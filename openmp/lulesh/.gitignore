@@ -1,0 +1,3 @@
+./lulesh
+*.o
+.gdb_history

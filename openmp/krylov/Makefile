@@ -14,6 +14,7 @@
 # work for a portable CPU build (USE_TASKGRAPH=0) but need the clang-specific
 # flags below adjusted (e.g. drop -fopenmp-version=60 for g++).
 CC = clang++
+#CC = xkcxx
 
 # ---- Common flags (edit me) ----------------------------------------------
 CFLAGS  =
@@ -27,9 +28,11 @@ CFLAGS += -DMAX_ITER=50
 # Record/replay the identical per-iteration task graph. This needs a taskgraph-
 # enabled clang (it emits the `replayable(1)` clause + `#pragma omp taskgraph`).
 # For a portable build on vanilla clang/gcc, set this to 0 (plain OpenMP tasks).
-CFLAGS += -DUSE_TASKGRAPH=0
-# Use XKOMP's taskgraph API instead of LLVM's (needs C++20):
-#CFLAGS += -DUSE_XKOMP=1 -std=c++20
+#CFLAGS += -DUSE_TASKGRAPH=1
+#CFLAGS += -DUSE_REPLAYABLE=0
+
+# Use XKOMP's taskgraph API
+#CFLAGS += -DUSE_XKOMP=1
 
 LDFLAGS  =
 LDFLAGS += -lm
@@ -39,14 +42,21 @@ LDFLAGS += -lm
 # --offload-arch to your device (sm_80 = A100, sm_90 = H100, gfx942 = MI300X).
 # With a standard offload clang (no taskgraph support), also set USE_TASKGRAPH=0
 # above for a plain target-offload build.
-#CFLAGS  += -DUSE_TARGET=1
-#CFLAGS  += -fopenmp-targets=nvptx64-nvidia-cuda --offload-arch=sm_80
-#CFLAGS  += -fopenmp-offload-mandatory -foffload-lto
-#LDFLAGS += -lcudart
+CFLAGS  += -DUSE_TARGET=1
+CFLAGS  += -fopenmp-targets=nvptx64-nvidia-cuda
+DETECTED_SMS := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | sort -u | tr -d '.')
+ifneq ($(DETECTED_SMS),)
+  CFLAGS += $(foreach sm,$(DETECTED_SMS),--offload-arch=sm_$(sm))
+else
+  CFLAGS += --offload-arch=sm_80
+endif
+CFLAGS  += -fopenmp-offload-mandatory -foffload-lto
+LDFLAGS += -lcudart
+
 # Pinned host-memory backend for the mapped buffers (see common/kalloc.h). The
 # default (nothing set) uses the OpenMP pinned allocator (omp_alloc, which the
 # runtime backs with CUDA/HIP/L0); pick a vendor path for an explicit one:
-#CFLAGS  += -DALLOC_CUDA                    # cudaMallocHost (uses -lcudart above)
+CFLAGS  += -DALLOC_CUDA                    # cudaMallocHost (uses -lcudart above)
 #CFLAGS  += -DALLOC_HIP                     # hipHostMalloc
 #LDFLAGS += -lamdhip64                      # ... its runtime lib, for ALLOC_HIP
 

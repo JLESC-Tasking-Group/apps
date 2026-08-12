@@ -37,18 +37,26 @@ LDFLAGS += -lm
 # ---- GPU (OpenMP target offload) -----------------------------------------
 # Uncomment this block to build the GPU backend instead of the CPU one. Adjust
 # --offload-arch to your device (sm_80 = A100, sm_90 = H100, gfx942 = MI300X).
+# With a standard offload clang (no taskgraph support), also set USE_TASKGRAPH=0
+# above for a plain target-offload build.
 #CFLAGS  += -DUSE_TARGET=1
 #CFLAGS  += -fopenmp-targets=nvptx64-nvidia-cuda --offload-arch=sm_80
 #CFLAGS  += -fopenmp-offload-mandatory -foffload-lto
 #LDFLAGS += -lcudart
+# Pinned host-memory backend for the mapped buffers (see common/kalloc.h). The
+# default (nothing set) uses the OpenMP pinned allocator (omp_alloc, which the
+# runtime backs with CUDA/HIP/L0); pick a vendor path for an explicit one:
+#CFLAGS  += -DALLOC_CUDA                    # cudaMallocHost (uses -lcudart above)
+#CFLAGS  += -DALLOC_HIP                     # hipHostMalloc
+#LDFLAGS += -lamdhip64                      # ... its runtime lib, for ALLOC_HIP
 
 # ---- Sources --------------------------------------------------------------
-COMMON_SRC = common/spmat.cpp
+COMMON_SRC = common/spmat.cpp common/kalloc.cpp
 
 # =============================================================================
 # Solvers (one target each). Add new solvers as: <name>: ... $(CC) ... -o <name>.x
 # =============================================================================
-cg: $(COMMON_SRC) cg/cg.cpp common/spmat.h common/tasking.h
+cg: $(COMMON_SRC) cg/cg.cpp common/spmat.h common/tasking.h common/kalloc.h
 	$(CC) $(CFLAGS) $(COMMON_SRC) cg/cg.cpp -o cg.x $(LDFLAGS)
 
 clean:

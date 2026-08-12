@@ -48,10 +48,12 @@ extern "C" {
  * set to the row sums of A, which makes the all-ones vector the exact solution
  * (a convenient built-in correctness check for the solvers).
  *
- *   A       : output matrix; its arrays are allocated here (free w/ spmat_free)
+ *   A       : output matrix; CSR arrays are device-mapped so they are allocated
+ *             with kr_alloc (pinned on GPU builds) -- free them with spmat_free
  *   stencil : SPMAT_STENCIL_7PT or SPMAT_STENCIL_27PT
- *   b       : if non-NULL, *b is allocated [n] and filled with the RHS
- *   xexact  : if non-NULL, *xexact is allocated [n] and filled with all ones
+ *   b       : if non-NULL, *b is malloc'd [n] and filled with the RHS (host-only;
+ *             free with free())
+ *   xexact  : if non-NULL, *xexact is malloc'd [n], all ones (host-only; free())
  */
 void spmat_generate_stencil(SpMatrix *A, idx_t nx, idx_t ny, idx_t nz,
                             int stencil, real_t **b, real_t **xexact);

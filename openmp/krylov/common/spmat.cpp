@@ -2,12 +2,24 @@
  * spmat.cpp - implementation of the sparse-matrix library (see spmat.h).
  */
 #include "spmat.h"
+#include "kalloc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 
-/* Fatal allocation helper: never returns NULL. */
-static void *xmalloc(size_t bytes)
+/* Fatal allocation helper for device-mapped arrays (pinned on GPU builds). */
+static void *xalloc_dev(size_t bytes)
+{
+    void *p = kr_alloc(bytes);
+    if (!p) {
+        fprintf(stderr, "spmat: out of memory (%zu bytes)\n", bytes);
+        exit(EXIT_FAILURE);
+    }
+    return p;
+}
+
+/* Fatal allocation helper for host-only arrays. */
+static void *xalloc_host(size_t bytes)
 {
     void *p = malloc(bytes);
     if (!p) {
@@ -25,13 +37,15 @@ void spmat_generate_stencil(SpMatrix *A, idx_t nx, idx_t ny, idx_t nz,
     const real_t diag_val = (real_t) stencil;      /* 7 or 27 on the diagonal */
     const idx_t  max_nnz  = (idx_t) stencil * n;   /* upper bound (interior rows) */
 
+    /* CSR arrays are mapped onto the device -> allocate them pinned (kr_alloc). */
     A->n       = n;
-    A->row_ptr = (idx_t  *) xmalloc((size_t)(n + 1) * sizeof(idx_t));
-    A->col_idx = (idx_t  *) xmalloc((size_t) max_nnz * sizeof(idx_t));
-    A->val     = (real_t *) xmalloc((size_t) max_nnz * sizeof(real_t));
+    A->row_ptr = (idx_t  *) xalloc_dev((size_t)(n + 1) * sizeof(idx_t));
+    A->col_idx = (idx_t  *) xalloc_dev((size_t) max_nnz * sizeof(idx_t));
+    A->val     = (real_t *) xalloc_dev((size_t) max_nnz * sizeof(real_t));
 
-    real_t *bb = b      ? (real_t *) xmalloc((size_t) n * sizeof(real_t)) : NULL;
-    real_t *xx = xexact ? (real_t *) xmalloc((size_t) n * sizeof(real_t)) : NULL;
+    /* b / xexact are host-only (b seeds the residual, xexact verifies). */
+    real_t *bb = b      ? (real_t *) xalloc_host((size_t) n * sizeof(real_t)) : NULL;
+    real_t *xx = xexact ? (real_t *) xalloc_host((size_t) n * sizeof(real_t)) : NULL;
 
     idx_t k = 0;                 /* running nonzero counter */
     A->row_ptr[0] = 0;
@@ -102,9 +116,9 @@ void spmat_extract_diagonal(const SpMatrix *A, real_t *diag)
 
 void spmat_free(SpMatrix *A)
 {
-    free(A->row_ptr);
-    free(A->col_idx);
-    free(A->val);
+    kr_free(A->row_ptr);
+    kr_free(A->col_idx);
+    kr_free(A->val);
     A->row_ptr = NULL;
     A->col_idx = NULL;
     A->val     = NULL;

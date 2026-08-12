@@ -51,15 +51,30 @@ LDFLAGS += -lm
 #LDFLAGS += -lamdhip64                      # ... its runtime lib, for ALLOC_HIP
 
 # ---- Sources --------------------------------------------------------------
-COMMON_SRC = common/spmat.cpp common/kalloc.cpp
+COMMON_SRC = common/spmat.cpp common/kalloc.cpp common/kernels.cpp
+COMMON_HDR = common/spmat.h common/kalloc.h common/kernels.h common/tasking.h
 
 # =============================================================================
-# Solvers (one target each). Add new solvers as: <name>: ... $(CC) ... -o <name>.x
+# Solvers (one target each). Add a new solver <name> as:
+#   <name>: $(COMMON_SRC) <name>/<name>.cpp $(COMMON_HDR)
+#           $(CC) $(CFLAGS) $(COMMON_SRC) <name>/<name>.cpp -o <name>.x $(LDFLAGS)
 # =============================================================================
-cg: $(COMMON_SRC) cg/cg.cpp common/spmat.h common/tasking.h common/kalloc.h
+cg: $(COMMON_SRC) cg/cg.cpp $(COMMON_HDR)
 	$(CC) $(CFLAGS) $(COMMON_SRC) cg/cg.cpp -o cg.x $(LDFLAGS)
 
-clean:
-	rm -f cg.x
+cr: $(COMMON_SRC) cr/cr.cpp $(COMMON_HDR)
+	$(CC) $(CFLAGS) $(COMMON_SRC) cr/cr.cpp -o cr.x $(LDFLAGS)
 
-.PHONY: cg clean
+bicgstab: $(COMMON_SRC) bicgstab/bicgstab.cpp $(COMMON_HDR)
+	$(CC) $(CFLAGS) $(COMMON_SRC) bicgstab/bicgstab.cpp -o bicgstab.x $(LDFLAGS)
+
+minres: $(COMMON_SRC) minres/minres.cpp $(COMMON_HDR)
+	$(CC) $(CFLAGS) $(COMMON_SRC) minres/minres.cpp -o minres.x $(LDFLAGS)
+
+gmres: $(COMMON_SRC) gmres/gmres.cpp $(COMMON_HDR)
+	$(CC) $(CFLAGS) $(COMMON_SRC) gmres/gmres.cpp -o gmres.x $(LDFLAGS)
+
+clean:
+	rm -f *.x
+
+.PHONY: cg cr bicgstab minres gmres clean

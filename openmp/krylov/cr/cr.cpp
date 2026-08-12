@@ -1,29 +1,27 @@
 /*
- * cg.cpp - Jacobi-preconditioned Conjugate Gradient (CG), a clean
- * re-implementation of Krylov.jl's `cg!` using OpenMP tasking.
+ * cr.cpp - Jacobi-preconditioned Conjugate Residual (CR), a clean
+ * re-implementation of Krylov.jl's `cr!` using OpenMP tasking.
  *
- * The tasked/offloaded building blocks live in common/kernels.{h,cpp}; this file
- * is just the CG algorithm expressed as a task graph. One source, two backends
- * (selected at compile time by -DUSE_TARGET, see common/tasking.h). With
- * -DUSE_TASKGRAPH the per-iteration task region is recorded once and replayed;
- * CG reuses the SAME buffers every iteration, so every recorded task has
- * loop-invariant addresses -- the ideal record/replay case.
+ * Same infrastructure as cg.cpp: tasked/offloaded building blocks from
+ * common/kernels.{h,cpp}, backend selected by -DUSE_TARGET, per-iteration task
+ * region recorded/replayed with -DUSE_TASKGRAPH. CR is for SPD systems and, like
+ * CG, reuses the SAME buffers every iteration (ideal for record/replay).
  *
- * Algorithm (preconditioned CG, x0 = 0, M = diag(A) Jacobi preconditioner):
- *     r = b;  z = M^-1 r;  p = z;  gamma = <r,z>
+ * Algorithm (preconditioned CR, x0 = 0, M = diag(A) Jacobi preconditioner
+ * applied as z = M^-1 z = inv_diag .* z, so r is the preconditioned residual and
+ * q = A*p is maintained by recurrence -> only ONE SpMV per iteration):
+ *     r = M b;  Ar = A r;  rho = <r,Ar>;  p = r;  q = Ar
  *     repeat:
- *         Ap    = A*p
- *         pAp   = <p,Ap>
- *         alpha = gamma / pAp
- *         x     = x + alpha*p
- *         r     = r - alpha*Ap
- *         z     = M^-1 r
- *         g_new = <r,z>
- *         beta  = g_new / gamma
- *         p     = z + beta*p
- *         gamma = g_new
- * The reported per-iteration residual is sqrt(gamma) = ||r||_{M^-1} (as in
- * Krylov.jl); the final verification uses the true 2-norm ||b - A x||_2.
+ *         Mq   = M q
+ *         alpha = rho / <q,Mq>
+ *         x    = x + alpha*p
+ *         r    = r - alpha*Mq
+ *         Ar   = A r
+ *         rho_bar = rho;  rho = <r,Ar>;  beta = rho / rho_bar
+ *         p    = r + beta*p
+ *         q    = Ar + beta*q
+ * The per-iteration residual reported is sqrt(|rho|) = ||r||_A; the final
+ * verification uses the true 2-norm ||b - A x||_2.
  */
 #include "spmat.h"
 #include "tasking.h"
@@ -41,13 +39,13 @@
 # define GRID_N 64        /* cubic grid dimension: n = GRID_N^3 unknowns */
 #endif
 #ifndef MAX_ITER
-# define MAX_ITER 50      /* fixed number of CG iterations */
+# define MAX_ITER 50      /* fixed number of CR iterations */
 #endif
 
 /* ==========================================================================
  * The solver.
  * ========================================================================== */
-static double cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
+static double cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
                        int max_iter, int T1, int T2, int print_dbg)
 {
     const idx_t   n       = A->n;
@@ -58,90 +56,87 @@ static double cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
 
     Tiling tl;
     tiling_init(&tl, n, T1, T2);
-    char *ap_tok = spmv_tokens_alloc(&tl); /* dependency tokens for Ap = A*p */
+    char *ar_tok = spmv_tokens_alloc(&tl); /* dependency tokens for Ar = A*r */
 
     /* Device-mapped working vectors (pinned on GPU builds). */
     real_t *r   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
     real_t *p   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *Ap  = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *z   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *inv = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* 1/diag(A) */
+    real_t *q   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* q = A*p (recurrence) */
+    real_t *Ar  = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
+    real_t *Mq  = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* M^-1 q            */
+    real_t *inv = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* 1/diag(A)         */
 
     /* Device-mapped length-1 scalar buffers. */
-    real_t *gamma = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *g_new = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *pAp   = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *alpha = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *beta  = (real_t *) kr_alloc(sizeof(real_t));
+    real_t *rho     = (real_t *) kr_alloc(sizeof(real_t));
+    real_t *rho_bar = (real_t *) kr_alloc(sizeof(real_t));
+    real_t *qMq     = (real_t *) kr_alloc(sizeof(real_t));
+    real_t *alpha   = (real_t *) kr_alloc(sizeof(real_t));
+    real_t *beta    = (real_t *) kr_alloc(sizeof(real_t));
 
-    /* Host-only partial sums for the CPU dot reduction (unused on GPU). */
-    real_t *part1 = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t)); /* <p,Ap> */
-    real_t *part2 = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t)); /* <r,z>  */
+    /* Host-only partial sums for the CPU dot reductions (unused on GPU). */
+    real_t *part_qMq = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_rho = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t));
 
-    /* Host initialization: inv_diag = 1/diag(A), x = 0, r = b (since x0 = 0). */
+    /* Host init: inv_diag = 1/diag(A), x = 0, r = M b = inv_diag .* b (x0 = 0). */
     spmat_extract_diagonal(A, inv);
     for (idx_t i = 0; i < n; i++) inv[i] = (real_t) 1.0 / inv[i];
-    for (idx_t i = 0; i < n; i++) { x[i] = (real_t) 0.0; r[i] = b[i]; }
+    for (idx_t i = 0; i < n; i++) { x[i] = (real_t) 0.0; r[i] = inv[i] * b[i]; }
 
     OMP_TARGET_ENTER_DATA(map(to: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], x[0:n], r[0:n])
-                          map(alloc: p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1]))
+                          map(alloc: p[0:n], q[0:n], Ar[0:n], Mq[0:n],
+                                     rho[0:1], rho_bar[0:1], qMq[0:1], alpha[0:1], beta[0:1]))
 
     const double t0 = omp_get_wtime();
 
     #pragma omp parallel
     #pragma omp single
     {
-        /* One-time setup: z = M^-1 r; p = z; gamma = <r,z>. A taskwait here is
-         * fine -- it is a one-time synchronization, not per-iteration. */
-        task_vmul(&tl, inv, r, z);
-        task_copy(&tl, z, p);
-        task_dot(&tl, r, z, part2, gamma);
+        /* One-time setup: Ar = A r; p = r; q = Ar; rho = <r,Ar>. */
+        task_spmv(row_ptr, col_idx, val, nnz, r, Ar, ar_tok, &tl);
+        task_copy(&tl, r, p);
+        task_copy_spmv(&tl, Ar, ar_tok, q);
+        task_dot_spmv(&tl, r, Ar, ar_tok, part_rho, rho);
         #pragma omp taskwait
 
-        /* Reference timestamp for the first iteration's execution time. */
         double prev_ts = omp_get_wtime();
 
         for (int it = 0; it < max_iter; it++) {
-            /* Host time spent creating (recording, then replaying) the tasks of
-             * this iteration = "time to spawn all tasks". */
             const double spawn0 = print_dbg ? omp_get_wtime() : 0.0;
 
-            /* Every iteration spawns the identical task pattern on the identical
-             * buffers -> recorded once, replayed thereafter. */
+            /* Identical task pattern on identical buffers every iteration. */
             TASKGRAPH_BEGIN
             {
-                task_spmv(row_ptr, col_idx, val, nnz, p, Ap, ap_tok, &tl); /* Ap  = A*p       */
-                task_dot_spmv(&tl, p, Ap, ap_tok, part1, pAp);            /* pAp = <p,Ap>    */
-                task_scalar_div(gamma, pAp, alpha);                       /* alpha = g/pAp   */
-                task_axpy(&tl, alpha, (real_t) +1.0, p, x);               /* x  += alpha*p   */
-                task_axpy_spmv(&tl, alpha, (real_t) -1.0, Ap, ap_tok, r); /* r  -= alpha*Ap  */
-                task_vmul(&tl, inv, r, z);                                /* z   = M^-1 r    */
-                task_dot(&tl, r, z, part2, g_new);                        /* g_new = <r,z>   */
-                task_scalar_div(g_new, gamma, beta);                      /* beta = gn/g     */
-                task_xpby(&tl, z, beta, p);                               /* p = z + beta*p  */
-                task_scalar_copy(g_new, gamma);                           /* gamma = g_new   */
+                task_vmul(&tl, inv, q, Mq);                                 /* Mq = M^-1 q      */
+                task_dot(&tl, q, Mq, part_qMq, qMq);                       /* <q,Mq>           */
+                task_scalar_div(rho, qMq, alpha);                          /* alpha = rho/<q,Mq> */
+                task_axpy(&tl, alpha, (real_t) +1.0, p, x);                /* x += alpha*p     */
+                task_axpy(&tl, alpha, (real_t) -1.0, Mq, r);               /* r -= alpha*Mq    */
+                task_spmv(row_ptr, col_idx, val, nnz, r, Ar, ar_tok, &tl); /* Ar = A r         */
+                task_scalar_copy(rho, rho_bar);                            /* rho_bar = rho    */
+                task_dot_spmv(&tl, r, Ar, ar_tok, part_rho, rho);          /* rho = <r,Ar>     */
+                task_scalar_div(rho, rho_bar, beta);                       /* beta = rho/rho_bar */
+                task_xpby(&tl, r, beta, p);                                /* p = r + beta*p   */
+                task_xpby_spmv(&tl, Ar, ar_tok, beta, q);                  /* q = Ar + beta*q  */
             }
             TASKGRAPH_END
 
             if (print_dbg) {
                 const double spawn_ms = (omp_get_wtime() - spawn0) * 1000.0;
-                /* Async D2H of the residual scalar, ordered via the g_new token
-                 * (expands to nothing on the host backend). */
-                OMP_TARGET_UPDATE(from(g_new[0:1]) nowait DEPEND(inout, g_new[0]))
-                /* Debug print as a task synchronized by dependencies (no taskwait):
-                 * it runs after the iteration's last task (gamma) and records the
-                 * completion time to derive each iteration's execution time. */
-                OMP_HOST_TASK(firstprivate(it, spawn_ms) shared(prev_ts) DEPEND(in, g_new[0], gamma[0]))
+                /* Async D2H of rho (= ||r||_A^2), ordered via its token. */
+                OMP_TARGET_UPDATE(from(rho[0:1]) nowait DEPEND(inout, rho[0]))
+                /* Depend-synchronized debug print (no taskwait); anchored on rho
+                 * (computed after the SpMV), so consecutive prints bracket exactly
+                 * one iteration's work. */
+                OMP_HOST_TASK(firstprivate(it, spawn_ms) shared(prev_ts) DEPEND(in, rho[0]))
                 {
                     const double now     = omp_get_wtime();
                     const double exec_ms = (now - prev_ts) * 1000.0;
                     prev_ts = now;
                     printf("  iter %4d   residual = %.6e   spawn = %8.3f ms   exec = %8.3f ms\n",
-                           it, sqrt((double) g_new[0]), spawn_ms, exec_ms);
+                           it, sqrt(fabs((double) rho[0])), spawn_ms, exec_ms);
                 }
             }
         }
-        /* One-time end-of-solve synchronization before reading/freeing buffers. */
         #pragma omp taskwait
     }
 
@@ -149,12 +144,13 @@ static double cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
 
     OMP_TARGET_EXIT_DATA(map(from: x[0:n])
                          map(release: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], r[0:n],
-                                      p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1]))
+                                      p[0:n], q[0:n], Ar[0:n], Mq[0:n],
+                                      rho[0:1], rho_bar[0:1], qMq[0:1], alpha[0:1], beta[0:1]))
 
-    kr_free(r); kr_free(p); kr_free(Ap); kr_free(z); kr_free(inv);
-    kr_free(gamma); kr_free(g_new); kr_free(pAp); kr_free(alpha); kr_free(beta);
-    free(part1); free(part2);
-    spmv_tokens_free(ap_tok);
+    kr_free(r); kr_free(p); kr_free(q); kr_free(Ar); kr_free(Mq); kr_free(inv);
+    kr_free(rho); kr_free(rho_bar); kr_free(qMq); kr_free(alpha); kr_free(beta);
+    free(part_qMq); free(part_rho);
+    spmv_tokens_free(ar_tok);
     return t1 - t0;
 }
 
@@ -166,7 +162,7 @@ static void usage(const char *prog)
     fprintf(stderr,
             "Usage: %s [-n N] [-i ITER] [-t T1] [-s T2] [-S {7|27}] [-p]\n"
             "  -n N       cubic grid: solve an N*N*N system   (default %d)\n"
-            "  -i ITER    fixed number of CG iterations       (default %d)\n"
+            "  -i ITER    fixed number of CR iterations       (default %d)\n"
             "  -t T1      number of tasks per vector op        (default: omp threads)\n"
             "  -s T2      number of SpMV sub-tasks per block   (default: omp threads)\n"
             "  -S STENCIL 7- or 27-point 3-D stencil           (default 27)\n"
@@ -198,7 +194,7 @@ int main(int argc, char **argv)
     real_t *b = NULL, *xexact = NULL;
     spmat_generate_stencil(&A, N, N, N, stencil, &b, &xexact);
 
-    printf("Krylov CG (Jacobi-preconditioned)\n");
+    printf("Krylov CR (Jacobi-preconditioned)\n");
     printf("  backend    : %s\n", USE_TARGET ? "GPU (omp target, pinned host mem)" : "CPU (omp task, malloc)");
     printf("  taskgraph  : %s\n", USE_TASKGRAPH ? "on" : "off");
     printf("  grid       : %d x %d x %d  (n = %d, nnz = %d, %d-pt stencil)\n",
@@ -209,7 +205,7 @@ int main(int argc, char **argv)
 
     real_t *x = (real_t *) kr_alloc((size_t) A.n * sizeof(real_t));
 
-    const double solve_time = cg_solve(&A, b, x, max_iter, T1, T2, print_dbg);
+    const double solve_time = cr_solve(&A, b, x, max_iter, T1, T2, print_dbg);
 
     /* Verification: true residual ||b - A x||_2 and error ||x - xexact||_2. */
     real_t *Ax = (real_t *) malloc((size_t) A.n * sizeof(real_t));

@@ -58,11 +58,31 @@ extern "C" {
 void spmat_generate_stencil(SpMatrix *A, idx_t nx, idx_t ny, idx_t nz,
                             int stencil, real_t **b, real_t **xexact);
 
+/*
+ * Build a NONSYMMETRIC convection-diffusion matrix on an nx x ny x nz grid:
+ *   L = -Laplacian + I + conv * (central-difference first derivatives).
+ * The diagonal is 7 and the six face-neighbor off-diagonals are -1 +/- conv/2
+ * (asymmetric when conv != 0; conv = 0 reproduces the symmetric 7-point matrix).
+ * It is strictly diagonally dominant for |conv| < 2. As with the stencil
+ * generator, b is set to the row sums so the exact solution is all-ones -- this
+ * holds for any A since (A*1)_i is the row sum, symmetric or not.
+ *
+ *   conv : convection strength (0 => symmetric); a good default is 1.0
+ *   b, xexact : as in spmat_generate_stencil (host-only, free with free())
+ */
+void spmat_generate_convdiff(SpMatrix *A, idx_t nx, idx_t ny, idx_t nz,
+                             real_t conv, real_t **b, real_t **xexact);
+
 /* y = A*x  (serial reference SpMV; host only, used for verification). */
 void spmat_spmv(const SpMatrix *A, const real_t *x, real_t *y);
 
 /* diag[i] = A(i,i)  (extract the main diagonal; diag must hold n reals). */
 void spmat_extract_diagonal(const SpMatrix *A, real_t *diag);
+
+/* A(i,i) -= sigma for every row (shift the diagonal). Handy to turn the SPD
+ * stencil matrix into a symmetric INDEFINITE one for MINRES. To keep the
+ * all-ones exact solution, the caller should also do b[i] -= sigma. */
+void spmat_shift_diagonal(SpMatrix *A, real_t sigma);
 
 /* Release all memory owned by A and reset its fields. */
 void spmat_free(SpMatrix *A);

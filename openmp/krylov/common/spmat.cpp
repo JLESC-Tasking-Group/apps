@@ -94,6 +94,64 @@ void spmat_generate_stencil(SpMatrix *A, idx_t nx, idx_t ny, idx_t nz,
     if (xexact) *xexact = xx;
 }
 
+void spmat_generate_convdiff(SpMatrix *A, idx_t nx, idx_t ny, idx_t nz,
+                             real_t conv, real_t **b, real_t **xexact)
+{
+    const idx_t  n        = nx * ny * nz;
+    const real_t diag_val = (real_t) 7.0;         /* 6 (-Laplacian) + 1 (reaction) */
+    const real_t half     = (real_t) 0.5 * conv;  /* central-difference convection  */
+    const idx_t  max_nnz  = (idx_t) 7 * n;        /* 7-point stencil                */
+
+    /* Six face-neighbor offsets and their (asymmetric) coefficients. */
+    const int    off[6][3] = {{-1, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}};
+    const real_t coef[6]   = {(real_t) -1.0 - half, (real_t) -1.0 + half,
+                              (real_t) -1.0 - half, (real_t) -1.0 + half,
+                              (real_t) -1.0 - half, (real_t) -1.0 + half};
+
+    A->n       = n;
+    A->row_ptr = (idx_t  *) xalloc_dev((size_t)(n + 1) * sizeof(idx_t));
+    A->col_idx = (idx_t  *) xalloc_dev((size_t) max_nnz * sizeof(idx_t));
+    A->val     = (real_t *) xalloc_dev((size_t) max_nnz * sizeof(real_t));
+
+    real_t *bb = b      ? (real_t *) xalloc_host((size_t) n * sizeof(real_t)) : NULL;
+    real_t *xx = xexact ? (real_t *) xalloc_host((size_t) n * sizeof(real_t)) : NULL;
+
+    idx_t k = 0;
+    A->row_ptr[0] = 0;
+
+    for (idx_t iz = 0; iz < nz; iz++) {
+        for (idx_t iy = 0; iy < ny; iy++) {
+            for (idx_t ix = 0; ix < nx; ix++) {
+                const idx_t row = (iz * ny + iy) * nx + ix;
+                real_t rowsum = (real_t) 0.0;
+
+                for (int m = 0; m < 6; m++) {
+                    const idx_t jx = ix + off[m][0];
+                    const idx_t jy = iy + off[m][1];
+                    const idx_t jz = iz + off[m][2];
+                    if (jx < 0 || jx >= nx || jy < 0 || jy >= ny || jz < 0 || jz >= nz) continue;
+                    A->col_idx[k] = (jz * ny + jy) * nx + jx;
+                    A->val[k]     = coef[m];
+                    rowsum       += coef[m];
+                    k++;
+                }
+                A->col_idx[k] = row;        /* diagonal (unsorted within row is fine) */
+                A->val[k]     = diag_val;
+                rowsum       += diag_val;
+                k++;
+
+                A->row_ptr[row + 1] = k;
+                if (bb) bb[row] = rowsum;             /* = row sum of A */
+                if (xx) xx[row] = (real_t) 1.0;       /* exact solution */
+            }
+        }
+    }
+
+    A->nnz = k;
+    if (b)      *b      = bb;
+    if (xexact) *xexact = xx;
+}
+
 void spmat_spmv(const SpMatrix *A, const real_t *x, real_t *y)
 {
     for (idx_t i = 0; i < A->n; i++) {
@@ -112,6 +170,13 @@ void spmat_extract_diagonal(const SpMatrix *A, real_t *diag)
             if (A->col_idx[k] == i) { diag[i] = A->val[k]; break; }
         }
     }
+}
+
+void spmat_shift_diagonal(SpMatrix *A, real_t sigma)
+{
+    for (idx_t i = 0; i < A->n; i++)
+        for (idx_t k = A->row_ptr[i]; k < A->row_ptr[i + 1]; k++)
+            if (A->col_idx[k] == i) { A->val[k] -= sigma; break; }
 }
 
 void spmat_free(SpMatrix *A)

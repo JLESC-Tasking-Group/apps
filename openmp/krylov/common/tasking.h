@@ -82,6 +82,11 @@
 
 #endif /* USE_TARGET */
 
+/* Always a host task (never offloaded), regardless of USE_TARGET. Used for
+ * host-side work such as the optional per-iteration debug print. It is created
+ * outside the taskgraph region, so it is not marked replayable. */
+#define OMP_HOST_TASK(...) KR_XPRAGMA(omp task __VA_ARGS__)
+
 /* ---- Dependency-clause abstraction (matches llm.c naming) ----
  *   DEPEND(in, a[x:y], b)           -> depend(in: a[x:y], b)
  *   DEPEND_MULTI(in, (i=0:N), a[i]) -> depend(iterator(i=0:N), in: a[i])
@@ -95,6 +100,21 @@
 # define MAP(...) map(__VA_ARGS__)
 #else
 # define MAP(...)
+#endif
+
+/* ---- Device data-management directives ----
+ * On the host backend (USE_TARGET == 0) they expand to nothing (buffers already
+ * live in host memory); on the device backend they emit the matching
+ * "#pragma omp target ..." directive. Used for the one-time H2D/D2H staging and
+ * the per-iteration residual read-back. */
+#if USE_TARGET
+# define OMP_TARGET_ENTER_DATA(...) KR_XPRAGMA(omp target enter data __VA_ARGS__)
+# define OMP_TARGET_EXIT_DATA(...)  KR_XPRAGMA(omp target exit data __VA_ARGS__)
+# define OMP_TARGET_UPDATE(...)     KR_XPRAGMA(omp target update __VA_ARGS__)
+#else
+# define OMP_TARGET_ENTER_DATA(...)
+# define OMP_TARGET_EXIT_DATA(...)
+# define OMP_TARGET_UPDATE(...)
 #endif
 
 /* ----------------------------------------------------------------------------

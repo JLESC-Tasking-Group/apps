@@ -106,9 +106,8 @@ static void gpu_dot(idx_t n, const real_t *a, const real_t *b, real_t *result)
     {
         result[0] = (real_t) 0.0;
     }
-    KR_XPRAGMA(omp target teams distribute parallel for REPLAYABLE_CLAUSE nowait
-               map(present, alloc: a[0:n], b[0:n], result[0:1])
-               reduction(+: result[0]) depend(in: a[0], b[0]) depend(inout: result[0]))
+    OMP_TARGET_LOOP_TASK(reduction(+: result[0]) DEPEND(in, a[0], b[0]) DEPEND(inout, result[0])
+                         MAP(present, alloc: a[0:n], b[0:n], result[0:1]))
     for (idx_t i = 0; i < n; i++)
         result[0] += a[i] * b[i];
 }
@@ -358,25 +357,30 @@ static double cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
     for (idx_t i = 0; i < n; i++) inv[i] = (real_t) 1.0 / inv[i];
     for (idx_t i = 0; i < n; i++) { x[i] = (real_t) 0.0; r[i] = b[i]; }
 
-#if USE_TARGET
-    #pragma omp target enter data map(to: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], x[0:n], r[0:n]) \
-        map(alloc: p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1])
-#endif
+    OMP_TARGET_ENTER_DATA(map(to: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], x[0:n], r[0:n])
+                          map(alloc: p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1]))
 
     const double t0 = omp_get_wtime();
 
     #pragma omp parallel
     #pragma omp single
     {
-        /* One-time setup (outside the taskgraph region): z = M^-1 r; p = z;
-         * gamma = <r,z>. The taskwait makes z/p/gamma ready before the first
-         * taskgraph record, keeping the recorded region self-contained. */
+        /* One-time setup: z = M^-1 r; p = z; gamma = <r,z>. A taskwait here is
+         * fine -- it is a one-time synchronization, not per-iteration -- and it
+         * makes z/p/gamma ready before the first taskgraph record. */
         task_vmul(&tl, inv, r, z);
         task_copy(&tl, z, p);
         task_dot(&tl, r, z, part2, gamma);
         #pragma omp taskwait
 
+        /* Reference timestamp for the first iteration's execution time. */
+        double prev_ts = omp_get_wtime();
+
         for (int it = 0; it < max_iter; it++) {
+            /* Host time spent creating (recording, then replaying) the tasks of
+             * this iteration = "time to spawn all tasks". */
+            const double spawn0 = print_dbg ? omp_get_wtime() : 0.0;
+
             /* Every iteration spawns the identical task pattern on the identical
              * buffers -> recorded once, replayed thereafter. */
             TASKGRAPH_BEGIN
@@ -395,23 +399,34 @@ static double cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
             TASKGRAPH_END
 
             if (print_dbg) {
-                #pragma omp taskwait
-#if USE_TARGET
-                #pragma omp target update from(g_new[0:1])
-#endif
-                printf("  iter %4d   residual = %.6e\n", it, sqrt((double) g_new[0]));
+                const double spawn_ms = (omp_get_wtime() - spawn0) * 1000.0;
+                /* Async D2H of the residual scalar, ordered via the g_new token
+                 * (expands to nothing on the host backend). */
+                OMP_TARGET_UPDATE(from(g_new[0:1]) nowait DEPEND(inout, g_new[0]))
+                /* Debug print as a task synchronized by dependencies (no taskwait):
+                 * it runs after the iteration's last task (gamma) and records the
+                 * completion time to derive each iteration's execution time. The
+                 * WAR on g_new forces the next iteration's dot to wait for it, so
+                 * the debug tasks stay ordered and prev_ts is race-free. */
+                OMP_HOST_TASK(firstprivate(it, spawn_ms) shared(prev_ts) DEPEND(in, g_new[0], gamma[0]))
+                {
+                    const double now     = omp_get_wtime();
+                    const double exec_ms = (now - prev_ts) * 1000.0;
+                    prev_ts = now;
+                    printf("  iter %4d   residual = %.6e   spawn = %8.3f ms   exec = %8.3f ms\n",
+                           it, sqrt((double) g_new[0]), spawn_ms, exec_ms);
+                }
             }
         }
+        /* One-time end-of-solve synchronization before reading/freeing buffers. */
         #pragma omp taskwait
     }
 
     const double t1 = omp_get_wtime();
 
-#if USE_TARGET
-    #pragma omp target exit data map(from: x[0:n]) \
-        map(release: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], r[0:n], \
-                     p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1])
-#endif
+    OMP_TARGET_EXIT_DATA(map(from: x[0:n])
+                         map(release: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], r[0:n],
+                                      p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1]))
 
     kr_free(r); kr_free(p); kr_free(Ap); kr_free(z); kr_free(inv);
     kr_free(gamma); kr_free(g_new); kr_free(pAp); kr_free(alpha); kr_free(beta);

@@ -27,7 +27,7 @@ CFLAGS += -DMAX_ITER=50
 # Record/replay the identical per-iteration task graph. This needs a taskgraph-
 # enabled clang (it emits the `replayable(1)` clause + `#pragma omp taskgraph`).
 # For a portable build on vanilla clang/gcc, set this to 0 (plain OpenMP tasks).
-CFLAGS += -DUSE_TASKGRAPH=1
+CFLAGS += -DUSE_TASKGRAPH=0
 # Use XKOMP's taskgraph API instead of LLVM's (needs C++20):
 #CFLAGS += -DUSE_XKOMP=1 -std=c++20
 

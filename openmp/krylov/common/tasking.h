@@ -102,6 +102,8 @@
 # define MAP(...)
 #endif
 
+# define DEFAULT_NONE default(none)
+
 /* ---- Device data-management directives ----
  * On the host backend (USE_TARGET == 0) they expand to nothing (buffers already
  * live in host memory); on the device backend they emit the matching

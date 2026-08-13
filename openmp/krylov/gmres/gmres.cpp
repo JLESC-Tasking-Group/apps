@@ -159,8 +159,7 @@ static double gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                 task_axpy_spmv(&tl, one, (real_t) -1.0, w, w_tok, res);    /* res -= A x     */
                 task_vmul(&tl, inv, res, q);                              /* q = M res      */
                 task_dot(&tl, q, q, part, beta);                         /* beta = <q,q>   */
-                OMP_TARGET_TASK(DEPEND(inout, beta[0]) DEPEND(out, ibeta[0])
-                                MAP(present: beta[0:1], ibeta[0:1]))
+                OMP_TARGET_TASK(DEFAULT_NONE MAP(present: beta[0:1], ibeta[0:1]))
                 {
                     beta[0]  = sqrt(beta[0]);
                     ibeta[0] = (real_t) 1.0 / beta[0];
@@ -178,7 +177,8 @@ static double gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                         task_axpy(&tl, H + (i + j * ld), (real_t) -1.0, Vi, q); /* q -= H[i,j] V[i] */
                     }
                     task_dot(&tl, q, q, part, hh);                          /* hh = <q,q> */
-                    OMP_TARGET_TASK(DEPEND(in, hh[0]) DEPEND(out, ih[0], H[(j + 1) + j * ld])
+                    OMP_TARGET_TASK(DEFAULT_NONE firstprivate(j, ld)
+                                    DEPEND(in, hh[0]) DEPEND(out, ih[0], H[(j + 1) + j * ld])
                                     MAP(present: hh[0:1], ih[0:1], H[0:ld * m]))
                     {
                         const real_t hn = sqrt(hh[0]);

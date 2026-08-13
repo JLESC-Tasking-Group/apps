@@ -109,7 +109,8 @@ static double minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     {
         /* One-time setup: beta = sqrt(<r1,v>); init the Givens state. */
         task_dot(&tl, r1, v, part_vy, beta); /* beta <- <r1, v> (= beta_1^2) */
-        OMP_TARGET_TASK(DEPEND(inout, beta[0]) DEPEND(out, phibar[0], cs[0], sn[0], dbar[0], eps[0], oldb[0])
+        OMP_TARGET_TASK(DEFAULT_NONE
+                        DEPEND(inout, beta[0]) DEPEND(out, phibar[0], cs[0], sn[0], dbar[0], eps[0], oldb[0])
                         MAP(present: beta[0:1], phibar[0:1], cs[0:1], sn[0:1], dbar[0:1], eps[0:1], oldb[0:1]))
         {
             beta[0]   = sqrt(beta[0]);
@@ -130,7 +131,8 @@ static double minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
             TASKGRAPH_BEGIN
             {
                 /* --- scalars: inv_beta = 1/beta, bob = beta/oldbeta (0 first iter) --- */
-                OMP_TARGET_TASK(DEPEND(in, beta[0], oldb[0]) DEPEND(out, inv_beta[0], bob[0])
+                OMP_TARGET_TASK(DEFAULT_NONE
+                                DEPEND(in, beta[0], oldb[0]) DEPEND(out, inv_beta[0], bob[0])
                                 MAP(present: beta[0:1], oldb[0:1], inv_beta[0:1], bob[0:1]))
                 {
                     inv_beta[0] = (real_t) 1.0 / beta[0];
@@ -145,7 +147,8 @@ static double minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                 task_dot(&tl, v, y, part_vy, vy);                        /* <v,y>            */
 
                 /* --- scalars: alpha, delta (for w), alpha/beta --- */
-                OMP_TARGET_TASK(DEPEND(in, vy[0], beta[0], cs[0], sn[0], dbar[0]) DEPEND(out, alpha[0], delta[0], aob[0])
+                OMP_TARGET_TASK(DEFAULT_NONE
+                                DEPEND(in, vy[0], beta[0], cs[0], sn[0], dbar[0]) DEPEND(out, alpha[0], delta[0], aob[0])
                                 MAP(present: vy[0:1], beta[0:1], cs[0:1], sn[0:1], dbar[0:1], alpha[0:1], delta[0:1], aob[0:1]))
                 {
                     alpha[0] = vy[0] / beta[0];
@@ -166,11 +169,12 @@ static double minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                 task_dot(&tl, r2, v, part_r2v, r2v);                    /* <r2,v> (= beta^2) */
 
                 /* --- scalars: new beta + plane rotation; phi, 1/gamma --- */
-                OMP_TARGET_TASK(DEPEND(in, r2v[0], alpha[0])
+                OMP_TARGET_TASK(DEFAULT_NONE
+                                DEPEND(in, r2v[0], alpha[0])
                                 DEPEND(inout, beta[0], cs[0], sn[0], dbar[0], phibar[0])
                                 DEPEND(out, oldb[0], eps[0], phi[0], gamma_inv[0])
                                 MAP(present: r2v[0:1], alpha[0:1], beta[0:1], cs[0:1], sn[0:1],
-                                                    dbar[0:1], phibar[0:1], oldb[0:1], eps[0:1], phi[0:1], gamma_inv[0:1]))
+                                             dbar[0:1], phibar[0:1], oldb[0:1], eps[0:1], phi[0:1], gamma_inv[0:1]))
                 {
                     const real_t b_new  = sqrt(r2v[0]);
                     const real_t gbar   = sn[0] * dbar[0] - cs[0] * alpha[0];
@@ -204,7 +208,7 @@ static double minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
             if (print_dbg) {
                 const double spawn_ms = (omp_get_wtime() - spawn0) * 1000.0;
                 OMP_TARGET_UPDATE(from(phibar[0:1]) nowait DEPEND(inout, phibar[0]))
-                OMP_HOST_TASK(firstprivate(it, spawn_ms) shared(prev_ts) DEPEND(in, phibar[0]))
+                OMP_HOST_TASK(default(none) firstprivate(it, spawn_ms, phibar) shared(prev_ts) DEPEND(in, phibar[0]))
                 {
                     const double now     = omp_get_wtime();
                     const double exec_ms = (now - prev_ts) * 1000.0;

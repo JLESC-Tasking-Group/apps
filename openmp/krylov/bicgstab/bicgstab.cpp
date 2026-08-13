@@ -135,7 +135,8 @@ static double bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
                 task_dot(&tl, c, r, part_nr, next_rho);                 /* next_rho = <c,r> */
                 task_dot(&tl, r, r, part_rr, rr);                       /* <r,r> (residual) */
                 /* beta = (next_rho/rho) * (alpha/omega) -- a compound scalar task. */
-                OMP_TARGET_TASK(DEPEND(in, next_rho[0], rho[0], alpha[0], omega[0]) DEPEND(out, beta[0])
+                OMP_TARGET_TASK(DEFAULT_NONE
+                                DEPEND(in, next_rho[0], rho[0], alpha[0], omega[0]) DEPEND(out, beta[0])
                                 MAP(present: next_rho[0:1], rho[0:1], alpha[0:1], omega[0:1], beta[0:1]))
                 {
                     beta[0] = (next_rho[0] / rho[0]) * (alpha[0] / omega[0]);
@@ -148,7 +149,7 @@ static double bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
             if (print_dbg) {
                 const double spawn_ms = (omp_get_wtime() - spawn0) * 1000.0;
                 OMP_TARGET_UPDATE(from(rr[0:1]) nowait DEPEND(inout, rr[0]))
-                OMP_HOST_TASK(firstprivate(it, spawn_ms) shared(prev_ts) DEPEND(in, rr[0]))
+                OMP_HOST_TASK(DEFAULT_NONE firstprivate(it, spawn_ms, rr) shared(prev_ts) DEPEND(in, rr[0]))
                 {
                     const double now     = omp_get_wtime();
                     const double exec_ms = (now - prev_ts) * 1000.0;

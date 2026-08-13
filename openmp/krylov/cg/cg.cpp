@@ -131,7 +131,7 @@ static double cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
                 /* Debug print as a task synchronized by dependencies (no taskwait):
                  * it runs after the iteration's last task (gamma) and records the
                  * completion time to derive each iteration's execution time. */
-                OMP_HOST_TASK(firstprivate(it, spawn_ms) shared(prev_ts) DEPEND(in, g_new[0], gamma[0]))
+                OMP_HOST_TASK(DEFAULT_NONE firstprivate(it, spawn_ms, g_new, gamma) shared(prev_ts) DEPEND(in, g_new[0], gamma[0]))
                 {
                     const double now     = omp_get_wtime();
                     const double exec_ms = (now - prev_ts) * 1000.0;

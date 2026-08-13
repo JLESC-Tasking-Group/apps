@@ -127,7 +127,7 @@ static double cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
                 /* Depend-synchronized debug print (no taskwait); anchored on rho
                  * (computed after the SpMV), so consecutive prints bracket exactly
                  * one iteration's work. */
-                OMP_HOST_TASK(firstprivate(it, spawn_ms) shared(prev_ts) DEPEND(in, rho[0]))
+                OMP_HOST_TASK(default(none) firstprivate(it, spawn_ms, rho) shared(prev_ts) DEPEND(in, rho[0]))
                 {
                     const double now     = omp_get_wtime();
                     const double exec_ms = (now - prev_ts) * 1000.0;

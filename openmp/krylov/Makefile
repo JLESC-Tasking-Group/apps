@@ -20,7 +20,8 @@ CC = clang++
 CFLAGS  =
 CFLAGS += -Icommon
 CFLAGS += -fopenmp -fopenmp-version=60
-CFLAGS += -O3 -ffast-math
+#CFLAGS += -O3 -ffast-math
+CFLAGS += -O0 -g
 CFLAGS += -Wall -Wextra
 # Compile-time problem/solver defaults (all also settable at runtime, see -h):
 CFLAGS += -DGRID_N=64
@@ -50,7 +51,8 @@ ifneq ($(DETECTED_SMS),)
 else
   CFLAGS += --offload-arch=sm_80
 endif
-CFLAGS  += -fopenmp-offload-mandatory -foffload-lto
+CFLAGS += -fopenmp-offload-mandatory
+#CFLAGS += -foffload-lto
 LDFLAGS += -lcudart
 
 # Pinned host-memory backend for the mapped buffers (see common/kalloc.h). The

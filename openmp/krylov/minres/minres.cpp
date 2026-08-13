@@ -110,7 +110,7 @@ static double minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
         /* One-time setup: beta = sqrt(<r1,v>); init the Givens state. */
         task_dot(&tl, r1, v, part_vy, beta); /* beta <- <r1, v> (= beta_1^2) */
         OMP_TARGET_TASK(DEPEND(inout, beta[0]) DEPEND(out, phibar[0], cs[0], sn[0], dbar[0], eps[0], oldb[0])
-                        MAP(present, alloc: beta[0:1], phibar[0:1], cs[0:1], sn[0:1], dbar[0:1], eps[0:1], oldb[0:1]))
+                        MAP(present: beta[0:1], phibar[0:1], cs[0:1], sn[0:1], dbar[0:1], eps[0:1], oldb[0:1]))
         {
             beta[0]   = sqrt(beta[0]);
             phibar[0] = beta[0];
@@ -131,7 +131,7 @@ static double minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
             {
                 /* --- scalars: inv_beta = 1/beta, bob = beta/oldbeta (0 first iter) --- */
                 OMP_TARGET_TASK(DEPEND(in, beta[0], oldb[0]) DEPEND(out, inv_beta[0], bob[0])
-                                MAP(present, alloc: beta[0:1], oldb[0:1], inv_beta[0:1], bob[0:1]))
+                                MAP(present: beta[0:1], oldb[0:1], inv_beta[0:1], bob[0:1]))
                 {
                     inv_beta[0] = (real_t) 1.0 / beta[0];
                     bob[0]      = (oldb[0] == (real_t) 0.0) ? (real_t) 0.0 : beta[0] / oldb[0];
@@ -146,7 +146,7 @@ static double minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
 
                 /* --- scalars: alpha, delta (for w), alpha/beta --- */
                 OMP_TARGET_TASK(DEPEND(in, vy[0], beta[0], cs[0], sn[0], dbar[0]) DEPEND(out, alpha[0], delta[0], aob[0])
-                                MAP(present, alloc: vy[0:1], beta[0:1], cs[0:1], sn[0:1], dbar[0:1], alpha[0:1], delta[0:1], aob[0:1]))
+                                MAP(present: vy[0:1], beta[0:1], cs[0:1], sn[0:1], dbar[0:1], alpha[0:1], delta[0:1], aob[0:1]))
                 {
                     alpha[0] = vy[0] / beta[0];
                     delta[0] = cs[0] * dbar[0] + sn[0] * alpha[0];
@@ -169,7 +169,7 @@ static double minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                 OMP_TARGET_TASK(DEPEND(in, r2v[0], alpha[0])
                                 DEPEND(inout, beta[0], cs[0], sn[0], dbar[0], phibar[0])
                                 DEPEND(out, oldb[0], eps[0], phi[0], gamma_inv[0])
-                                MAP(present, alloc: r2v[0:1], alpha[0:1], beta[0:1], cs[0:1], sn[0:1],
+                                MAP(present: r2v[0:1], alpha[0:1], beta[0:1], cs[0:1], sn[0:1],
                                                     dbar[0:1], phibar[0:1], oldb[0:1], eps[0:1], phi[0:1], gamma_inv[0:1]))
                 {
                     const real_t b_new  = sqrt(r2v[0]);

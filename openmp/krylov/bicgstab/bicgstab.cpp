@@ -136,7 +136,7 @@ static double bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
                 task_dot(&tl, r, r, part_rr, rr);                       /* <r,r> (residual) */
                 /* beta = (next_rho/rho) * (alpha/omega) -- a compound scalar task. */
                 OMP_TARGET_TASK(DEPEND(in, next_rho[0], rho[0], alpha[0], omega[0]) DEPEND(out, beta[0])
-                                MAP(present, alloc: next_rho[0:1], rho[0:1], alpha[0:1], omega[0:1], beta[0:1]))
+                                MAP(present: next_rho[0:1], rho[0:1], alpha[0:1], omega[0:1], beta[0:1]))
                 {
                     beta[0] = (next_rho[0] / rho[0]) * (alpha[0] / omega[0]);
                 }

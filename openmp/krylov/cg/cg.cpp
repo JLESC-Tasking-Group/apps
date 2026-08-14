@@ -83,8 +83,8 @@ static double cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
     for (idx_t i = 0; i < n; i++) inv[i] = (real_t) 1.0 / inv[i];
     for (idx_t i = 0; i < n; i++) { x[i] = (real_t) 0.0; r[i] = b[i]; }
 
-    OMP_TARGET_ENTER_DATA(map(to: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], x[0:n], r[0:n])
-                          map(alloc: p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1]))
+    OMP_TARGET_ENTER_DATA(MAP(to: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], x[0:n], r[0:n])
+                          MAP(alloc: p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1]))
 
     const double t0 = omp_get_wtime();
 
@@ -147,8 +147,7 @@ static double cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
 
     const double t1 = omp_get_wtime();
 
-    OMP_TARGET_EXIT_DATA(map(from: x[0:n])
-                         map(release: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], r[0:n],
+    OMP_TARGET_EXIT_DATA(MAP(from: x[0:n]) MAP(release: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], r[0:n],
                                       p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1]))
 
     kr_free(r); kr_free(p); kr_free(Ap); kr_free(z); kr_free(inv);

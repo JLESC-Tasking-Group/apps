@@ -13,15 +13,15 @@
 # / XKOMP fork), consistent with the other apps in this repo. Other compilers may
 # work for a portable CPU build (USE_TASKGRAPH=0) but need the clang-specific
 # flags below adjusted (e.g. drop -fopenmp-version=60 for g++).
-CC = clang++
-#CC = xkcxx
+#CC = clang++
+CC = xkcxx -DUSE_XKOMP=1
 
 # ---- Common flags (edit me) ----------------------------------------------
 CFLAGS  =
 CFLAGS += -Icommon
 CFLAGS += -fopenmp -fopenmp-version=60
-#CFLAGS += -O3 -ffast-math
-CFLAGS += -O0 -g
+CFLAGS += -O3 -ffast-math
+#CFLAGS += -O0 -g
 CFLAGS += -Wall -Wextra
 # Compile-time problem/solver defaults (all also settable at runtime, see -h):
 CFLAGS += -DGRID_N=64
@@ -29,11 +29,8 @@ CFLAGS += -DMAX_ITER=50
 # Record/replay the identical per-iteration task graph. This needs a taskgraph-
 # enabled clang (it emits the `replayable(1)` clause + `#pragma omp taskgraph`).
 # For a portable build on vanilla clang/gcc, set this to 0 (plain OpenMP tasks).
-#CFLAGS += -DUSE_TASKGRAPH=1
-#CFLAGS += -DUSE_REPLAYABLE=0
-
-# Use XKOMP's taskgraph API
-#CFLAGS += -DUSE_XKOMP=1
+CFLAGS += -DUSE_TASKGRAPH=1
+CFLAGS += -DUSE_REPLAYABLE=0
 
 LDFLAGS  =
 LDFLAGS += -lm

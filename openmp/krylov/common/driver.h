@@ -48,9 +48,9 @@ typedef struct {
 
 void krylov_stats_init  (KrylovStats *s, int niter);
 void krylov_stats_free  (KrylovStats *s);
-/* Print total time, iteration 0, iteration 1, and the average of iterations
- * 2..niter-1. `unit` is "iteration" or "restart"; when `taskgraph` is nonzero
- * the first two lines are annotated (record) / (1st replay). */
+/* Print total time, iteration 0, iteration 1, and the mean and (sample) standard
+ * deviation of iterations 2..niter-1. `unit` is "iteration" or "restart"; when
+ * `taskgraph` is nonzero the first two lines are annotated (record)/(1st replay). */
 void krylov_stats_report(const KrylovStats *s, const char *unit, int taskgraph);
 
 /* ---- solver descriptor: each solver translation unit provides exactly one ---- */

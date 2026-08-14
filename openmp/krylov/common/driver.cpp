@@ -53,11 +53,25 @@ void krylov_stats_report(const KrylovStats *s, const char *unit, int taskgraph)
         printf("  %-27s : %10.3f ms\n", lbl, s->iter_ms[1]);
     }
     if (s->niter >= 3) {
+        /* Steady-state iterations 2..niter-1 (iteration 0 = record and iteration
+         * 1 = first replay are excluded as outliers). Report mean and the
+         * (sample) standard deviation of the per-iteration time. */
+        const int cnt = s->niter - 2;
         double sum = 0.0;
         for (int i = 2; i < s->niter; i++) sum += s->iter_ms[i];
-        const int cnt = s->niter - 2;
+        const double mean = sum / cnt;
+
+        double var = 0.0;
+        for (int i = 2; i < s->niter; i++) {
+            const double dv = s->iter_ms[i] - mean;
+            var += dv * dv;
+        }
+        const double stddev = (cnt > 1) ? sqrt(var / (cnt - 1)) : 0.0;
+
         snprintf(lbl, sizeof lbl, "%ss 2..%d (avg)", unit, s->niter - 1);
-        printf("  %-27s : %10.3f ms   (%d %ss)\n", lbl, sum / cnt, cnt, unit);
+        printf("  %-27s : %10.3f ms   (%d %ss)\n", lbl, mean, cnt, unit);
+        snprintf(lbl, sizeof lbl, "%ss 2..%d (stddev)", unit, s->niter - 1);
+        printf("  %-27s : %10.3f ms\n", lbl, stddev);
     }
 }
 

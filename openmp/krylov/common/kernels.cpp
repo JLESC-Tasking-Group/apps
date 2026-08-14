@@ -351,7 +351,7 @@ void task_dot_spmv(const Tiling *tl, const real_t *a, const real_t *ys, char *ys
  * ========================================================================== */
 void task_scalar_div(const real_t *a, const real_t *b, real_t *c)
 {
-    OMP_TARGET_TASK(DEFAULT_NONE DEPEND(in, a[0], b[0]) DEPEND(out, c[0]) MAP(present: a[0:1], b[0:1], c[0:1]))
+    OMP_TARGET_TASK(DEFAULT_NONE firstprivate(a, b, c), DEPEND(in, a[0], b[0]) DEPEND(out, c[0]) MAP(present: a[0:1], b[0:1], c[0:1]))
     {
         c[0] = a[0] / b[0];
     }
@@ -359,7 +359,7 @@ void task_scalar_div(const real_t *a, const real_t *b, real_t *c)
 
 void task_scalar_copy(const real_t *a, real_t *b)
 {
-    OMP_TARGET_TASK(DEFAULT_NONE DEPEND(in, a[0]) DEPEND(out, b[0]) MAP(present: a[0:1], b[0:1]))
+    OMP_TARGET_TASK(DEFAULT_NONE firstprivate(a, b) DEPEND(in, a[0]) DEPEND(out, b[0]) MAP(present: a[0:1], b[0:1]))
     {
         b[0] = a[0];
     }

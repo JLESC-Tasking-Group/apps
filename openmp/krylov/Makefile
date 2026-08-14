@@ -31,6 +31,7 @@ CFLAGS += -DMAX_ITER=50
 # For a portable build on vanilla clang/gcc, set this to 0 (plain OpenMP tasks).
 CFLAGS += -DUSE_TASKGRAPH=1
 CFLAGS += -DUSE_REPLAYABLE=0
+CFLAGS += -fopenmp-task-jit-type=packed
 
 LDFLAGS  =
 LDFLAGS += -lm
@@ -40,17 +41,17 @@ LDFLAGS += -lm
 # --offload-arch to your device (sm_80 = A100, sm_90 = H100, gfx942 = MI300X).
 # With a standard offload clang (no taskgraph support), also set USE_TASKGRAPH=0
 # above for a plain target-offload build.
-CFLAGS  += -DUSE_TARGET=1
-CFLAGS  += -fopenmp-targets=nvptx64-nvidia-cuda
-DETECTED_SMS := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | sort -u | tr -d '.')
-ifneq ($(DETECTED_SMS),)
-  CFLAGS += $(foreach sm,$(DETECTED_SMS),--offload-arch=sm_$(sm))
-else
-  CFLAGS += --offload-arch=sm_80
-endif
-CFLAGS += -fopenmp-offload-mandatory
-#CFLAGS += -foffload-lto
-LDFLAGS += -lcudart
+#CFLAGS  += -DUSE_TARGET=1
+#CFLAGS  += -fopenmp-targets=nvptx64-nvidia-cuda
+#DETECTED_SMS := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | sort -u | tr -d '.')
+#ifneq ($(DETECTED_SMS),)
+#  CFLAGS += $(foreach sm,$(DETECTED_SMS),--offload-arch=sm_$(sm))
+#else
+#  CFLAGS += --offload-arch=sm_80
+#endif
+#CFLAGS += -fopenmp-offload-mandatory
+##CFLAGS += -foffload-lto
+#LDFLAGS += -lcudart
 
 # Pinned host-memory backend for the mapped buffers (see common/kalloc.h). The
 # default (nothing set) uses the OpenMP pinned allocator (omp_alloc, which the

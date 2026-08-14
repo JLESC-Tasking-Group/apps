@@ -67,7 +67,7 @@ void krylov_stats_report(const KrylovStats *s, const char *unit, int taskgraph)
 static void usage(const char *prog, const KrylovDescriptor *d)
 {
     const char *iw = d->restarted ? "RESTARTS" : "ITER";
-    fprintf(stderr, "Usage: %s [-n N] [-i %s] [-t T1] [-s T2]", prog, iw);
+    fprintf(stderr, "Usage: %s [-n N] [-i %s] [-t T1] [-s T2] [-M FILE]", prog, iw);
     if (d->opt_mask & OPT_MEM)     fprintf(stderr, " [-m MEM]");
     if (d->opt_mask & OPT_STENCIL) fprintf(stderr, " [-S {7|27}]");
     if (d->opt_mask & OPT_SHIFT)   fprintf(stderr, " [-g SIGMA]");
@@ -75,6 +75,8 @@ static void usage(const char *prog, const KrylovDescriptor *d)
     fprintf(stderr, " [-p]\n");
 
     fprintf(stderr,
+            "  -M FILE    import the matrix from a Matrix Market .mtx file\n"
+            "             (SuiteSparse); overrides the built-in generator and -n\n"
             "  -n N       cubic grid: solve an N*N*N system   (default %d)\n",
             GRID_N);
     if (d->restarted)
@@ -120,12 +122,14 @@ int main(int argc, char **argv)
     prm.conv      = 1.0;
     prm.sigma     = 0.0;
     prm.print_dbg = 0;
+    prm.mtx       = NULL;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-n") && i + 1 < argc) prm.N     = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-i") && i + 1 < argc) prm.iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) prm.T1    = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-s") && i + 1 < argc) prm.T2    = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-M") && i + 1 < argc) prm.mtx   = argv[++i];
         else if ((d->opt_mask & OPT_MEM)     && !strcmp(argv[i], "-m") && i + 1 < argc) prm.m       = atoi(argv[++i]);
         else if ((d->opt_mask & OPT_STENCIL) && !strcmp(argv[i], "-S") && i + 1 < argc) prm.stencil = atoi(argv[++i]);
         else if ((d->opt_mask & OPT_SHIFT)   && !strcmp(argv[i], "-g") && i + 1 < argc) prm.sigma   = atof(argv[++i]);
@@ -141,24 +145,30 @@ int main(int argc, char **argv)
         prm.stencil != SPMAT_STENCIL_7PT && prm.stencil != SPMAT_STENCIL_27PT)
         prm.stencil = SPMAT_STENCIL_27PT;
 
-    /* Build the test system (exact solution is all-ones for every generator). */
+    /* Build the test system (exact solution is all-ones for every generator and
+     * for the importer, which sets b = A*1). A '-M <file>' import overrides the
+     * solver's built-in generator (and the -n/-S/-c/-g knobs). */
     SpMatrix A;
     real_t *b = NULL, *xexact = NULL;
-    switch (d->problem) {
-        case KR_CONVDIFF:
-            spmat_generate_convdiff(&A, prm.N, prm.N, prm.N, (real_t) prm.conv, &b, &xexact);
-            break;
-        case KR_STENCIL_SHIFT:
-            spmat_generate_stencil(&A, prm.N, prm.N, prm.N, prm.stencil, &b, &xexact);
-            if (prm.sigma != 0.0) {
-                spmat_shift_diagonal(&A, (real_t) prm.sigma);
-                for (idx_t i = 0; i < A.n; i++) b[i] -= (real_t) prm.sigma; /* keep xexact = 1 */
-            }
-            break;
-        case KR_SPD_STENCIL:
-        default:
-            spmat_generate_stencil(&A, prm.N, prm.N, prm.N, prm.stencil, &b, &xexact);
-            break;
+    if (prm.mtx) {
+        spmat_load_matrixmarket(&A, prm.mtx, &b, &xexact);
+    } else {
+        switch (d->problem) {
+            case KR_CONVDIFF:
+                spmat_generate_convdiff(&A, prm.N, prm.N, prm.N, (real_t) prm.conv, &b, &xexact);
+                break;
+            case KR_STENCIL_SHIFT:
+                spmat_generate_stencil(&A, prm.N, prm.N, prm.N, prm.stencil, &b, &xexact);
+                if (prm.sigma != 0.0) {
+                    spmat_shift_diagonal(&A, (real_t) prm.sigma);
+                    for (idx_t i = 0; i < A.n; i++) b[i] -= (real_t) prm.sigma; /* keep xexact = 1 */
+                }
+                break;
+            case KR_SPD_STENCIL:
+            default:
+                spmat_generate_stencil(&A, prm.N, prm.N, prm.N, prm.stencil, &b, &xexact);
+                break;
+        }
     }
 
     /* Banner. */
@@ -166,20 +176,26 @@ int main(int argc, char **argv)
     else              printf("Krylov %s (Jacobi-preconditioned)\n", d->name);
     printf("  backend    : %s\n", USE_TARGET ? "GPU (omp target, pinned host mem)" : "CPU (omp task, malloc)");
     printf("  taskgraph  : %s\n", USE_TASKGRAPH ? "on" : "off");
-    switch (d->problem) {
-        case KR_SPD_STENCIL:
-            printf("  matrix     : %d-pt stencil (SPD)\n", prm.stencil);
-            break;
-        case KR_STENCIL_SHIFT:
-            printf("  matrix     : %d-pt stencil, diagonal shift sigma = %.3f (%s)\n",
-                   prm.stencil, prm.sigma, prm.sigma == 0.0 ? "SPD" : "indefinite");
-            break;
-        case KR_CONVDIFF:
-            printf("  matrix     : convection-diffusion (conv = %.2f, %s)\n",
-                   prm.conv, prm.conv == 0.0 ? "symmetric" : "nonsymmetric");
-            break;
+    if (prm.mtx) {
+        /* imported: the loader already printed the detailed matrix info block */
+        printf("  matrix     : Matrix Market file %s\n", prm.mtx);
+        printf("  size       : n = %d, nnz = %d\n", A.n, A.nnz);
+    } else {
+        switch (d->problem) {
+            case KR_SPD_STENCIL:
+                printf("  matrix     : %d-pt stencil (SPD)\n", prm.stencil);
+                break;
+            case KR_STENCIL_SHIFT:
+                printf("  matrix     : %d-pt stencil, diagonal shift sigma = %.3f (%s)\n",
+                       prm.stencil, prm.sigma, prm.sigma == 0.0 ? "SPD" : "indefinite");
+                break;
+            case KR_CONVDIFF:
+                printf("  matrix     : convection-diffusion (conv = %.2f, %s)\n",
+                       prm.conv, prm.conv == 0.0 ? "symmetric" : "nonsymmetric");
+                break;
+        }
+        printf("  grid       : %d x %d x %d  (n = %d, nnz = %d)\n", prm.N, prm.N, prm.N, A.n, A.nnz);
     }
-    printf("  grid       : %d x %d x %d  (n = %d, nnz = %d)\n", prm.N, prm.N, prm.N, A.n, A.nnz);
     if (d->restarted)
         printf("  restarts   : %d  x  m = %d  (%d Arnoldi steps)\n", prm.iters, prm.m, prm.iters * prm.m);
     else

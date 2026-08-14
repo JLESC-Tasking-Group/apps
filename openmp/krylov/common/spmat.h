@@ -73,6 +73,26 @@ void spmat_generate_stencil(SpMatrix *A, idx_t nx, idx_t ny, idx_t nz,
 void spmat_generate_convdiff(SpMatrix *A, idx_t nx, idx_t ny, idx_t nz,
                              real_t conv, real_t **b, real_t **xexact);
 
+/*
+ * Load a square matrix from a Matrix Market (.mtx) file, as distributed by the
+ * SuiteSparse Matrix Collection. Supported header:
+ *   %%MatrixMarket matrix coordinate <field> <symmetry>
+ * with field in {real, integer, pattern} and symmetry in {general, symmetric,
+ * skew-symmetric}. Only one triangle is stored for a (skew-)symmetric matrix, so
+ * it is expanded to the full CSR that the SpMV kernels expect. Prints a summary
+ * of the imported matrix (dimensions, nnz, symmetry, ...).
+ *
+ * As with the generators, b and xexact are optional host-only outputs: b is set
+ * to the row sums (= A*1) so the all-ones vector is the exact solution, keeping
+ * the solvers' built-in residual/error checks meaningful. The CSR arrays are
+ * device-mapped (kr_alloc) -- free A with spmat_free, b/xexact with free().
+ *
+ * Fatal (exit) on any error: unreadable file, non-square, truncated, or an
+ * unsupported header (complex, hermitian, array/dense).
+ */
+void spmat_load_matrixmarket(SpMatrix *A, const char *path,
+                             real_t **b, real_t **xexact);
+
 /* y = A*x  (serial reference SpMV; host only, used for verification). */
 void spmat_spmv(const SpMatrix *A, const real_t *x, real_t *y);
 

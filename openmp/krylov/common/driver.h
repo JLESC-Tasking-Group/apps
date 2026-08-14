@@ -24,14 +24,15 @@
 
 /* ---- parsed command line (superset of every solver's options) ---- */
 typedef struct {
-    int    N;          /* cubic grid dimension: n = N^3                        */
-    int    iters;      /* iterations (or restart cycles for GMRES)             */
-    int    m;          /* GMRES restart length (unused by the other solvers)   */
-    int    T1, T2;     /* task granularity (vectors / SpMV sub-blocks)         */
-    int    stencil;    /* 7 or 27 (stencil problems)                           */
-    double conv;       /* convection strength (convection-diffusion problems)  */
-    double sigma;      /* diagonal shift (MINRES indefinite test)              */
-    int    print_dbg;  /* -p : per-iteration residual trace                    */
+    int         N;         /* cubic grid dimension: n = N^3                     */
+    int         iters;     /* iterations (or restart cycles for GMRES)          */
+    int         m;         /* GMRES restart length (unused by the other solvers)*/
+    int         T1, T2;    /* task granularity (vectors / SpMV sub-blocks)      */
+    int         stencil;   /* 7 or 27 (stencil problems)                        */
+    double      conv;      /* convection strength (convection-diffusion)        */
+    double      sigma;     /* diagonal shift (MINRES indefinite test)           */
+    int         print_dbg; /* -p : per-iteration residual trace                 */
+    const char *mtx;       /* -M : Matrix Market file to import (NULL = generate)*/
 } KrylovParams;
 
 /* ---- timing-only statistics (ala Krylov.jl) ----

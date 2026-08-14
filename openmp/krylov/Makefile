@@ -61,8 +61,8 @@ CFLAGS  += -DALLOC_CUDA                    # cudaMallocHost (uses -lcudart above
 #LDFLAGS += -lamdhip64                      # ... its runtime lib, for ALLOC_HIP
 
 # ---- Sources --------------------------------------------------------------
-COMMON_SRC = common/spmat.cpp common/kalloc.cpp common/kernels.cpp
-COMMON_HDR = common/spmat.h common/kalloc.h common/kernels.h common/tasking.h
+COMMON_SRC = common/spmat.cpp common/kalloc.cpp common/kernels.cpp common/driver.cpp
+COMMON_HDR = common/spmat.h common/kalloc.h common/kernels.h common/tasking.h common/driver.h
 
 # =============================================================================
 # Solvers (one target each). Add a new solver <name> as:

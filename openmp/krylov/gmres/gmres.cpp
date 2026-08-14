@@ -27,6 +27,7 @@
 #include "tasking.h"
 #include "kalloc.h"
 #include "kernels.h"
+#include "driver.h"
 
 #include <math.h>
 #include <omp.h>
@@ -34,17 +35,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef GRID_N
-# define GRID_N 64
-#endif
 #ifndef RESTARTS
 # define RESTARTS 10       /* number of restart cycles */
 #endif
 #ifndef RESTART_M
 # define RESTART_M 30      /* Krylov subspace size (restart length) */
-#endif
-#ifndef CONV_COEFF
-# define CONV_COEFF 1.0
 #endif
 
 /* Host least-squares: solve min ||beta*e1 - H y|| for an (m+1) x m upper-
@@ -96,9 +91,15 @@ static double gmres_least_squares(real_t *H, int ld, int m, real_t beta, real_t 
 /* ==========================================================================
  * The solver.
  * ========================================================================== */
-static double gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
-                          int nrestart, int m, int T1, int T2, int print_dbg)
+static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
+                        const KrylovParams *prm, KrylovStats *st)
 {
+    const int     nrestart  = prm->iters;
+    const int     m         = prm->m;
+    const int     T1        = prm->T1;
+    const int     T2        = prm->T2;
+    const int     print_dbg = prm->print_dbg;
+
     const idx_t   n       = A->n;
     const idx_t   nnz     = A->nnz;
     const idx_t  *row_ptr = A->row_ptr;
@@ -209,12 +210,14 @@ static double gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                 task_axpy(&tl, y + i, (real_t) +1.0, Vd + (size_t) i * n, x);
             #pragma omp taskwait
 
-            if (print_dbg) {
-                const double now = omp_get_wtime();
+            /* Per-restart timing (always; GMRES already taskwaits per restart, so
+             * this is a plain host measurement) + optional residual print (-p). */
+            const double now = omp_get_wtime();
+            st->iter_ms[r] = (now - prev_ts) * 1000.0;
+            if (print_dbg)
                 printf("  restart %4d   residual = %.6e   spawn = %8.3f ms   exec = %8.3f ms\n",
-                       r, resid, spawn_ms, (now - prev_ts) * 1000.0);
-                prev_ts = now;
-            }
+                       r, resid, spawn_ms, st->iter_ms[r]);
+            prev_ts = now;
         }
     }
 
@@ -229,81 +232,18 @@ static double gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     kr_free(H); kr_free(y); kr_free(one); kr_free(beta); kr_free(ibeta); kr_free(hh); kr_free(ih);
     free(part); free(Hhost);
     spmv_tokens_free(w_tok);
-    return t1 - t0;
+    st->total_s = t1 - t0;
 }
 
 /* ==========================================================================
- * Driver.
+ * Descriptor (the shared driver in common/driver.cpp provides main()).
  * ========================================================================== */
-static void usage(const char *prog)
-{
-    fprintf(stderr,
-            "Usage: %s [-n N] [-i RESTARTS] [-m MEM] [-t T1] [-s T2] [-c CONV] [-p]\n"
-            "  -n N        cubic grid: solve an N*N*N system   (default %d)\n"
-            "  -i RESTARTS number of restart cycles            (default %d)\n"
-            "  -m MEM      Krylov subspace size (restart)      (default %d)\n"
-            "  -t T1       number of tasks per vector op        (default: omp threads)\n"
-            "  -s T2       number of SpMV sub-tasks per block   (default: omp threads)\n"
-            "  -c CONV     convection strength (0 => symmetric) (default %.2f)\n"
-            "  -p          print the residual at each restart\n",
-            prog, GRID_N, RESTARTS, RESTART_M, (double) CONV_COEFF);
-}
-
-int main(int argc, char **argv)
-{
-    int    N = GRID_N, nrestart = RESTARTS, m = RESTART_M, T1 = 0, T2 = 0, print_dbg = 0;
-    double conv = CONV_COEFF;
-
-    for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "-n") && i + 1 < argc) N        = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-i") && i + 1 < argc) nrestart = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-m") && i + 1 < argc) m        = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-t") && i + 1 < argc) T1       = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-s") && i + 1 < argc) T2       = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-c") && i + 1 < argc) conv     = atof(argv[++i]);
-        else if (!strcmp(argv[i], "-p"))                 print_dbg = 1;
-        else if (!strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
-        else { fprintf(stderr, "unknown argument: %s\n", argv[i]); usage(argv[0]); return 1; }
-    }
-    if (T1 <= 0) T1 = omp_get_max_threads();
-    if (T2 <= 0) T2 = omp_get_max_threads();
-    if (m  <= 0) m  = RESTART_M;
-
-    /* Build the nonsymmetric convection-diffusion system (exact solution = 1). */
-    SpMatrix A;
-    real_t *b = NULL, *xexact = NULL;
-    spmat_generate_convdiff(&A, N, N, N, (real_t) conv, &b, &xexact);
-
-    printf("Krylov GMRES(%d) (Jacobi-preconditioned)\n", m);
-    printf("  backend    : %s\n", USE_TARGET ? "GPU (omp target, pinned host mem)" : "CPU (omp task, malloc)");
-    printf("  taskgraph  : %s\n", USE_TASKGRAPH ? "on" : "off");
-    printf("  matrix     : convection-diffusion (conv = %.2f, %s)\n",
-           conv, conv == 0.0 ? "symmetric" : "nonsymmetric");
-    printf("  grid       : %d x %d x %d  (n = %d, nnz = %d)\n", N, N, N, A.n, A.nnz);
-    printf("  restarts   : %d  x  m = %d  (%d Arnoldi steps)\n", nrestart, m, nrestart * m);
-    printf("  tasks      : T1 = %d (vectors), T2 = %d (SpMV sub-blocks)\n", T1, T2);
-    printf("  omp threads: %d\n", omp_get_max_threads());
-
-    real_t *x = (real_t *) kr_alloc((size_t) A.n * sizeof(real_t));
-
-    const double solve_time = gmres_solve(&A, b, x, nrestart, m, T1, T2, print_dbg);
-
-    /* Verification: true residual ||b - A x||_2 and error ||x - xexact||_2. */
-    real_t *Ax = (real_t *) malloc((size_t) A.n * sizeof(real_t));
-    spmat_spmv(&A, x, Ax);
-    double res2 = 0.0, b2 = 0.0, err2 = 0.0, xe2 = 0.0;
-    for (idx_t i = 0; i < A.n; i++) {
-        const double ri = (double) b[i] - (double) Ax[i];
-        const double ei = (double) x[i] - (double) xexact[i];
-        res2 += ri * ri; b2 += (double) b[i] * (double) b[i];
-        err2 += ei * ei; xe2 += (double) xexact[i] * (double) xexact[i];
-    }
-    printf("Results\n");
-    printf("  solve time            : %.4f s\n", solve_time);
-    printf("  relative residual     : %.6e   (||b-Ax|| / ||b||)\n", sqrt(res2 / b2));
-    printf("  relative error        : %.6e   (||x-xexact|| / ||xexact||)\n", sqrt(err2 / xe2));
-
-    free(Ax); kr_free(x); free(b); free(xexact);
-    spmat_free(&A);
-    return 0;
-}
+const KrylovDescriptor krylov_descriptor = {
+    /* name          */ "GMRES",
+    /* problem       */ KR_CONVDIFF,
+    /* opt_mask      */ OPT_CONV | OPT_MEM,
+    /* restarted     */ 1,
+    /* default_iters */ RESTARTS,
+    /* default_m     */ RESTART_M,
+    /* solve         */ gmres_solve,
+};

@@ -27,17 +27,14 @@
 #include "tasking.h"
 #include "kalloc.h"
 #include "kernels.h"
+#include "driver.h"
 
 #include <math.h>
 #include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 /* ---- Problem/solver defaults (override with -D on the compiler) ---- */
-#ifndef GRID_N
-# define GRID_N 64        /* cubic grid dimension: n = GRID_N^3 unknowns */
-#endif
 #ifndef MAX_ITER
 # define MAX_ITER 50      /* fixed number of CR iterations */
 #endif
@@ -45,9 +42,14 @@
 /* ==========================================================================
  * The solver.
  * ========================================================================== */
-static double cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
-                       int max_iter, int T1, int T2, int print_dbg)
+static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
+                     const KrylovParams *prm, KrylovStats *st)
 {
+    const int     max_iter  = prm->iters;
+    const int     T1        = prm->T1;
+    const int     T2        = prm->T2;
+    const int     print_dbg = prm->print_dbg;
+
     const idx_t   n       = A->n;
     const idx_t   nnz     = A->nnz;
     const idx_t  *row_ptr = A->row_ptr;
@@ -120,21 +122,22 @@ static double cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
             }
             TASKGRAPH_END
 
+            /* Per-iteration timing (always) + optional residual print (-p).
+             * Depend-synchronized host task (no taskwait), anchored on rho (=
+             * ||r||_A^2); consecutive firings bracket one iteration's work. */
+            const double spawn_ms = print_dbg ? (omp_get_wtime() - spawn0) * 1000.0 : 0.0;
             if (print_dbg) {
-                const double spawn_ms = (omp_get_wtime() - spawn0) * 1000.0;
-                /* Async D2H of rho (= ||r||_A^2), ordered via its token. */
                 OMP_TARGET_UPDATE(from(rho[0:1]) nowait DEPEND(inout, rho[0]))
-                /* Depend-synchronized debug print (no taskwait); anchored on rho
-                 * (computed after the SpMV), so consecutive prints bracket exactly
-                 * one iteration's work. */
-                OMP_HOST_TASK(default(none) firstprivate(it, spawn_ms, rho) shared(prev_ts) DEPEND(in, rho[0]))
-                {
-                    const double now     = omp_get_wtime();
-                    const double exec_ms = (now - prev_ts) * 1000.0;
-                    prev_ts = now;
+            }
+            OMP_HOST_TASK(DEFAULT_NONE firstprivate(it, spawn_ms, rho, print_dbg, st)
+                          shared(prev_ts) DEPEND(in, rho[0]))
+            {
+                const double now = omp_get_wtime();
+                st->iter_ms[it] = (now - prev_ts) * 1000.0;
+                prev_ts = now;
+                if (print_dbg)
                     printf("  iter %4d   residual = %.6e   spawn = %8.3f ms   exec = %8.3f ms\n",
-                           it, sqrt(fabs((double) rho[0])), spawn_ms, exec_ms);
-                }
+                           it, sqrt(fabs((double) rho[0])), spawn_ms, st->iter_ms[it]);
             }
         }
         #pragma omp taskwait
@@ -151,78 +154,18 @@ static double cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
     kr_free(rho); kr_free(rho_bar); kr_free(qMq); kr_free(alpha); kr_free(beta);
     free(part_qMq); free(part_rho);
     spmv_tokens_free(ar_tok);
-    return t1 - t0;
+    st->total_s = t1 - t0;
 }
 
 /* ==========================================================================
- * Driver.
+ * Descriptor (the shared driver in common/driver.cpp provides main()).
  * ========================================================================== */
-static void usage(const char *prog)
-{
-    fprintf(stderr,
-            "Usage: %s [-n N] [-i ITER] [-t T1] [-s T2] [-S {7|27}] [-p]\n"
-            "  -n N       cubic grid: solve an N*N*N system   (default %d)\n"
-            "  -i ITER    fixed number of CR iterations       (default %d)\n"
-            "  -t T1      number of tasks per vector op        (default: omp threads)\n"
-            "  -s T2      number of SpMV sub-tasks per block   (default: omp threads)\n"
-            "  -S STENCIL 7- or 27-point 3-D stencil           (default 27)\n"
-            "  -p         print the residual at each iteration\n",
-            prog, GRID_N, MAX_ITER);
-}
-
-int main(int argc, char **argv)
-{
-    int N = GRID_N, max_iter = MAX_ITER, stencil = SPMAT_STENCIL_27PT;
-    int T1 = 0, T2 = 0, print_dbg = 0;
-
-    for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "-n") && i + 1 < argc) N        = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-i") && i + 1 < argc) max_iter = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-t") && i + 1 < argc) T1       = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-s") && i + 1 < argc) T2       = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-S") && i + 1 < argc) stencil  = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-p"))                 print_dbg = 1;
-        else if (!strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
-        else { fprintf(stderr, "unknown argument: %s\n", argv[i]); usage(argv[0]); return 1; }
-    }
-    if (T1 <= 0) T1 = omp_get_max_threads();
-    if (T2 <= 0) T2 = omp_get_max_threads();
-    if (stencil != SPMAT_STENCIL_7PT && stencil != SPMAT_STENCIL_27PT) stencil = SPMAT_STENCIL_27PT;
-
-    /* Build the SPD test system (exact solution is all-ones). */
-    SpMatrix A;
-    real_t *b = NULL, *xexact = NULL;
-    spmat_generate_stencil(&A, N, N, N, stencil, &b, &xexact);
-
-    printf("Krylov CR (Jacobi-preconditioned)\n");
-    printf("  backend    : %s\n", USE_TARGET ? "GPU (omp target, pinned host mem)" : "CPU (omp task, malloc)");
-    printf("  taskgraph  : %s\n", USE_TASKGRAPH ? "on" : "off");
-    printf("  grid       : %d x %d x %d  (n = %d, nnz = %d, %d-pt stencil)\n",
-           N, N, N, A.n, A.nnz, stencil);
-    printf("  iterations : %d\n", max_iter);
-    printf("  tasks      : T1 = %d (vectors), T2 = %d (SpMV sub-blocks)\n", T1, T2);
-    printf("  omp threads: %d\n", omp_get_max_threads());
-
-    real_t *x = (real_t *) kr_alloc((size_t) A.n * sizeof(real_t));
-
-    const double solve_time = cr_solve(&A, b, x, max_iter, T1, T2, print_dbg);
-
-    /* Verification: true residual ||b - A x||_2 and error ||x - xexact||_2. */
-    real_t *Ax = (real_t *) malloc((size_t) A.n * sizeof(real_t));
-    spmat_spmv(&A, x, Ax);
-    double res2 = 0.0, b2 = 0.0, err2 = 0.0, xe2 = 0.0;
-    for (idx_t i = 0; i < A.n; i++) {
-        const double ri = (double) b[i] - (double) Ax[i];
-        const double ei = (double) x[i] - (double) xexact[i];
-        res2 += ri * ri; b2 += (double) b[i] * (double) b[i];
-        err2 += ei * ei; xe2 += (double) xexact[i] * (double) xexact[i];
-    }
-    printf("Results\n");
-    printf("  solve time            : %.4f s\n", solve_time);
-    printf("  relative residual     : %.6e   (||b-Ax|| / ||b||)\n", sqrt(res2 / b2));
-    printf("  relative error        : %.6e   (||x-xexact|| / ||xexact||)\n", sqrt(err2 / xe2));
-
-    free(Ax); kr_free(x); free(b); free(xexact);
-    spmat_free(&A);
-    return 0;
-}
+const KrylovDescriptor krylov_descriptor = {
+    /* name          */ "CR",
+    /* problem       */ KR_SPD_STENCIL,
+    /* opt_mask      */ OPT_STENCIL,
+    /* restarted     */ 0,
+    /* default_iters */ MAX_ITER,
+    /* default_m     */ 0,
+    /* solve         */ cr_solve,
+};

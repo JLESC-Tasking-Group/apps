@@ -31,7 +31,9 @@ CFLAGS += -DMAX_ITER=50
 # For a portable build on vanilla clang/gcc, set this to 0 (plain OpenMP tasks).
 CFLAGS += -DUSE_TASKGRAPH=1
 CFLAGS += -DUSE_REPLAYABLE=0
-CFLAGS += -fopenmp-task-jit-type=packed
+CFLAGS += -fopenmp-task-jit-type=none
+#CFLAGS += -fopenmp-task-jit-type=pointers
+#CFLAGS += -fopenmp-task-jit-type=packed
 
 LDFLAGS  =
 LDFLAGS += -lm

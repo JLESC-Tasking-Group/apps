@@ -162,8 +162,7 @@ void task_xpby(const Tiling *tl, const real_t *x, const real_t *s, real_t *y)
 static void gpu_dot_zero(const Tiling *tl, real_t *part)
 {
     const int NTB1 = tl->NTB1;
-    OMP_TARGET_TASK(DEFAULT_NONE firstprivate(part, NTB1)
-                    DEPEND_MULTI(out, (t1=0:NTB1), part[t1]) MAP(present: part[0:NTB1]))
+    OMP_TARGET_TASK(DEPEND_MULTI(out, (t1=0:NTB1), part[t1]) MAP(present: part[0:NTB1]))
     {
         for (int t1 = 0; t1 < NTB1; t1++) part[t1] = (real_t) 0.0;
     }
@@ -172,8 +171,7 @@ static void gpu_dot_zero(const Tiling *tl, real_t *part)
 static void gpu_dot_finalize(const Tiling *tl, const real_t *part, real_t *result)
 {
     const int NTB1 = tl->NTB1;
-    OMP_TARGET_TASK(DEFAULT_NONE firstprivate(part, result, NTB1)
-                    DEPEND_MULTI(in, (t1=0:NTB1), part[t1]) DEPEND(out, result[0])
+    OMP_TARGET_TASK(DEPEND_MULTI(in, (t1=0:NTB1), part[t1]) DEPEND(out, result[0])
                     MAP(present: part[0:NTB1], result[0:1]))
     {
         real_t s = (real_t) 0.0;
@@ -336,7 +334,7 @@ void task_dot_spmv(const Tiling *tl, const real_t *a, const real_t *ys, char *ys
  * ========================================================================== */
 void task_scalar_div(const real_t *a, const real_t *b, real_t *c)
 {
-    OMP_TARGET_TASK(DEFAULT_NONE firstprivate(a, b, c), DEPEND(in, a[0], b[0]) DEPEND(out, c[0]) MAP(present: a[0:1], b[0:1], c[0:1]))
+    OMP_TARGET_TASK(DEPEND(in, a[0], b[0]) DEPEND(out, c[0]) MAP(present: a[0:1], b[0:1], c[0:1]))
     {
         c[0] = a[0] / b[0];
     }
@@ -344,7 +342,7 @@ void task_scalar_div(const real_t *a, const real_t *b, real_t *c)
 
 void task_scalar_copy(const real_t *a, real_t *b)
 {
-    OMP_TARGET_TASK(DEFAULT_NONE firstprivate(a, b) DEPEND(in, a[0]) DEPEND(out, b[0]) MAP(present: a[0:1], b[0:1]))
+    OMP_TARGET_TASK(DEPEND(in, a[0]) DEPEND(out, b[0]) MAP(present: a[0:1], b[0:1]))
     {
         b[0] = a[0];
     }

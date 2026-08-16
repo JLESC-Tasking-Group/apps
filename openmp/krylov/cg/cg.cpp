@@ -76,9 +76,10 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
     real_t *alpha = (real_t *) kr_alloc(sizeof(real_t));
     real_t *beta  = (real_t *) kr_alloc(sizeof(real_t));
 
-    /* Host-only partial sums for the CPU dot reduction (unused on GPU). */
-    real_t *part1 = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t)); /* <p,Ap> */
-    real_t *part2 = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t)); /* <r,z>  */
+    /* Per-block partial dot sums (device-resident: the dot decomposes into T1
+     * partial reductions into these + a finalize, on both backends). */
+    real_t *part1 = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t)); /* <p,Ap> */
+    real_t *part2 = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t)); /* <r,z>  */
 
     /* Host initialization: inv_diag = 1/diag(A), x = 0, r = b (since x0 = 0). */
     spmat_extract_diagonal(A, inv);
@@ -86,7 +87,8 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
     for (idx_t i = 0; i < n; i++) { x[i] = (real_t) 0.0; r[i] = b[i]; }
 
     OMP_TARGET_ENTER_DATA(MAP(to: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], x[0:n], r[0:n])
-                          MAP(alloc: p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1]))
+                          MAP(alloc: p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1],
+                                     part1[0:tl.NTB1], part2[0:tl.NTB1]))
 
     const double t0 = omp_get_wtime();
 
@@ -152,11 +154,12 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
     const double t1 = omp_get_wtime();
 
     OMP_TARGET_EXIT_DATA(MAP(from: x[0:n]) MAP(release: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], r[0:n],
-                                      p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1]))
+                                      p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1],
+                                      part1[0:tl.NTB1], part2[0:tl.NTB1]))
 
     kr_free(r); kr_free(p); kr_free(Ap); kr_free(z); kr_free(inv);
     kr_free(gamma); kr_free(g_new); kr_free(pAp); kr_free(alpha); kr_free(beta);
-    free(part1); free(part2);
+    kr_free(part1); kr_free(part2);
     spmv_tokens_free(ap_tok);
     st->total_s = t1 - t0;
 }

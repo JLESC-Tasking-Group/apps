@@ -127,8 +127,8 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     real_t *ibeta = (real_t *) kr_alloc(sizeof(real_t)); /* 1/beta  */
     real_t *hh    = (real_t *) kr_alloc(sizeof(real_t)); /* <q,q>   */
     real_t *ih    = (real_t *) kr_alloc(sizeof(real_t)); /* 1/||q|| */
-    real_t *part  = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t)); /* CPU dot partials */
-    real_t *Hhost = (real_t *) malloc((size_t) ld * (size_t) m * sizeof(real_t)); /* host H */
+    real_t *part  = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t)); /* per-block dot partials (device-resident) */
+    real_t *Hhost = (real_t *) malloc((size_t) ld * (size_t) m * sizeof(real_t)); /* host H (least-squares) */
 
     /* Host init: inv_diag, x = 0, b on device, H = 0, one = 1. */
     spmat_extract_diagonal(A, inv);
@@ -140,7 +140,8 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     OMP_TARGET_ENTER_DATA(map(to: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], x[0:n], bd[0:n],
                                   H[0:ld * m], one[0:1])
                           map(alloc: Vd[0:(m + 1) * n], w[0:n], q[0:n], res[0:n],
-                                     y[0:m], beta[0:1], ibeta[0:1], hh[0:1], ih[0:1]))
+                                     y[0:m], beta[0:1], ibeta[0:1], hh[0:1], ih[0:1],
+                                     part[0:tl.NTB1]))
 
     const double t0 = omp_get_wtime();
     double prev_ts = t0;
@@ -226,11 +227,12 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     OMP_TARGET_EXIT_DATA(map(from: x[0:n])
                          map(release: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], bd[0:n],
                                       Vd[0:(m + 1) * n], w[0:n], q[0:n], res[0:n], H[0:ld * m], y[0:m],
-                                      one[0:1], beta[0:1], ibeta[0:1], hh[0:1], ih[0:1]))
+                                      one[0:1], beta[0:1], ibeta[0:1], hh[0:1], ih[0:1],
+                                      part[0:tl.NTB1]))
 
     kr_free(Vd); kr_free(w); kr_free(q); kr_free(res); kr_free(bd); kr_free(inv);
     kr_free(H); kr_free(y); kr_free(one); kr_free(beta); kr_free(ibeta); kr_free(hh); kr_free(ih);
-    free(part); free(Hhost);
+    kr_free(part); free(Hhost);
     spmv_tokens_free(w_tok);
     st->total_s = t1 - t0;
 }

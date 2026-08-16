@@ -82,6 +82,34 @@
 
 #endif /* USE_TARGET */
 
+/* ----------------------------------------------------------------------------
+ * One tile of a T1-decomposed (T1xT2 for SpMV) vector operation. The SAME tiled
+ * loop serves both backends: each tile becomes one host task (CPU) or one
+ * offloaded parallel-for over the tile's sub-range (GPU). The task granularity
+ * therefore follows -t/-s on BOTH backends (T1=T2=1 -> one tile == one kernel
+ * per op, i.e. the coarse single-task-per-op schedule).
+ *
+ *     for (blk = 0; blk < n; blk += BS) {
+ *         const idx_t begin = blk, end = KR_MIN(blk + BS, n);
+ *         OMP_TILE(DEPEND(in, x[begin]) DEPEND(out, y[begin]),
+ *                  MAP(present: x[0:n], y[0:n]),
+ *                  firstprivate(x, y, begin, end))
+ *         for (idx_t i = begin; i < end; i++) y[i] = x[i];
+ *     }
+ *
+ * Three arguments (each keeps its commas parenthesis-shielded):
+ *   deps : DEPEND(...) / DEPEND_MULTI(...) clauses (common to both backends)
+ *   mp   : MAP(present: ...) clause         (GPU only; empty on the host)
+ *   fp   : firstprivate(...) clause         (CPU only; target scalars/pointers
+ *          are implicitly firstprivate/mapped, and firstprivate on a target
+ *          construct trips a clang codegen assertion, so it is omitted on GPU).
+ * ------------------------------------------------------------------------- */
+#if USE_TARGET
+# define OMP_TILE(deps, mp, fp) KR_XPRAGMA(omp target teams distribute parallel for REPLAYABLE_CLAUSE nowait deps mp)
+#else
+# define OMP_TILE(deps, mp, fp) KR_XPRAGMA(omp task REPLAYABLE_CLAUSE default(none) fp deps)
+#endif
+
 /* Always a host task (never offloaded), regardless of USE_TARGET. Used for
  * host-side work such as the optional per-iteration debug print. It is created
  * outside the taskgraph region, so it is not marked replayable. */

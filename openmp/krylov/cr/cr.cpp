@@ -75,9 +75,10 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
     real_t *alpha   = (real_t *) kr_alloc(sizeof(real_t));
     real_t *beta    = (real_t *) kr_alloc(sizeof(real_t));
 
-    /* Host-only partial sums for the CPU dot reductions (unused on GPU). */
-    real_t *part_qMq = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_rho = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t));
+    /* Per-block partial dot sums (device-resident; the dot decomposes into T1
+     * partial reductions into these + a finalize, on both backends). */
+    real_t *part_qMq = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_rho = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
 
     /* Host init: inv_diag = 1/diag(A), x = 0, r = M b = inv_diag .* b (x0 = 0). */
     spmat_extract_diagonal(A, inv);
@@ -86,7 +87,8 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
 
     OMP_TARGET_ENTER_DATA(map(to: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], x[0:n], r[0:n])
                           map(alloc: p[0:n], q[0:n], Ar[0:n], Mq[0:n],
-                                     rho[0:1], rho_bar[0:1], qMq[0:1], alpha[0:1], beta[0:1]))
+                                     rho[0:1], rho_bar[0:1], qMq[0:1], alpha[0:1], beta[0:1],
+                                     part_qMq[0:tl.NTB1], part_rho[0:tl.NTB1]))
 
     const double t0 = omp_get_wtime();
 
@@ -148,11 +150,12 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
     OMP_TARGET_EXIT_DATA(map(from: x[0:n])
                          map(release: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], r[0:n],
                                       p[0:n], q[0:n], Ar[0:n], Mq[0:n],
-                                      rho[0:1], rho_bar[0:1], qMq[0:1], alpha[0:1], beta[0:1]))
+                                      rho[0:1], rho_bar[0:1], qMq[0:1], alpha[0:1], beta[0:1],
+                                      part_qMq[0:tl.NTB1], part_rho[0:tl.NTB1]))
 
     kr_free(r); kr_free(p); kr_free(q); kr_free(Ar); kr_free(Mq); kr_free(inv);
     kr_free(rho); kr_free(rho_bar); kr_free(qMq); kr_free(alpha); kr_free(beta);
-    free(part_qMq); free(part_rho);
+    kr_free(part_qMq); kr_free(part_rho);
     spmv_tokens_free(ar_tok);
     st->total_s = t1 - t0;
 }

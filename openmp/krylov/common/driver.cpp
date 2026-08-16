@@ -152,8 +152,11 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-h")) { usage(argv[0], d); return 0; }
         else { fprintf(stderr, "unknown argument: %s\n", argv[i]); usage(argv[0], d); return 1; }
     }
-    if (prm.T1 <= 0) prm.T1 = omp_get_max_threads();
-    if (prm.T2 <= 0) prm.T2 = omp_get_max_threads();
+    /* Default granularity: one tile per op on the GPU (T1=T2=1 -> one kernel per
+     * op, the coarse schedule); the host thread count on the CPU. Either way
+     * -t/-s override it and decompose the task graph on both backends. */
+    if (prm.T1 <= 0) prm.T1 = USE_TARGET ? 1 : omp_get_max_threads();
+    if (prm.T2 <= 0) prm.T2 = USE_TARGET ? 1 : omp_get_max_threads();
     if (prm.m  <= 0) prm.m  = d->default_m;
     if ((d->opt_mask & OPT_STENCIL) &&
         prm.stencil != SPMAT_STENCIL_7PT && prm.stencil != SPMAT_STENCIL_27PT)

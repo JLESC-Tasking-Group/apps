@@ -80,12 +80,13 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
     real_t *beta     = (real_t *) kr_alloc(sizeof(real_t));
     real_t *rr       = (real_t *) kr_alloc(sizeof(real_t)); /* <r,r> for the residual */
 
-    /* Host-only partial sums for the CPU dot reductions (unused on GPU). */
-    real_t *part_cv = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_ts = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_tt = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_nr = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_rr = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t));
+    /* Per-block partial dot sums (device-resident; the dot decomposes into T1
+     * partial reductions into these + a finalize, on both backends). */
+    real_t *part_cv = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_ts = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_tt = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_nr = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_rr = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
 
     /* Host init: inv_diag = 1/diag(A), x = 0, r = b (true residual, x0 = 0). */
     spmat_extract_diagonal(A, inv);
@@ -95,7 +96,9 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
     OMP_TARGET_ENTER_DATA(map(to: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], x[0:n], r[0:n])
                           map(alloc: c[0:n], p[0:n], q[0:n], v[0:n], s[0:n], d[0:n], t[0:n],
                                      rho[0:1], next_rho[0:1], cv[0:1], ts[0:1], tt[0:1],
-                                     alpha[0:1], omega[0:1], beta[0:1], rr[0:1]))
+                                     alpha[0:1], omega[0:1], beta[0:1], rr[0:1],
+                                     part_cv[0:tl.NTB1], part_ts[0:tl.NTB1], part_tt[0:tl.NTB1],
+                                     part_nr[0:tl.NTB1], part_rr[0:tl.NTB1]))
 
     const double t0 = omp_get_wtime();
 
@@ -172,13 +175,15 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
                          map(release: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], r[0:n],
                                       c[0:n], p[0:n], q[0:n], v[0:n], s[0:n], d[0:n], t[0:n],
                                       rho[0:1], next_rho[0:1], cv[0:1], ts[0:1], tt[0:1],
-                                      alpha[0:1], omega[0:1], beta[0:1], rr[0:1]))
+                                      alpha[0:1], omega[0:1], beta[0:1], rr[0:1],
+                                      part_cv[0:tl.NTB1], part_ts[0:tl.NTB1], part_tt[0:tl.NTB1],
+                                      part_nr[0:tl.NTB1], part_rr[0:tl.NTB1]))
 
     kr_free(r); kr_free(c); kr_free(p); kr_free(q); kr_free(v);
     kr_free(s); kr_free(d); kr_free(t); kr_free(inv);
     kr_free(rho); kr_free(next_rho); kr_free(cv); kr_free(ts); kr_free(tt);
     kr_free(alpha); kr_free(omega); kr_free(beta); kr_free(rr);
-    free(part_cv); free(part_ts); free(part_tt); free(part_nr); free(part_rr);
+    kr_free(part_cv); kr_free(part_ts); kr_free(part_tt); kr_free(part_nr); kr_free(part_rr);
     spmv_tokens_free(q_tok);
     spmv_tokens_free(d_tok);
     st->total_s = t1 - t0;

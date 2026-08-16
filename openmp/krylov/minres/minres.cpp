@@ -84,8 +84,10 @@ static void minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     real_t *phi       = (real_t *) kr_alloc(sizeof(real_t));
     real_t *gamma_inv = (real_t *) kr_alloc(sizeof(real_t));
 
-    real_t *part_vy  = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_r2v = (real_t *) malloc((size_t) tl.NTB1 * sizeof(real_t));
+    /* Per-block partial dot sums (device-resident; the dot decomposes into T1
+     * partial reductions into these + a finalize, on both backends). */
+    real_t *part_vy  = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_r2v = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
 
     /* Host init: inv_diag, x = 0, r1 = r2 = b, v = M^-1 b = inv .* b, w's = 0. */
     spmat_extract_diagonal(A, inv);
@@ -102,7 +104,8 @@ static void minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                           map(alloc: Av[0:n], y[0:n], wcur[0:n],
                                      beta[0:1], oldb[0:1], dbar[0:1], eps[0:1], cs[0:1], sn[0:1], phibar[0:1],
                                      inv_beta[0:1], bob[0:1], vy[0:1], alpha[0:1], delta[0:1], aob[0:1],
-                                     r2v[0:1], phi[0:1], gamma_inv[0:1]))
+                                     r2v[0:1], phi[0:1], gamma_inv[0:1],
+                                     part_vy[0:tl.NTB1], part_r2v[0:tl.NTB1]))
 
     const double t0 = omp_get_wtime();
 
@@ -235,14 +238,15 @@ static void minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                                       r1[0:n], r2[0:n], v[0:n], Av[0:n], y[0:n], wcur[0:n], wm1[0:n], wm2[0:n],
                                       beta[0:1], oldb[0:1], dbar[0:1], eps[0:1], cs[0:1], sn[0:1], phibar[0:1],
                                       inv_beta[0:1], bob[0:1], vy[0:1], alpha[0:1], delta[0:1], aob[0:1],
-                                      r2v[0:1], phi[0:1], gamma_inv[0:1]))
+                                      r2v[0:1], phi[0:1], gamma_inv[0:1],
+                                      part_vy[0:tl.NTB1], part_r2v[0:tl.NTB1]))
 
     kr_free(v); kr_free(Av); kr_free(y); kr_free(r1); kr_free(r2);
     kr_free(wcur); kr_free(wm1); kr_free(wm2); kr_free(inv);
     kr_free(beta); kr_free(oldb); kr_free(dbar); kr_free(eps); kr_free(cs); kr_free(sn); kr_free(phibar);
     kr_free(inv_beta); kr_free(bob); kr_free(vy); kr_free(alpha); kr_free(delta); kr_free(aob);
     kr_free(r2v); kr_free(phi); kr_free(gamma_inv);
-    free(part_vy); free(part_r2v);
+    kr_free(part_vy); kr_free(part_r2v);
     spmv_tokens_free(av_tok);
     st->total_s = t1 - t0;
 }

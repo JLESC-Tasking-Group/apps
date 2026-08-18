@@ -48,10 +48,24 @@ typedef struct {
 
 void krylov_stats_init  (KrylovStats *s, int niter);
 void krylov_stats_free  (KrylovStats *s);
-/* Print total time, iteration 0, iteration 1, and the mean and (sample) standard
- * deviation of iterations 2..niter-1. `unit` is "iteration" or "restart"; when
- * `taskgraph` is nonzero the first two lines are annotated (record)/(1st replay). */
-void krylov_stats_report(const KrylovStats *s, const char *unit, int taskgraph);
+/* Print total time; total (theoretical) FLOPs and the derived GFLOP/s; then
+ * iteration 0, iteration 1, and the mean and (sample) standard deviation of
+ * iterations 2..niter-1. `unit` is "iteration" or "restart"; when `taskgraph`
+ * is nonzero the first two lines are annotated (record)/(1st replay). Pass
+ * flops <= 0 to omit the FLOP lines. */
+void krylov_stats_report(const KrylovStats *s, const char *unit, int taskgraph, double flops);
+
+/* ---- theoretical FLOP costs of the tasked kernels ----
+ * n = vector length, nnz = matrix nonzeros. Standard textbook counts: SpMV does
+ * one multiply + one add per stored nonzero; dot/axpy/xpby are 2n; scal/vmul are
+ * n; copy is free; the O(1) scalar tasks (div/copy) are neglected. Used by each
+ * solver's `flops` callback to report the work it theoretically performed. */
+#define KR_FLOP_SPMV(nnz) (2.0 * (double)(nnz))
+#define KR_FLOP_DOT(n)    (2.0 * (double)(n))
+#define KR_FLOP_AXPY(n)   (2.0 * (double)(n))
+#define KR_FLOP_XPBY(n)   (2.0 * (double)(n))
+#define KR_FLOP_VMUL(n)   (1.0 * (double)(n))
+#define KR_FLOP_SCAL(n)   (1.0 * (double)(n))
 
 /* ---- solver descriptor: each solver translation unit provides exactly one ---- */
 typedef enum { KR_SPD_STENCIL, KR_CONVDIFF, KR_STENCIL_SHIFT } kr_problem_t;
@@ -69,6 +83,9 @@ typedef struct {
     /* Run the solve: fill st (per-iteration times + st->total_s). */
     void       (*solve)(const SpMatrix *A, const real_t *b, real_t *x,
                         const KrylovParams *prm, KrylovStats *st);
+    /* Theoretical FLOPs the algorithm performs for this problem/params (setup +
+     * all iterations). Uses the KR_FLOP_* costs above. */
+    double     (*flops)(const SpMatrix *A, const KrylovParams *prm);
 } KrylovDescriptor;
 
 /* Defined by each solver; referenced by the shared main() in driver.cpp. */

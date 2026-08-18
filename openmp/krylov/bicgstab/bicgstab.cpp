@@ -189,6 +189,21 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
     st->total_s = t1 - t0;
 }
 
+/* Theoretical FLOPs: setup (next_rho = <c,r>) plus, per iteration, two SpMVs,
+ * two vmul (v = M q, t = M d), five dots (<c,v>,<t,s>,<t,t>,<c,r>,<r,r>), five
+ * axpy and one xpby. */
+static double bicgstab_flops(const SpMatrix *A, const KrylovParams *prm)
+{
+    const double n = (double) A->n, nnz = (double) A->nnz;
+    const double setup    = KR_FLOP_DOT(n);
+    const double per_iter = 2.0 * KR_FLOP_SPMV(nnz)   /* q = A p, d = A s        */
+                          + 2.0 * KR_FLOP_VMUL(n)     /* v = M q, t = M d        */
+                          + 5.0 * KR_FLOP_DOT(n)      /* cv, ts, tt, next_rho, rr */
+                          + 5.0 * KR_FLOP_AXPY(n)     /* s, x, x, r, p updates    */
+                          + KR_FLOP_XPBY(n);          /* p = r + beta p           */
+    return setup + (double) prm->iters * per_iter;
+}
+
 /* ==========================================================================
  * Descriptor (the shared driver in common/driver.cpp provides main()).
  * ========================================================================== */
@@ -200,4 +215,5 @@ const KrylovDescriptor krylov_descriptor = {
     /* default_iters */ MAX_ITER,
     /* default_m     */ 0,
     /* solve         */ bicgstab_solve,
+    /* flops         */ bicgstab_flops,
 };

@@ -251,6 +251,22 @@ static void minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     st->total_s = t1 - t0;
 }
 
+/* Theoretical FLOPs: setup (beta = <r1,v>) plus, per iteration, one SpMV, two
+ * dots (<v,y>, <r2,v>), five axpy, one vmul, two scal (y/=beta, wcur/=gamma) and
+ * one scal_copy (wcur = v/beta). The Givens/Lanczos scalar tasks are O(1). */
+static double minres_flops(const SpMatrix *A, const KrylovParams *prm)
+{
+    const double n = (double) A->n, nnz = (double) A->nnz;
+    const double setup    = KR_FLOP_DOT(n);
+    const double per_iter = KR_FLOP_SPMV(nnz)         /* Av = A v            */
+                          + 2.0 * KR_FLOP_DOT(n)      /* <v,y>, <r2,v>       */
+                          + 5.0 * KR_FLOP_AXPY(n)     /* y (x3), wcur (x2)   */
+                          + KR_FLOP_VMUL(n)           /* v = M^-1 r2         */
+                          + 2.0 * KR_FLOP_SCAL(n)     /* y/=beta, wcur/=gamma */
+                          + KR_FLOP_SCAL(n);          /* wcur = v/beta       */
+    return setup + (double) prm->iters * per_iter;
+}
+
 /* ==========================================================================
  * Descriptor (the shared driver in common/driver.cpp provides main()).
  * ========================================================================== */
@@ -262,4 +278,5 @@ const KrylovDescriptor krylov_descriptor = {
     /* default_iters */ MAX_ITER,
     /* default_m     */ 0,
     /* solve         */ minres_solve,
+    /* flops         */ minres_flops,
 };

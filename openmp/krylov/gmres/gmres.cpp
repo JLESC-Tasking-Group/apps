@@ -237,6 +237,32 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     st->total_s = t1 - t0;
 }
 
+/* Theoretical FLOPs per restart: setup (r0 = M(b - A x), beta, V[0]) + the
+ * Arnoldi/MGS loop (m SpMVs, and O(n*m^2) dots/axpys from modified Gram-Schmidt)
+ * + the x-update (m axpys). The (m+1)x m host least-squares is O(m^2), negligible
+ * against the O(n*m^2) vector work, and omitted. */
+static double gmres_flops(const SpMatrix *A, const KrylovParams *prm)
+{
+    const double n = (double) A->n, nnz = (double) A->nnz;
+    const int    m = prm->m;
+
+    double per_restart = KR_FLOP_SPMV(nnz)   /* w = A x            */
+                       + KR_FLOP_AXPY(n)     /* res -= A x         */
+                       + KR_FLOP_VMUL(n)     /* q = M res          */
+                       + KR_FLOP_DOT(n)      /* beta = <q,q>       */
+                       + KR_FLOP_SCAL(n);    /* V[0] = q / beta    */
+    for (int j = 0; j < m; j++) {
+        per_restart += KR_FLOP_SPMV(nnz)     /* w = A V[j]         */
+                     + KR_FLOP_VMUL(n)       /* q = M w            */
+                     + KR_FLOP_DOT(n);       /* hh = <q,q>         */
+        per_restart += (double)(j + 1) * (KR_FLOP_DOT(n) + KR_FLOP_AXPY(n)); /* MGS */
+        if (j < m - 1) per_restart += KR_FLOP_SCAL(n);            /* V[j+1] = q/||q|| */
+    }
+    per_restart += (double) m * KR_FLOP_AXPY(n);                  /* x += sum y[i] V[i] */
+
+    return (double) prm->iters * per_restart;
+}
+
 /* ==========================================================================
  * Descriptor (the shared driver in common/driver.cpp provides main()).
  * ========================================================================== */
@@ -248,4 +274,5 @@ const KrylovDescriptor krylov_descriptor = {
     /* default_iters */ RESTARTS,
     /* default_m     */ RESTART_M,
     /* solve         */ gmres_solve,
+    /* flops         */ gmres_flops,
 };

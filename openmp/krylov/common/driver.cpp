@@ -37,12 +37,17 @@ void krylov_stats_free(KrylovStats *s)
     s->iter_ms = NULL;
 }
 
-void krylov_stats_report(const KrylovStats *s, const char *unit, int taskgraph)
+void krylov_stats_report(const KrylovStats *s, const char *unit, int taskgraph, double flops)
 {
     char lbl[64];
 
     printf("Statistics\n");
     printf("  %-27s : %10.4f s\n", "total solve time", s->total_s);
+    if (flops > 0.0) {
+        printf("  %-27s : %10.4e FLOP\n", "theoretical flops", flops);
+        if (s->total_s > 0.0)
+            printf("  %-27s : %10.3f GFLOP/s\n", "performance", flops / s->total_s / 1e9);
+    }
 
     if (s->niter >= 1) {
         snprintf(lbl, sizeof lbl, "%s 0%s", unit, taskgraph ? " (record)" : "");
@@ -241,7 +246,8 @@ int main(int argc, char **argv)
     printf("  relative residual     : %.6e   (||b-Ax|| / ||b||)\n", sqrt(res2 / b2));
     printf("  relative error        : %.6e   (||x-xexact|| / ||xexact||)\n", sqrt(err2 / xe2));
 
-    krylov_stats_report(&st, d->restarted ? "restart" : "iteration", USE_TASKGRAPH);
+    const double flops = d->flops ? d->flops(&A, &prm) : 0.0;
+    krylov_stats_report(&st, d->restarted ? "restart" : "iteration", USE_TASKGRAPH, flops);
 
     free(Ax); kr_free(x); free(b); free(xexact);
     spmat_free(&A);

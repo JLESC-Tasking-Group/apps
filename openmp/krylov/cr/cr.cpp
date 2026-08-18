@@ -160,6 +160,23 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
     st->total_s = t1 - t0;
 }
 
+/* Theoretical FLOPs: setup (Ar = A r, rho = <r,Ar>) plus, per iteration, one
+ * SpMV, two dots, two axpy, one vmul, one xpby and one xpby_spmv. */
+static double cr_flops(const SpMatrix *A, const KrylovParams *prm)
+{
+    const double n = (double) A->n, nnz = (double) A->nnz;
+    const double setup    = KR_FLOP_SPMV(nnz) + KR_FLOP_DOT(n);
+    const double per_iter = KR_FLOP_VMUL(n)     /* Mq = M q        */
+                          + KR_FLOP_DOT(n)      /* <q,Mq>          */
+                          + KR_FLOP_AXPY(n)     /* x += alpha p    */
+                          + KR_FLOP_AXPY(n)     /* r -= alpha Mq   */
+                          + KR_FLOP_SPMV(nnz)   /* Ar = A r        */
+                          + KR_FLOP_DOT(n)      /* rho = <r,Ar>    */
+                          + KR_FLOP_XPBY(n)     /* p = r + beta p  */
+                          + KR_FLOP_XPBY(n);    /* q = Ar + beta q */
+    return setup + (double) prm->iters * per_iter;
+}
+
 /* ==========================================================================
  * Descriptor (the shared driver in common/driver.cpp provides main()).
  * ========================================================================== */
@@ -171,4 +188,5 @@ const KrylovDescriptor krylov_descriptor = {
     /* default_iters */ MAX_ITER,
     /* default_m     */ 0,
     /* solve         */ cr_solve,
+    /* flops         */ cr_flops,
 };

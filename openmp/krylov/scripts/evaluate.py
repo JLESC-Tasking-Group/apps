@@ -10,8 +10,8 @@ It reproduces this manual launch for each configuration:
     ./cg.x -i 100 -S 7 -n <n> -t 1 -s 1
 
 Sweep (defaults):
-  * OMP_TASKGRAPH_OPT in { "reduce-node,reduce-edge",
-                           "batch",
+  * OMP_TASKGRAPH_OPT in { "none",
+                           "reduce-node,reduce-edge",
                            "reduce-node,reduce-edge,batch" }
   * grid size n : 20 points from 8 to 512 chosen so the *theoretical FLOP count*
                   (which scales like n^3 for the stencil matrix) is linearly
@@ -41,8 +41,8 @@ import sys
 # Defaults matching the evaluation request.
 # ----------------------------------------------------------------------------
 DEFAULT_OPTS = [
+    "none",
     "reduce-node,reduce-edge",
-    "batch",
     "reduce-node,reduce-edge,batch",
 ]
 DEFAULT_ENV = {

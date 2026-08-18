@@ -94,20 +94,20 @@ def _grab(text, pattern, cast=float):
 def parse_output(text):
     F = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"  # a float
     return {
-        "backend":      _grab(text, r"backend\s*:\s*(\S+)", str),
-        "taskgraph":    _grab(text, r"taskgraph\s*:\s*(\S+)", str),
-        "n_sys":        _grab(text, r"grid\s*:.*\(n\s*=\s*(\d+)", int),
-        "nnz":          _grab(text, r"nnz\s*=\s*(\d+)", int),
-        "omp_threads":  _grab(text, r"omp threads:\s*(\d+)", int),
-        "rel_residual": _grab(text, r"relative residual\s*:\s*" + F),
-        "rel_error":    _grab(text, r"relative error\s*:\s*" + F),
-        "total_time_s": _grab(text, r"total solve time\s*:\s*" + F),
-        "flops":        _grab(text, r"theoretical flops\s*:\s*" + F),
-        "gflops":       _grab(text, r"performance\s*:\s*" + F),
-        "iter0_ms":     _grab(text, r"(?:iteration|restart) 0.*:\s*" + F + r"\s*ms"),
-        "iter1_ms":     _grab(text, r"(?:iteration|restart) 1.*:\s*" + F + r"\s*ms"),
-        "avg_ms":       _grab(text, r"(?:iterations|restarts) 2\.\..*\(avg\)\s*:\s*" + F + r"\s*ms"),
-        "stddev_ms":    _grab(text, r"(?:iterations|restarts) 2\.\..*\(stddev\)\s*:\s*" + F + r"\s*ms"),
+        "backend":          _grab(text, r"backend\s*:\s*(\S+)", str),
+        "taskgraph":        _grab(text, r"taskgraph\s*:\s*(\S+)", str),
+        "n_sys":            _grab(text, r"grid\s*:.*\(n\s*=\s*(\d+)", int),
+        "nnz":              _grab(text, r"nnz\s*=\s*(\d+)", int),
+        "omp_num_threads":  _grab(text, r"omp threads:\s*(\d+)", int),
+        "rel_residual":     _grab(text, r"relative residual\s*:\s*" + F),
+        "rel_error":        _grab(text, r"relative error\s*:\s*" + F),
+        "total_time_s":     _grab(text, r"total solve time\s*:\s*" + F),
+        "flops":            _grab(text, r"theoretical flops\s*:\s*" + F),
+        "gflops":           _grab(text, r"performance\s*:\s*" + F),
+        "iter0_ms":         _grab(text, r"(?:iteration|restart) 0.*:\s*" + F + r"\s*ms"),
+        "iter1_ms":         _grab(text, r"(?:iteration|restart) 1.*:\s*" + F + r"\s*ms"),
+        "avg_ms":           _grab(text, r"(?:iterations|restarts) 2\.\..*\(avg\)\s*:\s*" + F + r"\s*ms"),
+        "stddev_ms":        _grab(text, r"(?:iterations|restarts) 2\.\..*\(stddev\)\s*:\s*" + F + r"\s*ms"),
     }
 
 
@@ -206,8 +206,7 @@ def main():
                     "command": pretty,
                 })
                 try:
-                    p = subprocess.run(cmd, env=env, capture_output=True, text=True,
-                                       timeout=(args.timeout or None))
+                    p = subprocess.run(cmd, env=env,stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=(args.timeout or None))
                     row["returncode"] = p.returncode
                     row.update({k: v for k, v in parse_output(p.stdout).items() if v is not None})
                     if p.returncode != 0:

@@ -27,26 +27,34 @@ obj = $(source:.cc=.o)
 #===============================================================================
 
 # Standard Flags
+CC=xkcxx
 LDFLAGS=
 CFLAGS=-O3
 #CFLAGS=-O0 -g
-CFLAGS+=-fopenmp -fopenmp-offload-mandatory
-CFLAGS+=-foffload-lto
-#CFLAGS+=-DALLOC_OMP=1
+
+# GPU FLAGS
+# ---- GPU (OpenMP target offload) -----------------------------------------
+# Uncomment this block to build the GPU backend instead of the CPU one. Adjust
+# --offload-arch to your device (sm_80 = A100, sm_90 = H100, gfx942 = MI300X).
+# With a standard offload clang (no taskgraph support), also set USE_TASKGRAPH=0
+# above for a plain target-offload build.
+CFLAGS  += -DUSE_TARGET=1
+CFLAGS  += -fopenmp-targets=nvptx64-nvidia-cuda
+DETECTED_SMS := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | sort -u | tr -d '.')
+ifneq ($(DETECTED_SMS),)
+  CFLAGS += $(foreach sm,$(DETECTED_SMS),--offload-arch=sm_$(sm))
+else
+  CFLAGS += --offload-arch=sm_80
+endif
+CFLAGS += -fopenmp-offload-mandatory
+#CFLAGS += -foffload-lto
+LDFLAGS += -L/soft/compilers/cuda/cuda-13.3.1/lib64
+LDFLAGS += -lcudart
 
 # XKOMP flags
 # CFLAGS+=-DUSE_XKOMP_TASKGRAPH=1 -std=c++20
 # CFLAGS+=-L$(XKOMP_HOME)/lib -lomp -Wl,-rpath,.
 #LDFLAGS+=-L$(XKOMP_HOME)/lib -lomp -Wl,-rpath,.
-
-# v100/a100/h100
-CC=clang++
-CFLAGS+=-fopenmp -fopenmp-targets=nvptx64-nvidia-cuda --offload-arch=sm_80
-CFLAGS+=-DALLOC_CUDA=1
-CFLAGS+=-DCUDA_ENERGY=0
-#LDFLAGS+=-lnvidia-ml
-#LDFLAGS+=-lcuda
-LDFLAGS+=-lcudart
 
 # mi250, mi300x
 # CC=clang++

@@ -11,6 +11,12 @@
  *
  * USE_TASKGRAPH wraps the (loop-invariant) per-iteration task region with
  * TASKGRAPH_BEGIN/END so it is recorded once and replayed on later iterations.
+ *
+ * USE_SYNC switches from the asynchronous task schedule to a *synchronous* one:
+ * each kernel runs to completion before the next (classic blocking "omp target"
+ * with no nowait / depend / tasks / taskgraph). This is what most OpenMP offload
+ * codes do; it is provided to compare against the default async task/taskgraph
+ * schedule. On the host backend it degenerates to a serial single-thread run.
  */
 #ifndef KRYLOV_TASKING_H
 #define KRYLOV_TASKING_H
@@ -23,6 +29,10 @@
 
 #ifndef USE_TASKGRAPH       /* 1: record/replay the per-iteration task graph */
 # define USE_TASKGRAPH 0
+#endif
+
+#ifndef USE_SYNC            /* 0: asynchronous tasks   1: synchronous blocking */
+# define USE_SYNC 0
 #endif
 
 #ifndef USE_XKOMP           /* 1: use XKOMP's taskgraph API instead of LLVM's */
@@ -47,8 +57,9 @@
 #define KR_PRAGMA(...)  _Pragma(#__VA_ARGS__)
 #define KR_XPRAGMA(...) KR_PRAGMA(__VA_ARGS__)
 
-/* replayable(1) is emitted on every task-generating construct when recording. */
-#if USE_REPLAYABLE
+/* replayable(1) is emitted on every task-generating construct when recording.
+ * Synchronous mode has no tasks/taskgraph, so it is never replayable. */
+#if USE_REPLAYABLE && !USE_SYNC
 # define REPLAYABLE_CLAUSE replayable(1)
 #else
 # define REPLAYABLE_CLAUSE
@@ -68,7 +79,24 @@
  * OMP_TARGET_TASK(...) is loop-less device work (a GPU target task; a host task
  * on the CPU) -- used for the tiny scalar updates (alpha, beta, ...).
  * ------------------------------------------------------------------------- */
-#if USE_TARGET
+#if USE_SYNC
+
+/* Synchronous: each kernel blocks until complete; no tasks, no nowait. On GPU
+ * the loops are still offloaded (blocking `omp target`); on the host they are
+ * plain serial loops (the macros vanish). DEPEND(...) also expands to nothing
+ * (program order enforces the data dependences), so __VA_ARGS__ carries only
+ * map()/reduction()/firstprivate clauses here. */
+# if USE_TARGET
+#  define OMP_TASK(...)                                                         /* nothing: the loop is offloaded whole */
+#  define OMP_TARGET_LOOP_TASK(...) KR_XPRAGMA(omp target teams distribute parallel for __VA_ARGS__)
+#  define OMP_TARGET_TASK(...)      KR_XPRAGMA(omp target __VA_ARGS__)
+# else
+#  define OMP_TASK(...)                                                         /* nothing: serial loop */
+#  define OMP_TARGET_LOOP_TASK(...)                                             /* nothing: serial loop */
+#  define OMP_TARGET_TASK(...)                                                  /* nothing: serial block */
+# endif
+
+#elif USE_TARGET
 
 # define OMP_TASK(...)                                                          /* nothing: work is done by OMP_TARGET_LOOP_TASK */
 # define OMP_TARGET_LOOP_TASK(...) KR_XPRAGMA(omp target teams distribute parallel for REPLAYABLE_CLAUSE nowait __VA_ARGS__)
@@ -80,7 +108,7 @@
 # define OMP_TARGET_LOOP_TASK(...)                                              /* nothing: tiling is done by OMP_TASK */
 # define OMP_TARGET_TASK(...)      KR_XPRAGMA(omp task REPLAYABLE_CLAUSE __VA_ARGS__)
 
-#endif /* USE_TARGET */
+#endif /* USE_SYNC / USE_TARGET */
 
 /* ----------------------------------------------------------------------------
  * One tile of a T1-decomposed (T1xT2 for SpMV) vector operation. The SAME tiled
@@ -104,23 +132,49 @@
  *          are implicitly firstprivate/mapped, and firstprivate on a target
  *          construct trips a clang codegen assertion, so it is omitted on GPU).
  * ------------------------------------------------------------------------- */
-#if USE_TARGET
+#if USE_SYNC
+# if USE_TARGET
+#  define OMP_TILE(deps, mp, fp) KR_XPRAGMA(omp target teams distribute parallel for deps mp)
+# else
+#  define OMP_TILE(deps, mp, fp)                                                /* nothing: serial loop */
+# endif
+#elif USE_TARGET
 # define OMP_TILE(deps, mp, fp) KR_XPRAGMA(omp target teams distribute parallel for REPLAYABLE_CLAUSE nowait deps mp)
 #else
 # define OMP_TILE(deps, mp, fp) KR_XPRAGMA(omp task REPLAYABLE_CLAUSE default(none) fp deps)
 #endif
 
-/* Always a host task (never offloaded), regardless of USE_TARGET. Used for
- * host-side work such as the optional per-iteration debug print. It is created
- * outside the taskgraph region, so it is not marked replayable. */
-#define OMP_HOST_TASK(...) KR_XPRAGMA(omp task __VA_ARGS__)
+/* Host-side work such as the optional per-iteration debug print / timing. In the
+ * asynchronous modes it is a real host task (depend-synchronized, so it fires
+ * after the iteration's tasks); in synchronous mode it vanishes and the block
+ * runs inline -- correct because the preceding kernels already completed. */
+#if USE_SYNC
+# define OMP_HOST_TASK(...)                                                     /* nothing: runs inline */
+#else
+# define OMP_HOST_TASK(...) KR_XPRAGMA(omp task __VA_ARGS__)
+#endif
+
+/* `nowait` on a construct in the asynchronous modes; nothing in synchronous mode
+ * (used on the residual target-update so it becomes a blocking D2H under -p). */
+#if USE_SYNC
+# define NOWAIT
+#else
+# define NOWAIT nowait
+#endif
 
 /* ---- Dependency-clause abstraction (matches llm.c naming) ----
  *   DEPEND(in, a[x:y], b)           -> depend(in: a[x:y], b)
  *   DEPEND_MULTI(in, (i=0:N), a[i]) -> depend(iterator(i=0:N), in: a[i])
- * The iterator argument must be parenthesized to shield its internal commas. */
-#define DEPEND(dir, ...)              depend(dir: __VA_ARGS__)
-#define DEPEND_MULTI(dir, iters, ...) depend(iterator iters, dir: __VA_ARGS__)
+ * The iterator argument must be parenthesized to shield its internal commas.
+ * In synchronous mode there are no tasks, so dependences expand to nothing --
+ * program order is the schedule. */
+#if USE_SYNC
+# define DEPEND(dir, ...)
+# define DEPEND_MULTI(dir, iters, ...)
+#else
+# define DEPEND(dir, ...)              depend(dir: __VA_ARGS__)
+# define DEPEND_MULTI(dir, iters, ...) depend(iterator iters, dir: __VA_ARGS__)
+#endif
 
 /* Only the GPU backend needs map() clauses; expands to nothing on the host so
  * the same call site serves both (host tasks operate directly on host memory). */
@@ -161,7 +215,7 @@
  * XKOMP's function/lambda form. Without USE_TASKGRAPH the macros vanish and the
  * tasks are simply created every iteration.
  * ------------------------------------------------------------------------- */
-#if USE_TASKGRAPH
+#if USE_TASKGRAPH && !USE_SYNC
 # if USE_XKOMP
 #  define TASKGRAPH_BEGIN pragma_omp_taskgraph(0, XKOMP_TASKGRAPH_FLAG_NONE, [&] (void)
 #  define TASKGRAPH_END   );

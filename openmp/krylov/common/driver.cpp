@@ -197,7 +197,9 @@ int main(int argc, char **argv)
     if (d->restarted) printf("Krylov %s(%d) (Jacobi-preconditioned)\n", d->name, prm.m);
     else              printf("Krylov %s (Jacobi-preconditioned)\n", d->name);
     printf("  backend    : %s\n", USE_TARGET ? "GPU (omp target, pinned host mem)" : "CPU (omp task, malloc)");
-    printf("  taskgraph  : %s\n", USE_TASKGRAPH ? "on" : "off");
+    printf("  exec mode  : %s\n", USE_SYNC ? "synchronous (blocking, no tasks)"
+                                           : "asynchronous (tasks + depend)");
+    printf("  taskgraph  : %s\n", (USE_TASKGRAPH && !USE_SYNC) ? "on" : "off");
     if (prm.mtx) {
         /* imported: the loader already printed the detailed matrix info block */
         printf("  matrix     : Matrix Market file %s\n", prm.mtx);
@@ -247,7 +249,8 @@ int main(int argc, char **argv)
     printf("  relative error        : %.6e   (||x-xexact|| / ||xexact||)\n", sqrt(err2 / xe2));
 
     const double flops = d->flops ? d->flops(&A, &prm) : 0.0;
-    krylov_stats_report(&st, d->restarted ? "restart" : "iteration", USE_TASKGRAPH, flops);
+    krylov_stats_report(&st, d->restarted ? "restart" : "iteration",
+                        USE_TASKGRAPH && !USE_SYNC, flops);
 
     free(Ax); kr_free(x); free(b); free(xexact);
     spmat_free(&A);

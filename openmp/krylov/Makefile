@@ -31,6 +31,11 @@ CFLAGS += -DMAX_ITER=50
 # For a portable build on vanilla clang/gcc, set this to 0 (plain OpenMP tasks).
 CFLAGS += -DUSE_TASKGRAPH=1
 CFLAGS += -DUSE_REPLAYABLE=0
+# Synchronous execution mode: run each kernel to completion before the next
+# (classic blocking `omp target`, no tasks/depend/nowait/taskgraph) -- for
+# comparing against the default asynchronous task/taskgraph schedule. When set,
+# it overrides USE_TASKGRAPH; on the CPU backend it degenerates to serial.
+#CFLAGS += -DUSE_SYNC=1
 CFLAGS += -fopenmp-task-jit-type=none
 #CFLAGS += -fopenmp-task-jit-type=pointers
 #CFLAGS += -fopenmp-task-jit-type=packed

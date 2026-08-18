@@ -134,7 +134,7 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
              * scalar (async D2H) and prints it. */
             const double spawn_ms = print_dbg ? (omp_get_wtime() - spawn0) * 1000.0 : 0.0;
             if (print_dbg) {
-                OMP_TARGET_UPDATE(from(g_new[0:1]) nowait DEPEND(inout, g_new[0]))
+                OMP_TARGET_UPDATE(from(g_new[0:1]) NOWAIT DEPEND(inout, g_new[0]))
             }
             OMP_HOST_TASK(DEFAULT_NONE firstprivate(it, spawn_ms, g_new, gamma, print_dbg, st)
                           shared(prev_ts) DEPEND(in, g_new[0], gamma[0]))

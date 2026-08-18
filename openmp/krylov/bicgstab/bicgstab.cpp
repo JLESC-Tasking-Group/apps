@@ -153,7 +153,7 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
              * <r,r> = ||b - A x||_2^2. */
             const double spawn_ms = print_dbg ? (omp_get_wtime() - spawn0) * 1000.0 : 0.0;
             if (print_dbg) {
-                OMP_TARGET_UPDATE(from(rr[0:1]) nowait DEPEND(inout, rr[0]))
+                OMP_TARGET_UPDATE(from(rr[0:1]) NOWAIT DEPEND(inout, rr[0]))
             }
             OMP_HOST_TASK(DEFAULT_NONE firstprivate(it, spawn_ms, rr, print_dbg, st)
                           shared(prev_ts) DEPEND(in, rr[0]))

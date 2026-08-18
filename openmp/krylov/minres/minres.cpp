@@ -215,7 +215,7 @@ static void minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
              * (MINRES tracks ||r|| = phibar by recurrence). */
             const double spawn_ms = print_dbg ? (omp_get_wtime() - spawn0) * 1000.0 : 0.0;
             if (print_dbg) {
-                OMP_TARGET_UPDATE(from(phibar[0:1]) nowait DEPEND(inout, phibar[0]))
+                OMP_TARGET_UPDATE(from(phibar[0:1]) NOWAIT DEPEND(inout, phibar[0]))
             }
             OMP_HOST_TASK(DEFAULT_NONE firstprivate(it, spawn_ms, phibar, print_dbg, st)
                           shared(prev_ts) DEPEND(in, phibar[0]))

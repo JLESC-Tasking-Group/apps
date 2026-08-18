@@ -75,10 +75,14 @@ def main():
             opts.append(r["opt"])
 
     # --- x categories: distinct grid sizes, ascending ---
+    # n / nnz / FLOPs depend only on the grid size, so store one value per group.
     n_cats = sorted({int(r["n_grid"]) for r in rows})
-    flops_by_n = {}
-    for r in rows:                       # FLOPs depend only on n -> one value per n
-        flops_by_n.setdefault(int(r["n_grid"]), _f(r, "flops"))
+    flops_by_n, nsys_by_n, nnz_by_n = {}, {}, {}
+    for r in rows:
+        k = int(r["n_grid"])
+        flops_by_n.setdefault(k, _f(r, "flops"))
+        nsys_by_n.setdefault(k, r.get("n_sys", "") or "?")   # matrix size (n = grid^3)
+        nnz_by_n.setdefault(k, r.get("nnz", "") or "?")      # number of nonzeros
 
     # --- data[opt][n] = (avg_ms, stddev_ms) ---
     data = {opt: {} for opt in opts}
@@ -101,10 +105,11 @@ def main():
         ax.bar(offs, heights, width, yerr=errs, capsize=3, label=opt,
                error_kw={"elinewidth": 1, "alpha": 0.7})
 
-    # --- bottom axis: grid size n ---
+    # --- bottom axis: matrix size n and number of nonzeros nnz (two lines) ---
     ax.set_xticks(x)
-    ax.set_xticklabels([str(n) for n in n_cats])
-    ax.set_xlabel("grid size n  (system size = n$^3$)")
+    ax.set_xticklabels(["n = %s\nnnz = %s" % (nsys_by_n[n], nnz_by_n[n]) for n in n_cats],
+                       rotation=20, ha="right", fontsize=8)
+    ax.set_xlabel("matrix size n  /  nonzeros nnz")
     ax.set_ylabel("avg execution time / iteration (ms)")
     if args.logy:
         ax.set_yscale("log")

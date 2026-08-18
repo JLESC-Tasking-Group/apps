@@ -129,7 +129,7 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
              * ||r||_A^2); consecutive firings bracket one iteration's work. */
             const double spawn_ms = print_dbg ? (omp_get_wtime() - spawn0) * 1000.0 : 0.0;
             if (print_dbg) {
-                OMP_TARGET_UPDATE(from(rho[0:1]) nowait DEPEND(inout, rho[0]))
+                OMP_TARGET_UPDATE(from(rho[0:1]) NOWAIT DEPEND(inout, rho[0]))
             }
             OMP_HOST_TASK(DEFAULT_NONE firstprivate(it, spawn_ms, rho, print_dbg, st)
                           shared(prev_ts) DEPEND(in, rho[0]))

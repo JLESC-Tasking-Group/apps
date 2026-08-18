@@ -1,0 +1,16 @@
+gpt2_forward
+gpt2_backward
+layernorm_forward
+matmul_forward
+attention_forward
+residual_forward
+gelu_forward
+softmax_forward
+
+layernorm_backward
+matmul_backward
+attention_backward
+residual_backward
+gelu_backward
+softmax_backward
+

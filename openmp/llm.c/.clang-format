@@ -1,0 +1,15 @@
+﻿---
+BasedOnStyle: LLVM
+AlignAfterOpenBracket: Align
+ColumnLimit: 155
+IndentWidth: 4
+Language: Cpp
+ArrayInitializerAlignmentStyle: Left
+BreakBeforeBraces: Attach
+AllowAllConstructorInitializersOnNextLine: true
+BinPackArguments: true
+BinPackParameters: true
+IndentPragmas: true
+IndentPPDirectives: BeforeHash
+
+...

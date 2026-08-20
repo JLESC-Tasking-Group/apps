@@ -20,7 +20,8 @@ CC = xkcxx -DUSE_XKOMP=1
 CFLAGS  =
 CFLAGS += -Icommon
 CFLAGS += -fopenmp -fopenmp-version=60
-CFLAGS += -O3 -ffast-math
+CFLAGS += -O3
+#CFLAGS += -ffast-math
 #CFLAGS += -O0 -g
 CFLAGS += -Wall -Wextra
 # Compile-time problem/solver defaults (all also settable at runtime, see -h):
@@ -29,7 +30,7 @@ CFLAGS += -DMAX_ITER=50
 # Record/replay the identical per-iteration task graph. This needs a taskgraph-
 # enabled clang (it emits the `replayable(1)` clause + `#pragma omp taskgraph`).
 # For a portable build on vanilla clang/gcc, set this to 0 (plain OpenMP tasks).
-#CFLAGS += -DUSE_TASKGRAPH=1
+CFLAGS += -DUSE_TASKGRAPH=1
 CFLAGS += -DUSE_REPLAYABLE=0
 # Synchronous execution mode: run each kernel to completion before the next
 # (classic blocking `omp target`, no tasks/depend/nowait/taskgraph) -- for
@@ -38,9 +39,9 @@ CFLAGS += -DUSE_REPLAYABLE=0
 #CFLAGS += -DUSE_SYNC=1
 
 # XKOMP JIT flags
-CFLAGS += -fopenmp-task-jit-type=none
+#CFLAGS += -fopenmp-task-jit-type=none
 #CFLAGS += -fopenmp-task-jit-type=pointers
-#CFLAGS += -fopenmp-task-jit-type=packed
+CFLAGS += -fopenmp-task-jit-type=packed
 
 LDFLAGS  =
 LDFLAGS += -lm

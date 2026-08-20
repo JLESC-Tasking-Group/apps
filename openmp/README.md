@@ -6,4 +6,4 @@
 | HPCCG                            | ✅             | ❌                           | ✅      |
 | LULESH                           | ✅             | ✅                           | ✅      |
 | Krylov (cg, cr, minres, gmres)   | ✅             | ✅                           | ❌      |
-
+| llm.c                            | ✅             | ✅                           | ✅      |

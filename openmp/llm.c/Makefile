@@ -1,10 +1,10 @@
-#CC=xkcxx
 #CC=clang
+CC=xkcxx -DUSE_XKOMP=1
 
 CFLAGS=
 CFLAGS+=-fopenmp -fopenmp-version=60
 CFLAGS+=-O3
-CFLAGS+=-ffast-math
+#CFLAGS+=-ffast-math
 CFLAGS+=-DNB_STEPS=10
 #CFLAGS+=-DUSE_REPLAYABLE=1
 CFLAGS+=-DUSE_TASKGRAPH=1
@@ -17,9 +17,6 @@ CFLAGS+=-DUSE_TASKGRAPH=1
 LDFLAGS=
 LDFLAGS+=-lm
 #LDFLAGS+=-L$(POT)/lib -lpot_ompt
-
-# XKOMP-specific
-CFLAGS+=-DUSE_XKOMP=1
 
 # OmpSs-2-specific
 #CFLAGS+=-DUSE_OMPSS=1

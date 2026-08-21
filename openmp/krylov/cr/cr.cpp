@@ -58,7 +58,6 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
 
     Tiling tl;
     tiling_init(&tl, n, T1, T2);
-    char *ar_tok = spmv_tokens_alloc(&tl); /* dependency tokens for Ar = A*r */
 
     /* Device-mapped working vectors (pinned on GPU builds). */
     real_t *r   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
@@ -96,10 +95,10 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
     #pragma omp single
     {
         /* One-time setup: Ar = A r; p = r; q = Ar; rho = <r,Ar>. */
-        task_spmv(row_ptr, col_idx, val, nnz, r, Ar, ar_tok, &tl);
+        task_spmv(row_ptr, col_idx, val, nnz, r, Ar, &tl);
         task_copy(&tl, r, p);
-        task_copy_spmv(&tl, Ar, ar_tok, q);
-        task_dot_spmv(&tl, r, Ar, ar_tok, part_rho, rho);
+        task_copy_spmv(&tl, Ar, q);
+        task_dot_spmv(&tl, r, Ar, part_rho, rho);
         #pragma omp taskwait
 
         double prev_ts = omp_get_wtime();
@@ -115,12 +114,12 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
                 task_scalar_div(rho, qMq, alpha);                          /* alpha = rho/<q,Mq> */
                 task_axpy(&tl, alpha, (real_t) +1.0, p, x);                /* x += alpha*p     */
                 task_axpy(&tl, alpha, (real_t) -1.0, Mq, r);               /* r -= alpha*Mq    */
-                task_spmv(row_ptr, col_idx, val, nnz, r, Ar, ar_tok, &tl); /* Ar = A r         */
+                task_spmv(row_ptr, col_idx, val, nnz, r, Ar, &tl);        /* Ar = A r         */
                 task_scalar_copy(rho, rho_bar);                            /* rho_bar = rho    */
-                task_dot_spmv(&tl, r, Ar, ar_tok, part_rho, rho);          /* rho = <r,Ar>     */
+                task_dot_spmv(&tl, r, Ar, part_rho, rho);                  /* rho = <r,Ar>     */
                 task_scalar_div(rho, rho_bar, beta);                       /* beta = rho/rho_bar */
                 task_xpby(&tl, r, beta, p);                                /* p = r + beta*p   */
-                task_xpby_spmv(&tl, Ar, ar_tok, beta, q);                  /* q = Ar + beta*q  */
+                task_xpby_spmv(&tl, Ar, beta, q);                          /* q = Ar + beta*q  */
             }
             TASKGRAPH_END
 
@@ -156,7 +155,6 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
     kr_free(r); kr_free(p); kr_free(q); kr_free(Ar); kr_free(Mq); kr_free(inv);
     kr_free(rho); kr_free(rho_bar); kr_free(qMq); kr_free(alpha); kr_free(beta);
     kr_free(part_qMq); kr_free(part_rho);
-    spmv_tokens_free(ar_tok);
     st->total_s = t1 - t0;
 }
 

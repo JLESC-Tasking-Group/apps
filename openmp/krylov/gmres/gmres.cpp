@@ -109,7 +109,6 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
 
     Tiling tl;
     tiling_init(&tl, n, T1, T2);
-    char *w_tok = spmv_tokens_alloc(&tl); /* tokens for w = A V[j] (and A x) */
 
     /* Device-mapped vectors: basis V[0..m], plus work vectors. */
     real_t *Vd  = (real_t *) kr_alloc((size_t)(m + 1) * (size_t) n * sizeof(real_t));
@@ -156,9 +155,9 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
             TASKGRAPH_BEGIN
             {
                 /* Setup: r0 = M(b - A x); beta = ||r0||; V[0] = r0/beta. */
-                task_spmv(row_ptr, col_idx, val, nnz, x, w, w_tok, &tl);   /* w = A x        */
+                task_spmv(row_ptr, col_idx, val, nnz, x, w, &tl);          /* w = A x        */
                 task_copy(&tl, bd, res);                                   /* res = b        */
-                task_axpy_spmv(&tl, one, (real_t) -1.0, w, w_tok, res);    /* res -= A x     */
+                task_axpy_spmv(&tl, one, (real_t) -1.0, w, res);           /* res -= A x     */
                 task_vmul(&tl, inv, res, q);                              /* q = M res      */
                 task_dot(&tl, q, q, part, beta);                         /* beta = <q,q>   */
                 OMP_TARGET_TASK(DEFAULT_NONE MAP(present: beta[0:1], ibeta[0:1]))
@@ -171,8 +170,8 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                 /* Arnoldi + modified Gram-Schmidt. */
                 for (int j = 0; j < m; j++) {
                     real_t *Vj = Vd + (size_t) j * n;
-                    task_spmv(row_ptr, col_idx, val, nnz, Vj, w, w_tok, &tl); /* w = A V[j] */
-                    task_vmul_spmv(&tl, inv, w, w_tok, q);                    /* q = M w    */
+                    task_spmv(row_ptr, col_idx, val, nnz, Vj, w, &tl);       /* w = A V[j] */
+                    task_vmul_spmv(&tl, inv, w, q);                          /* q = M w    */
                     for (int i = 0; i <= j; i++) {
                         real_t *Vi = Vd + (size_t) i * n;
                         task_dot(&tl, Vi, q, part, H + (i + j * ld));         /* H[i,j] = <V[i],q> */
@@ -233,7 +232,6 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     kr_free(Vd); kr_free(w); kr_free(q); kr_free(res); kr_free(bd); kr_free(inv);
     kr_free(H); kr_free(y); kr_free(one); kr_free(beta); kr_free(ibeta); kr_free(hh); kr_free(ih);
     kr_free(part); free(Hhost);
-    spmv_tokens_free(w_tok);
     st->total_s = t1 - t0;
 }
 

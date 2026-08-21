@@ -55,8 +55,6 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
 
     Tiling tl;
     tiling_init(&tl, n, T1, T2);
-    char *q_tok = spmv_tokens_alloc(&tl); /* tokens for q = A p */
-    char *d_tok = spmv_tokens_alloc(&tl); /* tokens for d = A s */
 
     /* Device-mapped working vectors (pinned on GPU builds). */
     real_t *r   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
@@ -119,15 +117,15 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
             TASKGRAPH_BEGIN
             {
                 task_scalar_copy(next_rho, rho);                          /* rho = next_rho    */
-                task_spmv(row_ptr, col_idx, val, nnz, p, q, q_tok, &tl);  /* q = A p           */
-                task_vmul_spmv(&tl, inv, q, q_tok, v);                    /* v = M q           */
+                task_spmv(row_ptr, col_idx, val, nnz, p, q, &tl);        /* q = A p           */
+                task_vmul_spmv(&tl, inv, q, v);                          /* v = M q           */
                 task_dot(&tl, c, v, part_cv, cv);                        /* <c,v>             */
                 task_scalar_div(rho, cv, alpha);                         /* alpha = rho/<c,v> */
                 task_copy(&tl, r, s);                                    /* s = r            */
                 task_axpy(&tl, alpha, (real_t) -1.0, v, s);              /* s -= alpha*v     */
                 task_axpy(&tl, alpha, (real_t) +1.0, p, x);              /* x += alpha*p     */
-                task_spmv(row_ptr, col_idx, val, nnz, s, d, d_tok, &tl); /* d = A s          */
-                task_vmul_spmv(&tl, inv, d, d_tok, t);                   /* t = M d          */
+                task_spmv(row_ptr, col_idx, val, nnz, s, d, &tl);       /* d = A s          */
+                task_vmul_spmv(&tl, inv, d, t);                         /* t = M d          */
                 task_dot(&tl, t, s, part_ts, ts);                       /* <t,s>            */
                 task_dot(&tl, t, t, part_tt, tt);                       /* <t,t>            */
                 task_scalar_div(ts, tt, omega);                         /* omega = <t,s>/<t,t> */
@@ -184,8 +182,6 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
     kr_free(rho); kr_free(next_rho); kr_free(cv); kr_free(ts); kr_free(tt);
     kr_free(alpha); kr_free(omega); kr_free(beta); kr_free(rr);
     kr_free(part_cv); kr_free(part_ts); kr_free(part_tt); kr_free(part_nr); kr_free(part_rr);
-    spmv_tokens_free(q_tok);
-    spmv_tokens_free(d_tok);
     st->total_s = t1 - t0;
 }
 

@@ -53,7 +53,6 @@ static void minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
 
     Tiling tl;
     tiling_init(&tl, n, T1, T2);
-    char *av_tok = spmv_tokens_alloc(&tl); /* tokens for Av = A v */
 
     /* Device-mapped vectors. */
     real_t *v    = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* Lanczos vector (M^-1 r2) */
@@ -145,8 +144,8 @@ static void minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                 }
 
                 /* --- Lanczos: y = (A v)/beta - (beta/oldbeta) r1 - (alpha/beta) r2 --- */
-                task_spmv(row_ptr, col_idx, val, nnz, v, Av, av_tok, &tl); /* Av = A v         */
-                task_copy_spmv(&tl, Av, av_tok, y);                        /* y = Av (retokenize) */
+                task_spmv(row_ptr, col_idx, val, nnz, v, Av, &tl);        /* Av = A v         */
+                task_copy_spmv(&tl, Av, y);                               /* y = Av           */
                 task_scal(&tl, inv_beta, y);                              /* y /= beta        */
                 task_axpy(&tl, bob, (real_t) -1.0, r1, y);               /* y -= (beta/oldb) r1 */
                 task_dot(&tl, v, y, part_vy, vy);                        /* <v,y>            */
@@ -247,7 +246,6 @@ static void minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     kr_free(inv_beta); kr_free(bob); kr_free(vy); kr_free(alpha); kr_free(delta); kr_free(aob);
     kr_free(r2v); kr_free(phi); kr_free(gamma_inv);
     kr_free(part_vy); kr_free(part_r2v);
-    spmv_tokens_free(av_tok);
     st->total_s = t1 - t0;
 }
 

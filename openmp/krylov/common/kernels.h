@@ -11,12 +11,13 @@
  *   - the SpMV is split into T1*T2 sub-block tasks (SBS = ceil(BS/T2) rows each)
  *     so its output chunks carry independent dependencies.
  *
- * Dependencies use SINGLE-ELEMENT tokens at chunk-aligned addresses (never array
- * sections): OpenMP only matches depend items that are *identical or disjoint*.
- * Vector chunks are keyed by the data address at the block start (v[t1*BS]); an
- * SpMV output vector is keyed by its own dedicated token array (see
- * spmv_tokens_alloc) so its T1 consumers can wait on all T2 sub-blocks via a
- * depend iterator, and so multiple SpMV outputs (e.g. BiCGSTAB) never collide.
+ * Dependencies use SINGLE-ELEMENT depend items at chunk-aligned addresses (never
+ * array sections): OpenMP only matches depend items that are *identical or
+ * disjoint*. Vector chunks are keyed by the data address at the block start
+ * (v[t1*BS]). An SpMV output vector is keyed the same way, on its own addresses:
+ * the T2 sub-blocks of one output tile all use `inoutset` on the tile's first
+ * address (v[t1*BS]) so they run concurrently (they write disjoint rows), while
+ * a consumer waits on the whole set with a single `in` on that address.
  */
 #ifndef KRYLOV_KERNELS_H
 #define KRYLOV_KERNELS_H
@@ -39,16 +40,10 @@ extern "C" {
 
 void tiling_init(Tiling *tl, idx_t n, int T1, int T2);
 
-/* Dependency-token array for ONE SpMV-output vector: NTB1*T2 single-byte tokens
- * (one per SpMV sub-block). Returns NULL on GPU builds (one task per op there,
- * so no per-chunk tokens are needed). Free with spmv_tokens_free. Allocate one
- * such array per distinct SpMV-output vector a solver maintains. */
-char *spmv_tokens_alloc(const Tiling *tl);
-void  spmv_tokens_free(char *tok);
-
-/* y = A*x   (CSR SpMV). y is an SpMV-output vector keyed by y_tok. */
+/* y = A*x   (CSR SpMV). The T2 sub-blocks of each output tile are `inoutset` on
+ * the tile's first address, so consumers depend (in) on y at that address. */
 void task_spmv(const idx_t *row_ptr, const idx_t *col_idx, const real_t *val,
-               idx_t nnz, const real_t *x, real_t *y, char *y_tok, const Tiling *tl);
+               idx_t nnz, const real_t *x, real_t *y, const Tiling *tl);
 
 /* --- vector ops where every operand is a T1-tiled vector --- */
 void task_copy     (const Tiling *tl, const real_t *x, real_t *y);                     /* y = x        */
@@ -59,12 +54,12 @@ void task_axpy     (const Tiling *tl, const real_t *s, real_t sign, const real_t
 void task_xpby     (const Tiling *tl, const real_t *x, const real_t *s, real_t *y);    /* y = x + s*y  */
 void task_dot      (const Tiling *tl, const real_t *a, const real_t *b, real_t *part, real_t *result); /* result = <a,b> */
 
-/* --- variants consuming a fresh SpMV-output vector `ys` (tokens ys_tok) --- */
-void task_copy_spmv(const Tiling *tl, const real_t *ys, char *ys_tok, real_t *y);                  /* y = ys      */
-void task_vmul_spmv(const Tiling *tl, const real_t *d, const real_t *ys, char *ys_tok, real_t *y); /* y = d .* ys */
-void task_axpy_spmv(const Tiling *tl, const real_t *s, real_t sign, const real_t *ys, char *ys_tok, real_t *y); /* y += sign*s*ys */
-void task_xpby_spmv(const Tiling *tl, const real_t *ys, char *ys_tok, const real_t *s, real_t *y); /* y = ys + s*y */
-void task_dot_spmv (const Tiling *tl, const real_t *a, const real_t *ys, char *ys_tok, real_t *part, real_t *result); /* result = <a,ys> */
+/* --- variants consuming a fresh SpMV-output vector `ys` --- */
+void task_copy_spmv(const Tiling *tl, const real_t *ys, real_t *y);                  /* y = ys      */
+void task_vmul_spmv(const Tiling *tl, const real_t *d, const real_t *ys, real_t *y); /* y = d .* ys */
+void task_axpy_spmv(const Tiling *tl, const real_t *s, real_t sign, const real_t *ys, real_t *y); /* y += sign*s*ys */
+void task_xpby_spmv(const Tiling *tl, const real_t *ys, const real_t *s, real_t *y); /* y = ys + s*y */
+void task_dot_spmv (const Tiling *tl, const real_t *a, const real_t *ys, real_t *part, real_t *result); /* result = <a,ys> */
 
 /* --- scalar (length-1 buffer) ops --- */
 void task_scalar_div (const real_t *a, const real_t *b, real_t *c); /* c = a / b */

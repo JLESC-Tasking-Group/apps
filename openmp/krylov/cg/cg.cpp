@@ -60,7 +60,6 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
 
     Tiling tl;
     tiling_init(&tl, n, T1, T2);
-    char *ap_tok = spmv_tokens_alloc(&tl); /* dependency tokens for Ap = A*p */
 
     /* Device-mapped working vectors (pinned on GPU builds). */
     real_t *r   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
@@ -114,11 +113,11 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
              * buffers -> recorded once, replayed thereafter. */
             TASKGRAPH_BEGIN
             {
-                task_spmv(row_ptr, col_idx, val, nnz, p, Ap, ap_tok, &tl); /* Ap  = A*p       */
-                task_dot_spmv(&tl, p, Ap, ap_tok, part1, pAp);            /* pAp = <p,Ap>    */
+                task_spmv(row_ptr, col_idx, val, nnz, p, Ap, &tl);        /* Ap  = A*p       */
+                task_dot_spmv(&tl, p, Ap, part1, pAp);                    /* pAp = <p,Ap>    */
                 task_scalar_div(gamma, pAp, alpha);                       /* alpha = g/pAp   */
                 task_axpy(&tl, alpha, (real_t) +1.0, p, x);               /* x  += alpha*p   */
-                task_axpy_spmv(&tl, alpha, (real_t) -1.0, Ap, ap_tok, r); /* r  -= alpha*Ap  */
+                task_axpy_spmv(&tl, alpha, (real_t) -1.0, Ap, r);         /* r  -= alpha*Ap  */
                 task_vmul(&tl, inv, r, z);                                /* z   = M^-1 r    */
                 task_dot(&tl, r, z, part2, g_new);                        /* g_new = <r,z>   */
                 task_scalar_div(g_new, gamma, beta);                      /* beta = gn/g     */
@@ -160,7 +159,6 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
     kr_free(r); kr_free(p); kr_free(Ap); kr_free(z); kr_free(inv);
     kr_free(gamma); kr_free(g_new); kr_free(pAp); kr_free(alpha); kr_free(beta);
     kr_free(part1); kr_free(part2);
-    spmv_tokens_free(ap_tok);
     st->total_s = t1 - t0;
 }
 

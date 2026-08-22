@@ -189,10 +189,9 @@ notice, this list of conditions and the disclaimer (as noted below)
 
 #define PTINY Real_t(1e-36)
 
-#if USE_XKOMP_TASKGRAPH
-# include <xkomp/xkomp.h>
-# include <xkomp/xkomp++.h>
-#endif
+/* Task / target / taskgraph abstraction (CPU tasks vs GPU target, selected by
+ * -DUSE_TARGET; see tasking.h). Also pulls in the XKOMP headers when USE_XKOMP. */
+#include "tasking.h"
 
 /* BLOCK SIZES */
 static Index_t EBS = -1;
@@ -205,6 +204,9 @@ void warmup(void)
     double * x = (double *) malloc(sizeof(double) * N);
     assert(x);
 
+    /* GPU-only: warms up the OpenMP offload runtime (H2D/kernel/D2H, sync and
+     * async). On the CPU backend there is nothing to warm up, so it is skipped. */
+#if USE_TARGET
     # pragma omp parallel num_threads(2)
     {
         /* Init */
@@ -243,6 +245,7 @@ void warmup(void)
             # pragma omp target exit data map(release: x[0:N])
         }
     }
+#endif /* USE_TARGET */
 
     free(x);
 }
@@ -1194,8 +1197,8 @@ int main(int argc, char *argv[])
 
   power_start();
 
-#pragma omp target enter data \
-  map(to: \
+OMP_TARGET_ENTER_DATA( \
+  MAP(to: \
 	x[0:numNode], \
 	y[0:numNode], \
 	z[0:numNode], \
@@ -1237,7 +1240,7 @@ int main(int argc, char *argv[])
 	nodeElemStart[0:len1], \
 	nodeElemCornerList[0:len2], \
 	gamma[0:32]) \
-  map(alloc: \
+  MAP(alloc: \
 	determ[0:numElem], \
 	fx_elem[0:numElem8], \
 	fy_elem[0:numElem8], \
@@ -1270,7 +1273,7 @@ int main(int argc, char *argv[])
         dtcourant_reduc[0:numReg], \
         dtcourant_elem_reduc[0:numReg], \
         dthydro_reduc[0:numReg], \
-        dthydro_elem_reduc[0:numReg])
+        dthydro_elem_reduc[0:numReg]))
 
 
   double initialisation_time;
@@ -1288,20 +1291,15 @@ int main(int argc, char *argv[])
     t0 = omp_get_wtime();
   for (Int_t iter = 0; iter < opts.its; ++iter) {
 
-      #if USE_XKOMP_TASKGRAPH
-      constexpr xkomp_taskgraph_id_t graph_id = 0;
-      constexpr xkomp_taskgraph_flags_t flags = XKOMP_TASKGRAPH_FLAG_NONE;
-      pragma_omp_taskgraph(graph_id, flags, [&] (void)
+      TASKGRAPH_BEGIN
       {
-      #endif
 
     //==============================================================================
     // TimeIncrement(*locDom) ;
     //==============================================================================
 
-    #pragma omp target nowait				\
-    depend(in: dtcourant[0], dthydro[0], deltatime[0])	\
-    depend(out: deltatime[0], time[0], cycle[0])
+    OMP_TARGET_TASK(DEPEND(in, dtcourant[0], dthydro[0], deltatime[0])
+                    DEPEND(out, deltatime[0], time[0], cycle[0]))
     {
       Real_t targetdt = stoptime - time[0] ;
 
@@ -1353,8 +1351,8 @@ int main(int argc, char *argv[])
       ++cycle[0];
     }
 
-    #pragma omp target update nowait from(deltatime[0:1], time[0:1], cycle[0:1])	\
-    depend(inout: deltatime[0], time[0], cycle[0])
+    OMP_TARGET_UPDATE(NOWAIT from(deltatime[0:1], time[0:1], cycle[0:1])
+                      DEPEND(inout, deltatime[0], time[0], cycle[0]))
 
     //==============================================================================
     // LagrangeLeapFrog(*locDom) ;
@@ -1381,9 +1379,7 @@ int main(int argc, char *argv[])
     for(Index_t b = 0; b < numElem; b+= EBS){
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
-      #pragma omp target teams distribute parallel for num_teams(elem_teams) thread_limit(THREADS) nowait	\
-      depend(in: q[start], p[start])							\
-      depend(out: sigxx[start])
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, q[start], p[start]) DEPEND(out, sigxx[start]))
       for (Index_t i = start; i < end; i++) {
         sigxx[i] = sigyy[i] = sigzz[i] = - p[i] - q[i] ;
       }
@@ -1397,10 +1393,7 @@ int main(int argc, char *argv[])
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
       Index_t nb = start / EBS;
-      #pragma omp target teams distribute parallel for num_teams(elem_teams) thread_limit(THREADS) nowait	\
-      depend(in: sigxx[start])								\
-      depend(iterator(it=0:dep_x_y_z[nb].size()), in: x[dep_x_y_z[nb][it]])		\
-      depend(out: fx_elem[8*start], determ[start])
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, sigxx[start]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND(out, fx_elem[8*start], determ[start]))
       for (Index_t k = start; k < end; k++) {
 
         const Index_t* const elemToNode = nodelist + Index_t(8)*k;
@@ -1465,10 +1458,7 @@ int main(int argc, char *argv[])
       Index_t start = b;
       Index_t end = min(start + NBS, numNode);
       Index_t nb = b/NBS;
-      #pragma omp target teams distribute parallel for num_teams(node_teams) thread_limit(THREADS) nowait	\
-      depend(iterator(it=0:dep_fx_fy_fz_elem[nb].size()), in:				\
-              fx_elem[dep_fx_fy_fz_elem[nb][it]])					\
-      depend(out: fx[start])
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(in, (it=0:dep_fx_fy_fz_elem[nb].size()), fx_elem[dep_fx_fy_fz_elem[nb][it]]) DEPEND(out, fx[start]))
       for (Index_t gnode = start; gnode < end; gnode++) {
         // element count
         const Index_t count = nodeElemStart[gnode+1] - nodeElemStart[gnode];
@@ -1506,8 +1496,7 @@ int main(int argc, char *argv[])
     // CalcHourglassControlForElems(device_queue, domain, determ, hgcoef) ;
     //=================================================================================
 
-  #pragma omp target nowait	\
-  depend(out: vol_error[0])
+  OMP_TARGET_TASK(DEPEND(out, vol_error[0]))
   {
     vol_error[0] = -1;
   }
@@ -1516,10 +1505,7 @@ int main(int argc, char *argv[])
     Index_t start = b;
     Index_t end = min(start + EBS, numElem);
     Index_t nb = start/EBS;
-    #pragma omp target teams distribute parallel for num_teams(elem_teams) thread_limit(THREADS) nowait	\
-    depend(in: v[start], vol_error[0])							\
-    depend(iterator(it=0:dep_x_y_z[nb].size()), in: x[dep_x_y_z[nb][it]])		\
-    depend(out: determ[start], dvdx[8*start], x8n[8*start])
+    OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, v[start], vol_error[0]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND(out, determ[start], dvdx[8*start], x8n[8*start]))
     for (Index_t i = start; i < end; i++) {
       Real_t  x1[8],  y1[8],  z1[8] ;
       Real_t pfx[8], pfy[8], pfz[8] ;
@@ -1586,10 +1572,9 @@ int main(int argc, char *argv[])
     }
   }
 
-   #pragma omp target update from (vol_error[0:1]) nowait	\
-   depend(inout: vol_error[0])
+   OMP_TARGET_UPDATE(from (vol_error[0:1]) NOWAIT DEPEND(inout, vol_error[0]))
 
-    #pragma omp task depend(in: vol_error[0])
+    OMP_HOST_TASK(DEPEND(in, vol_error[0]))
     {
       if (vol_error[0] >= 0){
       	printf("VolumeError: negative volumn\n");
@@ -1603,10 +1588,7 @@ int main(int argc, char *argv[])
 	Index_t start = b;
 	Index_t end = min(start + EBS, numElem);
 	Index_t nb = start / EBS;
-        #pragma omp target teams distribute parallel for num_teams(elem_teams) thread_limit(THREADS) nowait	\
-	depend(in: determ[start], x8n[8*start], ss[start], dvdx[8*start])		\
-	depend(iterator(it=0:dep_xd_yd_zd[nb].size()), in: xd[dep_xd_yd_zd[nb][it]])	\
-	depend(out: fx_elem[8*start])
+        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, determ[start], x8n[8*start], ss[start], dvdx[8*start]) DEPEND_MULTI(in, (it=0:dep_xd_yd_zd[nb].size()), xd[dep_xd_yd_zd[nb][it]]) DEPEND(out, fx_elem[8*start]))
         for (Index_t i2 = start; i2 < end; i2++) {
 
           Index_t i3 = 8*i2;
@@ -1797,10 +1779,7 @@ int main(int argc, char *argv[])
         Index_t start = b;
         Index_t end = min(start + NBS, numNode);
         Index_t nb = start/NBS;
-        #pragma omp target teams distribute parallel for num_teams(node_teams) thread_limit(THREADS) nowait	\
-        depend(iterator(it=0:dep_fx_fy_fz_elem[nb].size()), in:				\
-              fx_elem[dep_fx_fy_fz_elem[nb][it]])					\
-	depend(out: fx[start])
+        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(in, (it=0:dep_fx_fy_fz_elem[nb].size()), fx_elem[dep_fx_fy_fz_elem[nb][it]]) DEPEND(out, fx[start]))
 	for (Index_t gnode = start; gnode < end; gnode++) {
           // element count
           const Index_t count = nodeElemStart[gnode+1] - nodeElemStart[gnode];
@@ -1829,9 +1808,7 @@ int main(int argc, char *argv[])
     for (Index_t b = 0; b < numNode; b+=NBS) {
       Index_t start = b;
       Index_t end = min(start + NBS, numNode);
-      #pragma omp target teams distribute parallel for num_teams(node_teams) thread_limit(THREADS) nowait	\
-      depend(in: fx[start])								\
-      depend(out: xdd[start])
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND(in, fx[start]) DEPEND(out, xdd[start]))
       for (Index_t i = start; i < end; i++) {
         Real_t one_over_nMass = Real_t(1.) / nodalMass[i];
         xdd[i] = fx[i] * one_over_nMass;
@@ -1852,33 +1829,28 @@ int main(int argc, char *argv[])
       if (s1 && s2 && s3) {}
       // 1 0 0
       else if (!s1 && s2 && s3) {
-        #pragma omp target teams distribute parallel for num_teams(node_teams) thread_limit(THREADS) nowait	\
-        depend(iterator(it=0:dep_xdd[nb].size()), inout: xdd[dep_xdd[nb][it]])
+        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(inout, (it=0:dep_xdd[nb].size()), xdd[dep_xdd[nb][it]]))
 	for (Index_t i = start; i < end; i++) {
           xdd[symmX[i]] = Real_t(0.0) ;
         }
       }
       // 0 1 0
       else if (s1 && !s2 && s3) {
-        #pragma omp target teams distribute parallel for num_teams(node_teams) thread_limit(THREADS) nowait	\
-        depend(iterator(it=0:dep_ydd[nb].size()), inout: ydd[dep_ydd[nb][it]])
+        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(inout, (it=0:dep_ydd[nb].size()), ydd[dep_ydd[nb][it]]))
 	for (Index_t i = start; i < end; i++) {
           ydd[symmY[i]] = Real_t(0.0) ;
         }
       }
       // 0 0 1
       else if (s1 && s2 && !s3) {
-        #pragma omp target teams distribute parallel for num_teams(node_teams) thread_limit(THREADS) nowait	\
-        depend(iterator(it=0:dep_zdd[nb].size()), inout: zdd[dep_zdd[nb][it]])
+        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(inout, (it=0:dep_zdd[nb].size()), zdd[dep_zdd[nb][it]]))
 	for (Index_t i = start; i < end; i++) {
           zdd[symmZ[i]] = Real_t(0.0) ;
         }
       }
       // 1 1 0
       else if (!s1 && !s2 && s3) {
-        #pragma omp target teams distribute parallel for num_teams(node_teams) thread_limit(THREADS) nowait	\
-        depend(iterator(it=0:dep_xdd[nb].size()), inout: xdd[dep_xdd[nb][it]])          \
-        depend(iterator(it=0:dep_ydd[nb].size()), inout: ydd[dep_ydd[nb][it]])
+        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(inout, (it=0:dep_xdd[nb].size()), xdd[dep_xdd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_ydd[nb].size()), ydd[dep_ydd[nb][it]]))
 	for (Index_t i = start; i < end; i++) {
           xdd[symmX[i]] = Real_t(0.0) ;
 	  ydd[symmY[i]] = Real_t(0.0) ;
@@ -1886,9 +1858,7 @@ int main(int argc, char *argv[])
       }
       // 1 0 1
       else if (!s1 && s2 && !s3) {
-        #pragma omp target teams distribute parallel for num_teams(node_teams) thread_limit(THREADS) nowait	\
-        depend(iterator(it=0:dep_xdd[nb].size()), inout: xdd[dep_xdd[nb][it]])          \
-        depend(iterator(it=0:dep_zdd[nb].size()), inout: zdd[dep_zdd[nb][it]])
+        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(inout, (it=0:dep_xdd[nb].size()), xdd[dep_xdd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_zdd[nb].size()), zdd[dep_zdd[nb][it]]))
 	for (Index_t i = start; i < end; i++) {
           xdd[symmX[i]] = Real_t(0.0) ;
           zdd[symmZ[i]] = Real_t(0.0) ;
@@ -1896,9 +1866,7 @@ int main(int argc, char *argv[])
       }
       // 0 1 1
       else if (s1 && !s2 && !s3) {
-        #pragma omp target teams distribute parallel for num_teams(node_teams) thread_limit(THREADS) nowait	\
-        depend(iterator(it=0:dep_ydd[nb].size()), inout: ydd[dep_ydd[nb][it]])          \
-        depend(iterator(it=0:dep_zdd[nb].size()), inout: zdd[dep_zdd[nb][it]])
+        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(inout, (it=0:dep_ydd[nb].size()), ydd[dep_ydd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_zdd[nb].size()), zdd[dep_zdd[nb][it]]))
         for (Index_t i = start; i < end; i++) {
           ydd[symmY[i]] = Real_t(0.0) ;
           zdd[symmZ[i]] = Real_t(0.0) ;
@@ -1906,10 +1874,7 @@ int main(int argc, char *argv[])
       }
       // 1 1 1
       else if (!s1 && !s2 && !s3) {
-        #pragma omp target teams distribute parallel for num_teams(node_teams) thread_limit(THREADS) nowait	\
-	depend(iterator(it=0:dep_xdd[nb].size()), inout: xdd[dep_xdd[nb][it]])          \
-        depend(iterator(it=0:dep_ydd[nb].size()), inout: ydd[dep_ydd[nb][it]])          \
-        depend(iterator(it=0:dep_zdd[nb].size()), inout: zdd[dep_zdd[nb][it]])
+        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(inout, (it=0:dep_xdd[nb].size()), xdd[dep_xdd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_ydd[nb].size()), ydd[dep_ydd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_zdd[nb].size()), zdd[dep_zdd[nb][it]]))
         for (Index_t i = start; i < end; i++) {
 	  xdd[symmX[i]] = Real_t(0.0) ;
           ydd[symmY[i]] = Real_t(0.0) ;
@@ -1928,9 +1893,7 @@ int main(int argc, char *argv[])
     for (Index_t b = 0; b < numNode; b += NBS) {
       Index_t start = b;
       Index_t end = min(start + NBS, numNode);
-      #pragma omp target teams distribute parallel for num_teams(node_teams) thread_limit(THREADS) nowait	\
-      depend(in: xdd[start], ydd[start], zdd[start], deltatime[0])                      \
-      depend(inout: xd[start])
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND(in, xdd[start], ydd[start], zdd[start], deltatime[0]) DEPEND(inout, xd[start]))
       for (Index_t i = start; i < end; i++) {
 
         Real_t xdtmp = xd[i] + xdd[i] * deltatime[0];
@@ -1961,9 +1924,7 @@ int main(int argc, char *argv[])
     for (Index_t b = 0; b < numNode; b += NBS) {
       Index_t start = b;
       Index_t end = min(start + NBS, numNode);
-      #pragma omp target teams distribute parallel for num_teams(node_teams) thread_limit(THREADS) nowait	\
-      depend(in: xd[start], deltatime[0])						\
-      depend(inout: x[start])
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND(in, xd[start], deltatime[0]) DEPEND(inout, x[start]))
       for (Index_t i = start; i < end; i++) {
         x[i] += xd[i] * deltatime[0];
         y[i] += yd[i] * deltatime[0];
@@ -1986,11 +1947,7 @@ int main(int argc, char *argv[])
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
       Index_t nb = start/EBS;
-      #pragma omp target teams distribute parallel for num_teams(elem_teams) thread_limit(THREADS) nowait	\
-      depend(in: v[start], deltatime[0])						\
-      depend(iterator(it=0:dep_x_y_z[nb].size()), in: x[dep_x_y_z[nb][it]])		\
-      depend(iterator(it=0:dep_xd_yd_zd[nb].size()), in: xd[dep_xd_yd_zd[nb][it]])	\
-      depend(out: vnew[start], delv[start], arealg[start], dxx[start])
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, v[start], deltatime[0]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND_MULTI(in, (it=0:dep_xd_yd_zd[nb].size()), xd[dep_xd_yd_zd[nb][it]]) DEPEND(out, vnew[start], delv[start], arealg[start], dxx[start]))
       for (Index_t k = start; k < end; k++) {
         Real_t B[3][8] ; // shape function derivatives
         Real_t D[6] ;
@@ -2092,11 +2049,10 @@ int main(int argc, char *argv[])
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
       Index_t s = end - start;
-      #pragma omp target update from (arealg[start:s]) nowait	\
-      depend(inout: arealg[start])
+      OMP_TARGET_UPDATE(from (arealg[start:s]) NOWAIT DEPEND(inout, arealg[start]))
     }
 
-    #pragma omp target nowait
+    OMP_TARGET_TASK()
     {
       vol_error[0] = -1;
     }
@@ -2104,9 +2060,7 @@ int main(int argc, char *argv[])
     for (Index_t b = 0; b < numElem; b += EBS) {
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
-      #pragma omp target teams distribute parallel for num_teams(elem_teams) thread_limit(THREADS) nowait	\
-      depend(in: dxx[start])								\
-      depend(out: dxx[start], vdov[start])
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, dxx[start]) DEPEND(out, dxx[start], vdov[start]))
       for (Index_t k = start; k < end; k++) {
         Real_t vvdov = dxx[k] + dyy[k] + dzz[k] ;
         Real_t vdovthird = vvdov/Real_t(3.0) ;
@@ -2127,15 +2081,12 @@ int main(int argc, char *argv[])
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
       Index_t s = end - start;
-      #pragma omp target update from (vdov[start:s]) nowait	\
-      depend(inout: vdov[start])
+      OMP_TARGET_UPDATE(from (vdov[start:s]) NOWAIT DEPEND(inout, vdov[start]))
     }
 
-    #pragma omp target update from (vol_error[0:1]) nowait	\
-    depend(inout: vol_error[0])
+    OMP_TARGET_UPDATE(from (vol_error[0:1]) NOWAIT DEPEND(inout, vol_error[0]))
 
-    #pragma omp task		\
-    depend(in: vol_error[0])
+    OMP_HOST_TASK(DEPEND(in, vol_error[0]))
     {
       if (vol_error[0] >= 0){
         printf("VolumeError: negative volumn\n");
@@ -2156,12 +2107,7 @@ int main(int argc, char *argv[])
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
       Index_t nb = start/EBS;
-      #pragma omp target teams distribute parallel for num_teams(elem_teams) thread_limit(THREADS) nowait	\
-      depend(in: vnew[start])								\
-      depend(iterator(it=0:dep_x_y_z[nb].size()), in: x[dep_x_y_z[nb][it]])		\
-      depend(iterator(it=0:dep_xd_yd_zd[nb].size()), in: xd[dep_xd_yd_zd[nb][it]])	\
-      depend(out: delv_xi[start], delv_eta[start], delv_zeta[start],			\
-		  delx_xi[start], delx_eta[start], delx_zeta[start])
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, vnew[start]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND_MULTI(in, (it=0:dep_xd_yd_zd[nb].size()), xd[dep_xd_yd_zd[nb][it]]) DEPEND(out, delv_xi[start], delv_eta[start], delv_zeta[start], delx_xi[start], delx_eta[start], delx_zeta[start]))
       for (Index_t i = start; i < end; i++) {
         Real_t ax,ay,az ;
         Real_t dxv,dyv,dzv ;
@@ -2309,14 +2255,7 @@ int main(int argc, char *argv[])
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
       Index_t nb = start/EBS;
-      #pragma omp target teams distribute parallel for num_teams(elem_teams) thread_limit(THREADS) nowait		\
-      depend(in: delv_xi[start], delv_eta[start], delv_zeta[start],				\
-		 delx_xi[start], delx_eta[start], delx_zeta[start],				\
-		 vnew[start])									\
-      depend(iterator(it=0:dep_delv_xi[nb].size()), in: delv_xi[dep_delv_xi[nb][it]])           \
-      depend(iterator(it=0:dep_delv_eta[nb].size()), in: delv_eta[dep_delv_eta[nb][it]])        \
-      depend(iterator(it=0:dep_delv_zeta[nb].size()), in: delv_zeta[dep_delv_zeta[nb][it]])	\
-      depend(out: qq[start], ql[start])
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, delv_xi[start], delv_eta[start], delv_zeta[start], delx_xi[start], delx_eta[start], delx_zeta[start], vnew[start]) DEPEND_MULTI(in, (it=0:dep_delv_xi[nb].size()), delv_xi[dep_delv_xi[nb][it]]) DEPEND_MULTI(in, (it=0:dep_delv_eta[nb].size()), delv_eta[dep_delv_eta[nb][it]]) DEPEND_MULTI(in, (it=0:dep_delv_zeta[nb].size()), delv_zeta[dep_delv_zeta[nb][it]]) DEPEND(out, qq[start], ql[start]))
       for (Index_t i = start; i < end; i++) {
 
         Real_t qlin, qquad ;
@@ -2466,8 +2405,7 @@ int main(int argc, char *argv[])
     for (Index_t b = 0; b < numElem; b+=EBS) {
       Index_t start = b;
       Index_t end = min(b + EBS, numElem);
-      #pragma omp target teams distribute parallel for num_teams(elem_teams) thread_limit(THREADS) nowait	\
-      depend(in: q[start])
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, q[start]))
       for (Index_t i = start; i < end; i++) {
         if(q[i] > qstop) {
 	  printf("QStopError idx: %d\n", i);
@@ -2482,10 +2420,7 @@ int main(int argc, char *argv[])
     for (Index_t b = 0; b < numElem; b+=EBS) {
       Index_t start = b;
       Index_t end = min(b + EBS, numElem);
-      #pragma omp target teams distribute parallel for num_teams(elem_teams) thread_limit(THREADS) nowait	\
-      depend(in: vnew[start], v[start], e[start], delv[start], q[start], p[start], 	\
-		 qq[start], ql[start])							\
-      depend(out: q[start], p[start], e[start], ss[start], v[start])
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, vnew[start], v[start], e[start], delv[start], q[start], p[start], qq[start], ql[start]) DEPEND(out, q[start], p[start], e[start], ss[start], v[start]))
       for (Index_t elem = start; elem < end; elem++) {
         Index_t rep = elemRep[elem];
         Real_t e_old, delvc, p_old, q_old, qq_old, ql_old;
@@ -2692,16 +2627,12 @@ int main(int argc, char *argv[])
       Index_t start = b;
       Index_t end = min(b + EBS, numElem);
       Index_t s = end - start;
-      #pragma omp target update from(ss[start:s]) nowait	\
-      depend(inout: ss[start])
+      OMP_TARGET_UPDATE(from(ss[start:s]) NOWAIT DEPEND(inout, ss[start]))
     }
 
     for (Index_t r=0 ; r < numReg ; ++r) {
       /* evaluate time constraint */
-      #pragma omp task							\
-      depend(iterator(it=0:dep_dts[r].size()), in: ss[dep_dts[r][it]],	\
-			vdov[dep_dts[r][it]], arealg[dep_dts[r][it]])	\
-      depend(out: dtcourant_reduc[r], dtcourant_elem_reduc[r])
+      OMP_HOST_TASK(DEPEND_MULTI(in, (it=0:dep_dts[r].size()), ss[dep_dts[r][it]], vdov[dep_dts[r][it]], arealg[dep_dts[r][it]]) DEPEND(out, dtcourant_reduc[r], dtcourant_elem_reduc[r]))
       {
         Real_t   qqc2 = Real_t(64.0) * qqc * qqc;
 	      Index_t *regElemlist = locDom->regElemlist(r);
@@ -2732,9 +2663,7 @@ int main(int argc, char *argv[])
         }
       }
 
-      #pragma omp task								\
-      depend(iterator(it=0:dep_dts[r].size()), in: vdov[dep_dts[r][it]])	\
-      depend(out: dthydro_reduc[r], dthydro_elem_reduc[r])
+      OMP_HOST_TASK(DEPEND_MULTI(in, (it=0:dep_dts[r].size()), vdov[dep_dts[r][it]]) DEPEND(out, dthydro_reduc[r], dthydro_elem_reduc[r]))
       {
         /* check hydro constraint */
 	      Index_t *regElemlist = locDom->regElemlist(r);
@@ -2756,10 +2685,7 @@ int main(int argc, char *argv[])
       }
     }
 
-    #pragma omp task									\
-    depend(iterator(it=0:numReg), in: dtcourant_reduc[it], dtcourant_elem_reduc[it],	\
-		    dthydro_reduc[it], dthydro_elem_reduc[it])				\
-    depend(out: dtcourant[0], dthydro[0])
+    OMP_HOST_TASK(DEPEND_MULTI(in, (it=0:numReg), dtcourant_reduc[it], dtcourant_elem_reduc[it], dthydro_reduc[it], dthydro_elem_reduc[it]) DEPEND(out, dtcourant[0], dthydro[0]))
     {
       dtcourant[0] = 1.0e+20;
       dthydro[0] = 1.0e+20;
@@ -2773,11 +2699,9 @@ int main(int argc, char *argv[])
       }
     }
 
-    #pragma omp target update to(dtcourant[0:1], dthydro[0:1]) nowait	\
-    depend(inout: dtcourant[0], dthydro[0])
+    OMP_TARGET_UPDATE(to(dtcourant[0:1], dthydro[0:1]) NOWAIT DEPEND(inout, dtcourant[0], dthydro[0]))
 
-      #pragma omp task					\
-      depend(inout: cycle[0], time[0], deltatime[0])
+      OMP_HOST_TASK(DEPEND(inout, cycle[0], time[0], deltatime[0]))
       {
           //if ((opts.showProg != 0) && (opts.quiet == 0) && (myRank == 0))
           {
@@ -2791,9 +2715,8 @@ int main(int argc, char *argv[])
     opts.iteration_cap -= 1;
     # endif
 
-    # if USE_XKOMP_TASKGRAPH
-    });
-    # endif /* USE_XKOMP_TASKGRAPH */
+    }
+    TASKGRAPH_END
   }
   t1 = omp_get_wtime();
   # pragma omp taskwait
@@ -2804,7 +2727,7 @@ int main(int argc, char *argv[])
   double elapsed_time = tf - t0;
 
   // retrieve for correctness tests
-  # pragma omp target update from(e[0:numElem])
+  OMP_TARGET_UPDATE(from(e[0:numElem]))
   locDom->m_cycle = cycle[0];
 
   // Write out final viz file */

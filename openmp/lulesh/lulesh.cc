@@ -814,6 +814,15 @@ int main(int argc, char *argv[])
   if ((myRank == 0) && (opts.quiet == 0)) {
     printf("Running problem size %d^3 per domain until completion\n", opts.nx);
     printf("Num processors: %d\n", numRanks);
+    /* Backend banner (parity with the krylov / cholesky apps, for scripts). */
+#if USE_SYNC
+    const char *lu_backend = "synchronous (blocking)";
+#elif USE_TARGET
+    const char *lu_backend = "GPU target tasks";
+#else
+    const char *lu_backend = "CPU tasks";
+#endif
+    printf("backend=%s taskgraph=%d\n", lu_backend, USE_TASKGRAPH);
     printf("Num tasks per loop: %d\n", opts.nb);
     printf("Total number of elements: %lld\n\n", (long long int)(numRanks*opts.nx*opts.nx*opts.nx));
     printf("To run other sizes, use -s <integer>.\n");
@@ -1284,11 +1293,18 @@ OMP_TARGET_ENTER_DATA( \
 
   double t0, t1, tf;
 
+  /* Per-iteration wall-clock times (ms). Recorded by a depend-synchronized host
+   * task at the end of each iteration: iteration 0 is the taskgraph record, 1
+   * the first replay, 2.. the steady state -- like the krylov / cholesky apps. */
+  double *iter_times = (double *) malloc(sizeof(double) * (opts.its > 0 ? opts.its : 1));
+  double prev_ts = 0.0;
+
 #pragma omp parallel
 {
 #pragma omp single
 {
     t0 = omp_get_wtime();
+    prev_ts = t0;
   for (Int_t iter = 0; iter < opts.its; ++iter) {
 
       TASKGRAPH_BEGIN
@@ -1299,7 +1315,8 @@ OMP_TARGET_ENTER_DATA( \
     //==============================================================================
 
     OMP_TARGET_TASK(DEPEND(in, dtcourant[0], dthydro[0], deltatime[0])
-                    DEPEND(out, deltatime[0], time[0], cycle[0]))
+                    DEPEND(out, deltatime[0], time[0], cycle[0])
+                    MAP(present: time[0:1], cycle[0:1], deltatime[0:1], dtcourant[0:1], dthydro[0:1]))
     {
       Real_t targetdt = stoptime - time[0] ;
 
@@ -1496,7 +1513,7 @@ OMP_TARGET_ENTER_DATA( \
     // CalcHourglassControlForElems(device_queue, domain, determ, hgcoef) ;
     //=================================================================================
 
-  OMP_TARGET_TASK(DEPEND(out, vol_error[0]))
+  OMP_TARGET_TASK(DEPEND(out, vol_error[0]) MAP(present: vol_error[0:1]))
   {
     vol_error[0] = -1;
   }
@@ -1505,7 +1522,7 @@ OMP_TARGET_ENTER_DATA( \
     Index_t start = b;
     Index_t end = min(start + EBS, numElem);
     Index_t nb = start/EBS;
-    OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, v[start], vol_error[0]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND(out, determ[start], dvdx[8*start], x8n[8*start]))
+    OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, v[start], vol_error[0]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND(out, determ[start], dvdx[8*start], x8n[8*start]) MAP(present: vol_error[0:1]))
     for (Index_t i = start; i < end; i++) {
       Real_t  x1[8],  y1[8],  z1[8] ;
       Real_t pfx[8], pfy[8], pfz[8] ;
@@ -1588,7 +1605,7 @@ OMP_TARGET_ENTER_DATA( \
 	Index_t start = b;
 	Index_t end = min(start + EBS, numElem);
 	Index_t nb = start / EBS;
-        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, determ[start], x8n[8*start], ss[start], dvdx[8*start]) DEPEND_MULTI(in, (it=0:dep_xd_yd_zd[nb].size()), xd[dep_xd_yd_zd[nb][it]]) DEPEND(out, fx_elem[8*start]))
+        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, determ[start], x8n[8*start], ss[start], dvdx[8*start]) DEPEND_MULTI(in, (it=0:dep_xd_yd_zd[nb].size()), xd[dep_xd_yd_zd[nb][it]]) DEPEND(out, fx_elem[8*start]) MAP(present: gamma[0:32]))
         for (Index_t i2 = start; i2 < end; i2++) {
 
           Index_t i3 = 8*i2;
@@ -1893,7 +1910,7 @@ OMP_TARGET_ENTER_DATA( \
     for (Index_t b = 0; b < numNode; b += NBS) {
       Index_t start = b;
       Index_t end = min(start + NBS, numNode);
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND(in, xdd[start], ydd[start], zdd[start], deltatime[0]) DEPEND(inout, xd[start]))
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND(in, xdd[start], ydd[start], zdd[start], deltatime[0]) DEPEND(inout, xd[start]) MAP(present: deltatime[0:1]))
       for (Index_t i = start; i < end; i++) {
 
         Real_t xdtmp = xd[i] + xdd[i] * deltatime[0];
@@ -1924,7 +1941,7 @@ OMP_TARGET_ENTER_DATA( \
     for (Index_t b = 0; b < numNode; b += NBS) {
       Index_t start = b;
       Index_t end = min(start + NBS, numNode);
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND(in, xd[start], deltatime[0]) DEPEND(inout, x[start]))
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND(in, xd[start], deltatime[0]) DEPEND(inout, x[start]) MAP(present: deltatime[0:1]))
       for (Index_t i = start; i < end; i++) {
         x[i] += xd[i] * deltatime[0];
         y[i] += yd[i] * deltatime[0];
@@ -1947,7 +1964,7 @@ OMP_TARGET_ENTER_DATA( \
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
       Index_t nb = start/EBS;
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, v[start], deltatime[0]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND_MULTI(in, (it=0:dep_xd_yd_zd[nb].size()), xd[dep_xd_yd_zd[nb][it]]) DEPEND(out, vnew[start], delv[start], arealg[start], dxx[start]))
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, v[start], deltatime[0]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND_MULTI(in, (it=0:dep_xd_yd_zd[nb].size()), xd[dep_xd_yd_zd[nb][it]]) DEPEND(out, vnew[start], delv[start], arealg[start], dxx[start]) MAP(present: deltatime[0:1]))
       for (Index_t k = start; k < end; k++) {
         Real_t B[3][8] ; // shape function derivatives
         Real_t D[6] ;
@@ -2052,7 +2069,7 @@ OMP_TARGET_ENTER_DATA( \
       OMP_TARGET_UPDATE(from (arealg[start:s]) NOWAIT DEPEND(inout, arealg[start]))
     }
 
-    OMP_TARGET_TASK()
+    OMP_TARGET_TASK(MAP(present: vol_error[0:1]))
     {
       vol_error[0] = -1;
     }
@@ -2060,7 +2077,7 @@ OMP_TARGET_ENTER_DATA( \
     for (Index_t b = 0; b < numElem; b += EBS) {
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, dxx[start]) DEPEND(out, dxx[start], vdov[start]))
+      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, dxx[start]) DEPEND(out, dxx[start], vdov[start]) MAP(present: vol_error[0:1]))
       for (Index_t k = start; k < end; k++) {
         Real_t vvdov = dxx[k] + dyy[k] + dzz[k] ;
         Real_t vdovthird = vvdov/Real_t(3.0) ;
@@ -2701,13 +2718,6 @@ OMP_TARGET_ENTER_DATA( \
 
     OMP_TARGET_UPDATE(to(dtcourant[0:1], dthydro[0:1]) NOWAIT DEPEND(inout, dtcourant[0], dthydro[0]))
 
-      OMP_HOST_TASK(DEPEND(inout, cycle[0], time[0], deltatime[0]))
-      {
-          //if ((opts.showProg != 0) && (opts.quiet == 0) && (myRank == 0))
-          {
-              printf("cycle = %d, time = %e, dt=%e\n", cycle[0], double(time[0]), double(deltatime[0]) ) ;
-          }
-      }
     # if 0
     if (opts.iteration_cap == 1){
       break;
@@ -2717,6 +2727,23 @@ OMP_TARGET_ENTER_DATA( \
 
     }
     TASKGRAPH_END
+
+    /* Per-iteration timing + progress print. Created OUTSIDE the taskgraph (so
+     * it is not recorded/replayed) and depend-synchronized on this iteration's
+     * per-step scalars, so it fires after the iteration's last work (TimeIncrement
+     * update + end-of-step reductions) and before the next iteration's
+     * TimeIncrement -- recording the steady-state per-iteration wall time. It
+     * reads the host copies of cycle/time/deltatime kept current by the earlier
+     * `target update from`. */
+    OMP_HOST_TASK(firstprivate(iter, iter_times) shared(prev_ts)
+                  DEPEND(in, cycle[0], time[0], deltatime[0], dtcourant[0], dthydro[0]))
+    {
+        const double now = omp_get_wtime();
+        iter_times[iter] = (now - prev_ts) * 1000.0;
+        prev_ts = now;
+        printf("cycle = %d, time = %e, dt=%e, exec = %.3f ms\n",
+               cycle[0], double(time[0]), double(deltatime[0]), iter_times[iter]);
+    }
   }
   t1 = omp_get_wtime();
   # pragma omp taskwait
@@ -2763,6 +2790,25 @@ OMP_TARGET_ENTER_DATA( \
   double fom_per_watt = fom / P;
   printf("FOM/watt             = %10.8g (z/s/J)\n", fom_per_watt);
   printf("TDG creation time    = %10.8g (s)\n", t1 - t0);
+
+  /* Per-iteration timing summary (record / 1st replay / steady mean+stddev),
+   * parseable by scripts/evaluate.py -- same breakdown as the krylov app. */
+  if (opts.its > 0) {
+    const int lo  = (opts.its > 2) ? 2 : (opts.its > 1 ? 1 : 0);  /* first steady iter */
+    const int cnt = opts.its - lo;
+    double mean = 0.0;
+    for (int r = lo; r < opts.its; r++) mean += iter_times[r];
+    if (cnt > 0) mean /= cnt;
+    double var = 0.0;
+    for (int r = lo; r < opts.its; r++) { double d = iter_times[r] - mean; var += d * d; }
+    const double sd = (cnt > 1) ? sqrt(var / (cnt - 1)) : 0.0;
+    printf("iteration 0          : %10.3f ms  (record)\n", iter_times[0]);
+    printf("iteration 1          : %10.3f ms  (1st replay)\n",
+           (opts.its > 1) ? iter_times[1] : iter_times[0]);
+    printf("iterations 2.. (avg)    : %10.3f ms\n", mean);
+    printf("iterations 2.. (stddev) : %10.3f ms\n", sd);
+  }
+  free(iter_times);
 
   power_deinit();
 

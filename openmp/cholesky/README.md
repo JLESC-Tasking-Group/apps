@@ -22,5 +22,14 @@ Build and run:
 
 Please, see the Makefile for build configuration (CPU vs GPU, defaults, flags).
 
+Evaluation (like the krylov app): `scripts/evaluate.py` sweeps the taskgraph
+optimizations (`OMP_TASKGRAPH_OPT`) and problem sizes into a CSV, and
+`scripts/plot.py` renders a grouped bar chart (avg time / repetition, with
+record vs replay stddev error bars):
+
+    make
+    ./scripts/evaluate.py --ts 256 --reps 10          # -> evaluate_cholesky_<ts>.csv
+    ./scripts/plot.py evaluate_cholesky_*.csv          # -> .png
+
 Unified from the earlier `task/` (CPU + LAPACK) and `target-nowait-depend/` (GPU)
 variants; the MPI/MPC multi-node path has been removed.

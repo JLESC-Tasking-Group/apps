@@ -1,1 +1,5 @@
 cholesky
+*.o
+evaluate_*.csv
+evaluate_*.png
+scripts/__pycache__/

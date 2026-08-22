@@ -1,3 +1,7 @@
 ./lulesh
+lulesh
 *.o
 .gdb_history
+evaluate_*.csv
+evaluate_*.png
+scripts/__pycache__/

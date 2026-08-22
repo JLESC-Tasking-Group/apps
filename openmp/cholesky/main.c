@@ -272,16 +272,39 @@ int main(int argc, char **argv)
 
     OMP_TARGET_EXIT_DATA(MAP(release: A[0:total]))
 
-    /* ---- report ---- */
-    printf("total time           = %10.6f s\n", t_total1 - t_total0);
+    /* ---- report ----
+     * total time, theoretical FLOPs and the derived GFLOP/s, then the record /
+     * first-replay / steady-replay breakdown (mean and sample stddev of the
+     * repetitions after the first two), in the spirit of the krylov driver so
+     * scripts/evaluate.py can parse either app the same way. */
+    const double Nd    = (double) nt * (double) ts;          /* matrix dimension */
+    const double flops = Nd * Nd * Nd / 3.0;                 /* ~ (1/3) N^3 for Cholesky */
+
+    int lo = (reps > 2) ? 2 : (reps > 1 ? 1 : 0);           /* first steady rep */
+    int cnt = reps - lo;
+    double mean = 0.0;
+    for (int r = lo; r < reps; r++) mean += rep_ms[r];
+    if (cnt > 0) mean /= cnt;
+    double var = 0.0;
+    for (int r = lo; r < reps; r++) { double d = rep_ms[r] - mean; var += d * d; }
+    double stddev = (cnt > 1) ? sqrt(var / (cnt - 1)) : 0.0;
+    double gflops = (mean > 0.0) ? flops / (mean * 1.0e-3) / 1.0e9 : 0.0;
+
+    printf("total solve time     : %10.6f s\n", t_total1 - t_total0);
+    printf("theoretical flops    : %.6e\n", flops);
+    printf("performance          : %10.3f GFLOP/s\n", gflops);
     for (int r = 0; r < reps; r++) {
         const char *tag = "";
 #if USE_TASKGRAPH
         if (r == 0)      tag = "  (record)";
         else if (r == 1) tag = "  (1st replay)";
 #endif
-        printf("  rep %3d            = %10.3f ms%s\n", r, rep_ms[r], tag);
+        printf("  rep %3d            : %10.3f ms%s\n", r, rep_ms[r], tag);
     }
+    printf("repetition 0         : %10.3f ms\n", rep_ms[0]);
+    printf("repetition 1         : %10.3f ms\n", (reps > 1) ? rep_ms[1] : rep_ms[0]);
+    printf("repetitions 2.. (avg)    : %10.3f ms\n", mean);
+    printf("repetitions 2.. (stddev) : %10.3f ms\n", stddev);
 
     /* ---- optional verification ---- */
     if (check) {

@@ -80,6 +80,15 @@ enum Datasets { TINYSHAKESPEARE = 0, TINYSTORIES, DATASETS_MAX_INT };
 # define USE_TARGET 0
 #endif /* USE_TARGET */
 
+// When true, switch from the asynchronous task schedule to a *synchronous* one:
+// each kernel runs to completion before the next (no tasks / nowait / depend /
+// taskgraph). On the GPU the loops are still offloaded (blocking `omp target`);
+// on the host they degenerate to plain serial loops. Used as the "current
+// practice" baseline by the evaluation harness. Off (async) by default.
+#ifndef USE_SYNC
+# define USE_SYNC 0
+#endif /* USE_SYNC */
+
 #if USE_OMPSS && USE_TARGET
 # error "USE_OMPSS (host OmpSs-2) and USE_TARGET (OpenMP GPU offload) are mutually exclusive"
 #endif
@@ -155,13 +164,28 @@ enum Datasets { TINYSHAKESPEARE = 0, TINYSTORIES, DATASETS_MAX_INT };
 // in the taskgraph (they are created inside functions, not directly in the
 // taskgraph region). Applied to every task-generating macro below. OmpSs-2 has
 // no replayable clause, so it is never emitted for the OmpSs backend.
-#if USE_REPLAYABLE && !USE_OMPSS
+#if USE_REPLAYABLE && !USE_OMPSS && !USE_SYNC
 #  define REPLAYABLE_CLAUSE replayable(1)
 #else
 #  define REPLAYABLE_CLAUSE
 #endif
 
-#if USE_TARGET
+#if USE_SYNC
+
+    // Synchronous baseline: no tasks / nowait / depend / taskgraph. On the GPU
+    // each loop is still offloaded as one blocking `omp target` region; on the
+    // host the macros vanish and the loop body runs serially inline.
+    # if USE_TARGET
+    #define OMP_TASK(...)
+    #define OMP_TARGET_LOOP_TASK(...)      xPRAGMA(omp target teams distribute parallel for __VA_ARGS__)
+    #define OMP_TARGET_TASK(...)           xPRAGMA(omp target __VA_ARGS__)
+    # else
+    #define OMP_TASK(...)                                 /* nothing: serial loop */
+    #define OMP_TARGET_LOOP_TASK(...)                     /* nothing: serial loop */
+    #define OMP_TARGET_TASK(...)                          /* nothing: serial block */
+    # endif
+
+#elif USE_TARGET
 
     // The tile-level task disappears; the loop body runs inside the OMP_TARGET_LOOP_TASK.
     #define OMP_TASK(...)
@@ -183,8 +207,10 @@ enum Datasets { TINYSHAKESPEARE = 0, TINYSTORIES, DATASETS_MAX_INT };
 
 #endif /* USE_TARGET */
 
-// Always a host task, regardless of backend.
-#if USE_OMPSS
+// Always a host task, regardless of backend; runs inline under USE_SYNC.
+#if USE_SYNC
+    #define OMP_HOST_TASK(...)                            /* nothing: runs inline */
+#elif USE_OMPSS
     #define OMP_HOST_TASK(...) xPRAGMA(oss task REPLAYABLE_CLAUSE __VA_ARGS__)
 #else
     #define OMP_HOST_TASK(...) xPRAGMA(omp task REPLAYABLE_CLAUSE __VA_ARGS__)
@@ -213,7 +239,14 @@ enum Datasets { TINYSHAKESPEARE = 0, TINYSTORIES, DATASETS_MAX_INT };
 // ----------------------------------------------------------------------------
 #define UNWRAP(...) __VA_ARGS__
 
-#if USE_OMPSS
+#if USE_SYNC
+    // No tasks -> no dependences (program order is the schedule). ATOMIC is kept
+    // (needed inside the blocking GPU target loops; harmless on the serial host).
+    #define DEPEND(dir, ...)
+    #define DEPEND_MULTI(dir, iters, ...)
+
+    #define ATOMIC PRAGMA(omp atomic)
+#elif USE_OMPSS
     // Dependency-direction keyword mapping, OpenMP -> OmpSs-2. Call sites always
     // use the OpenMP keyword; only `inoutset` differs (OmpSs calls it
     // `concurrent`), the rest map to themselves:

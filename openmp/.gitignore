@@ -1,0 +1,16 @@
+# build outputs
+*.o
+*.x
+lulesh/lulesh
+cholesky/cholesky
+llm.c/train_gpt2
+llm.c/test_gpt2
+
+# evaluation harness outputs
+results/
+__pycache__/
+scripts/__pycache__/
+
+# stale per-app evaluation artifacts (superseded by scripts/ + results/)
+*/evaluate_*.csv
+*/evaluate_*.png

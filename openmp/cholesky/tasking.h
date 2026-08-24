@@ -1,7 +1,7 @@
 /*
- * tasking.h - OpenMP task / target / taskgraph abstraction for the tiled
- * Cholesky factorization, in the spirit of the krylov and llm.c apps: one
- * source expresses two backends, selected at compile time by -DUSE_TARGET.
+ * tasking.h - OpenMP task / target abstraction for the tiled Cholesky
+ * factorization: one source expresses two backends, selected at compile time by
+ * -DUSE_TARGET.
  *
  *   USE_TARGET == 0 (default): every tile kernel (potrf/trsm/syrk/gemm) becomes
  *                    one CPU task -> "#pragma omp task depend(...)".
@@ -9,13 +9,14 @@
  *                    -> "#pragma omp target [teams distribute parallel for]
  *                        nowait depend(...) map(...)".
  *
- * USE_TASKGRAPH wraps the (loop-invariant) per-repetition task region with
- * TASKGRAPH_BEGIN/END so it is recorded once and replayed afterwards.
- *
  * USE_SYNC switches from the asynchronous task schedule to a *synchronous* one:
  * each kernel runs to completion before the next (classic blocking "omp target"
- * with no nowait / depend / tasks / taskgraph). On the host backend it
- * degenerates to a serial single-thread run.
+ * with no nowait / depend / tasks). On the host backend it degenerates to a
+ * serial single-thread run.
+ *
+ * NOTE: unlike the krylov / lulesh / llm.c apps, Cholesky is a one-shot tiled
+ * factorization whose task DAG changes shape every step, so it is NOT a
+ * record/replay taskgraph example -- there is intentionally no taskgraph here.
  *
  * Dependencies are tracked with single-element "token" items (one char per tile,
  * see main.c), which works identically on both backends: the tiles themselves
@@ -42,43 +43,13 @@
 # define USE_TARGET 0
 #endif
 
-#ifndef USE_TASKGRAPH       /* 1: record/replay the per-repetition task graph */
-# define USE_TASKGRAPH 0
-#endif
-
 #ifndef USE_SYNC            /* 0: asynchronous tasks   1: synchronous blocking */
 # define USE_SYNC 0
-#endif
-
-#ifndef USE_XKOMP           /* 1: use XKOMP's taskgraph API instead of LLVM's */
-# define USE_XKOMP 0
-#endif
-
-/*
- * Tasks are created inside the tile-kernel helpers (potrf/trsm/syrk/gemm), i.e.
- * not lexically inside the taskgraph region, so they must be marked replayable
- * to be captured. Enable it automatically whenever the taskgraph is enabled.
- */
-#ifndef USE_REPLAYABLE
-# define USE_REPLAYABLE USE_TASKGRAPH
-#endif
-
-#if USE_XKOMP
-# include <xkomp/xkomp.h>
-# include <xkomp/xkomp++.h>
 #endif
 
 /* ---- Pragma stringization helpers (macros expand only through _Pragma) ---- */
 #define CH_PRAGMA(...)  _Pragma(#__VA_ARGS__)
 #define CH_XPRAGMA(...) CH_PRAGMA(__VA_ARGS__)
-
-/* replayable(1) is emitted on every task-generating construct when recording.
- * Synchronous mode has no tasks/taskgraph, so it is never replayable. */
-#if USE_REPLAYABLE && !USE_SYNC
-# define REPLAYABLE_CLAUSE replayable(1)
-#else
-# define REPLAYABLE_CLAUSE
-#endif
 
 /* ----------------------------------------------------------------------------
  * Task / kernel emission macros. The SAME loop/block compiles to a host task
@@ -105,13 +76,13 @@
 
 #elif USE_TARGET
 
-# define OMP_TARGET_LOOP_TASK(...) CH_XPRAGMA(omp target teams distribute parallel for REPLAYABLE_CLAUSE nowait __VA_ARGS__)
-# define OMP_TARGET_TASK(...)      CH_XPRAGMA(omp target REPLAYABLE_CLAUSE nowait __VA_ARGS__)
+# define OMP_TARGET_LOOP_TASK(...) CH_XPRAGMA(omp target teams distribute parallel for nowait __VA_ARGS__)
+# define OMP_TARGET_TASK(...)      CH_XPRAGMA(omp target nowait __VA_ARGS__)
 
 #else
 
-# define OMP_TARGET_LOOP_TASK(...) CH_XPRAGMA(omp task REPLAYABLE_CLAUSE __VA_ARGS__)
-# define OMP_TARGET_TASK(...)      CH_XPRAGMA(omp task REPLAYABLE_CLAUSE __VA_ARGS__)
+# define OMP_TARGET_LOOP_TASK(...) CH_XPRAGMA(omp task __VA_ARGS__)
+# define OMP_TARGET_TASK(...)      CH_XPRAGMA(omp task __VA_ARGS__)
 
 #endif /* USE_SYNC / USE_TARGET */
 
@@ -120,7 +91,7 @@
 #if USE_SYNC
 # define OMP_HOST_TASK(...)                                                      /* nothing: runs inline */
 #else
-# define OMP_HOST_TASK(...) CH_XPRAGMA(omp task REPLAYABLE_CLAUSE __VA_ARGS__)
+# define OMP_HOST_TASK(...) CH_XPRAGMA(omp task __VA_ARGS__)
 #endif
 
 /* `nowait` on a construct in the asynchronous modes; nothing in synchronous. */
@@ -173,32 +144,6 @@
 # define OMP_TARGET_ENTER_DATA(...)
 # define OMP_TARGET_EXIT_DATA(...)
 # define OMP_TARGET_UPDATE(...)
-#endif
-
-/* ----------------------------------------------------------------------------
- * Taskgraph record/replay wrapper for the factorization body:
- *
- *     TASKGRAPH_BEGIN
- *     {
- *         ... spawn the tile tasks ...
- *     }
- *     TASKGRAPH_END
- *
- * With USE_TASKGRAPH the region is recorded on the first encounter and replayed
- * afterwards. Two backends are supported: LLVM's "#pragma omp taskgraph" and
- * XKOMP's function/lambda form. Without USE_TASKGRAPH the macros vanish.
- * ------------------------------------------------------------------------- */
-#if USE_TASKGRAPH && !USE_SYNC
-# if USE_XKOMP
-#  define TASKGRAPH_BEGIN pragma_omp_taskgraph(0, XKOMP_TASKGRAPH_FLAG_NONE, [&] (void)
-#  define TASKGRAPH_END   );
-# else
-#  define TASKGRAPH_BEGIN CH_XPRAGMA(omp taskgraph graph_id(0))
-#  define TASKGRAPH_END
-# endif
-#else
-# define TASKGRAPH_BEGIN
-# define TASKGRAPH_END
 #endif
 
 #endif /* CHOLESKY_TASKING_H */

@@ -1,15 +1,16 @@
 /*
- * main.c - tiled dense Cholesky factorization (A = L L^T) expressed as an
- * OpenMP task graph. One source, two backends selected at compile time by
- * -DUSE_TARGET (see tasking.h):
+ * main.c - tiled dense Cholesky factorization (A = L L^T) as an OpenMP task DAG.
+ * One source, two backends selected at compile time by -DUSE_TARGET (tasking.h):
  *
  *   USE_TARGET == 0 (default): each tile kernel is a CPU task (#pragma omp task).
  *   USE_TARGET == 1:           each tile kernel is a GPU target task, with the
  *                              matrix staged to the device by target enter data
  *                              + per-tile target update pipelines.
  *
- * With -DUSE_TASKGRAPH the per-repetition task region is recorded once and
- * replayed on subsequent repetitions (run several with the reps argument).
+ * NOTE: this is intentionally NOT a record/replay taskgraph example -- the tiled
+ * factorization's DAG changes shape every step, so there is no fixed per-step
+ * graph to record and replay. The reps argument just re-runs the factorization
+ * to average the timing.
  *
  * Forked/unified from the earlier task/ (CPU, LAPACK) and target-nowait-depend/
  * (GPU, hand-written) variants; MPI/MPC support has been removed. The kernels
@@ -18,7 +19,7 @@
  * Usage:  ./cholesky [nt] [ts] [reps] [check]
  *   nt    : number of tiles per dimension (matrix is (nt*ts) x (nt*ts))
  *   ts    : tile size
- *   reps  : number of factorizations to run (record + replays for taskgraph)
+ *   reps  : number of factorizations to run (for timing average)
  *   check : 1 to verify against a sequential reference, 0 to skip
  * All are optional; compile-time defaults come from -DDEFAULT_NT / -DDEFAULT_TS.
  */
@@ -187,8 +188,8 @@ int main(int argc, char **argv)
     srand(2024);
     init_spd_matrix(A_org, nt, ts);
 
-    printf("Cholesky  backend=%s  taskgraph=%d  nt=%d  ts=%d  N=%d  reps=%d\n",
-           backend_name(), USE_TASKGRAPH, nt, ts, nt * ts, reps);
+    printf("Cholesky  backend=%s  nt=%d  ts=%d  N=%d  reps=%d\n",
+           backend_name(), nt, ts, nt * ts, reps);
 
     double *rep_ms = (double *) malloc((size_t) reps * sizeof(double));
 
@@ -206,8 +207,6 @@ int main(int argc, char **argv)
 
             const double t0 = omp_get_wtime();
 
-            /* Record on the first repetition, replay afterwards (taskgraph). */
-            TASKGRAPH_BEGIN
             {
 #if USE_TARGET
                 /* H2D pipeline: stage the lower-triangular tiles, each tagged
@@ -260,7 +259,6 @@ int main(int argc, char **argv)
                     }
 #endif
             }
-            TASKGRAPH_END
 
             #pragma omp taskwait
             const double t1 = omp_get_wtime();
@@ -273,14 +271,12 @@ int main(int argc, char **argv)
     OMP_TARGET_EXIT_DATA(MAP(release: A[0:total]))
 
     /* ---- report ----
-     * total time, theoretical FLOPs and the derived GFLOP/s, then the record /
-     * first-replay / steady-replay breakdown (mean and sample stddev of the
-     * repetitions after the first two), in the spirit of the krylov driver so
-     * scripts/evaluate.py can parse either app the same way. */
+     * total time, theoretical FLOPs and the derived GFLOP/s, then the mean and
+     * sample stddev of the per-repetition times (dropping rep 0 as warmup). */
     const double Nd    = (double) nt * (double) ts;          /* matrix dimension */
     const double flops = Nd * Nd * Nd / 3.0;                 /* ~ (1/3) N^3 for Cholesky */
 
-    int lo = (reps > 2) ? 2 : (reps > 1 ? 1 : 0);           /* first steady rep */
+    int lo = (reps > 1) ? 1 : 0;                             /* drop rep 0 (warmup) */
     int cnt = reps - lo;
     double mean = 0.0;
     for (int r = lo; r < reps; r++) mean += rep_ms[r];
@@ -293,18 +289,10 @@ int main(int argc, char **argv)
     printf("total solve time     : %10.6f s\n", t_total1 - t_total0);
     printf("theoretical flops    : %.6e\n", flops);
     printf("performance          : %10.3f GFLOP/s\n", gflops);
-    for (int r = 0; r < reps; r++) {
-        const char *tag = "";
-#if USE_TASKGRAPH
-        if (r == 0)      tag = "  (record)";
-        else if (r == 1) tag = "  (1st replay)";
-#endif
-        printf("  rep %3d            : %10.3f ms%s\n", r, rep_ms[r], tag);
-    }
-    printf("repetition 0         : %10.3f ms\n", rep_ms[0]);
-    printf("repetition 1         : %10.3f ms\n", (reps > 1) ? rep_ms[1] : rep_ms[0]);
-    printf("repetitions 2.. (avg)    : %10.3f ms\n", mean);
-    printf("repetitions 2.. (stddev) : %10.3f ms\n", stddev);
+    for (int r = 0; r < reps; r++)
+        printf("  rep %3d            : %10.3f ms\n", r, rep_ms[r]);
+    printf("repetitions (avg)    : %10.3f ms\n", mean);
+    printf("repetitions (stddev) : %10.3f ms\n", stddev);
 
     /* ---- optional verification ---- */
     if (check) {

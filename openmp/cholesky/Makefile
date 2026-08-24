@@ -6,12 +6,16 @@
 # CPU vs GPU is chosen HERE via the flag blocks below (not by a separate target):
 # keep the default flags for a host-task build, or uncomment the GPU block for an
 # OpenMP target-offload build. One source, two backends (see tasking.h).
+#
+# NOTE: Cholesky is intentionally NOT a record/replay taskgraph example (its tiled
+# DAG changes shape every step), so there is no USE_TASKGRAPH here. It is a plain
+# tasks (CPU) / target (GPU) benchmark and is not part of the shared apps/openmp
+# evaluation harness.
 # =============================================================================
 
 # ---- Compiler -------------------------------------------------------------
-# clang is the supported compiler (the taskgraph construct needs Julian's LLVM /
-# XKOMP fork), consistent with the other apps in this repo. A portable CPU build
-# (USE_TASKGRAPH=0) also works on vanilla clang; drop -fopenmp-version=60 for gcc.
+# clang is the supported compiler for the OpenMP target/tasks features; xkcxx
+# (the LLVM/XKOMP fork) works too and keeps a single toolchain across the repo.
 #CC = clang
 CC = xkcxx -DUSE_XKOMP=1
 
@@ -26,20 +30,9 @@ CFLAGS += -Wall -Wextra
 CFLAGS += -DDEFAULT_NT=8
 CFLAGS += -DDEFAULT_TS=256
 CFLAGS += -DDEFAULT_REPS=1
-# Record/replay the identical per-repetition task graph. Needs a taskgraph-
-# enabled clang (emits replayable(1) + the taskgraph construct). Set to 0 for a
-# portable build on vanilla clang/gcc (plain OpenMP tasks).
-CFLAGS += -DUSE_TASKGRAPH=1
-CFLAGS += -DUSE_REPLAYABLE=0
 # Synchronous execution mode: run each kernel to completion before the next
-# (no tasks/depend/nowait/taskgraph); overrides USE_TASKGRAPH. On the CPU backend
-# it degenerates to a serial run.
+# (no tasks/depend/nowait). On the CPU backend it degenerates to a serial run.
 #CFLAGS += -DUSE_SYNC=1
-
-# XKOMP JIT flags
-#CFLAGS += -fopenmp-task-jit-type=none
-#CFLAGS += -fopenmp-task-jit-type=pointers
-CFLAGS += -fopenmp-task-jit-type=packed
 
 LDFLAGS  =
 LDFLAGS += -lm

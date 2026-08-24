@@ -43,12 +43,10 @@ it fast.
 
 enum Datasets { TINYSHAKESPEARE = 0, TINYSTORIES, DATASETS_MAX_INT };
 
-// When true, the parallelization is expressed with OmpSs-2 (`#pragma oss ...`)
-// instead of OpenMP (`#pragma omp ...`). It selects a host task backend and is
-// mutually exclusive with USE_TARGET (checked below). Off (OpenMP) by default.
-#ifndef USE_OMPSS
-# define USE_OMPSS 0
-#endif /* USE_OMPSS */
+// Task / target / taskgraph macros and the USE_TARGET / USE_TASKGRAPH / USE_SYNC
+// / USE_OMPSS / USE_XKOMP / USE_REPLAYABLE toggles are shared with the other
+// apps/openmp benchmarks in ../tasking.h (resolved via the Makefile's -I..).
+#include "tasking.h"
 
 // OpenMP: omp_get_wtime() & omp_get_num_threads(). OmpSs-2: nanos6 API (nodes.h).
 #if USE_OMPSS
@@ -59,44 +57,6 @@ enum Datasets { TINYSHAKESPEARE = 0, TINYSTORIES, DATASETS_MAX_INT };
 
 // Used for strong/weak scaling
 #define PERF_TESTING 1
-
-// Need to make tasks replayable explicitly to ensure they are, since they do not appear directly in the taskgraph region.
-#ifndef USE_REPLAYABLE
-# define USE_REPLAYABLE 0
-#endif
-
-#ifndef USE_XKOMP
-# define USE_XKOMP 0
-#endif /* USE_XKOMP */
-
-#ifndef USE_TASKGRAPH
-# define USE_TASKGRAPH 0
-#endif /* USE_TASKGRAPH */
-
-// When true, the computational tasks are emitted as OpenMP *target tasks*
-// (offloaded to the GPU) instead of host tasks. See the OMP_TASK / OMP_TARGET_LOOP_TASK /
-// OMP_TARGET_TASK / OMP_HOST_TASK macros below. It is false (host) by default.
-#ifndef USE_TARGET
-# define USE_TARGET 0
-#endif /* USE_TARGET */
-
-// When true, switch from the asynchronous task schedule to a *synchronous* one:
-// each kernel runs to completion before the next (no tasks / nowait / depend /
-// taskgraph). On the GPU the loops are still offloaded (blocking `omp target`);
-// on the host they degenerate to plain serial loops. Used as the "current
-// practice" baseline by the evaluation harness. Off (async) by default.
-#ifndef USE_SYNC
-# define USE_SYNC 0
-#endif /* USE_SYNC */
-
-#if USE_OMPSS && USE_TARGET
-# error "USE_OMPSS (host OmpSs-2) and USE_TARGET (OpenMP GPU offload) are mutually exclusive"
-#endif
-
-#if USE_XKOMP
-# include <xkomp/xkomp.h>
-# include <xkomp/xkomp++.h>
-#endif
 
 #ifndef NB_STEPS
     #define NB_STEPS 8
@@ -137,139 +97,6 @@ enum Datasets { TINYSHAKESPEARE = 0, TINYSTORIES, DATASETS_MAX_INT };
 
 #undef MATMUL_LOOP_UNROLL
 #define MATMUL_LOOP_UNROLL 8
-
-#define xPRAGMA(...) PRAGMA(__VA_ARGS__)
-#define PRAGMA(...) _Pragma(#__VA_ARGS__)
-
-// ----------------------------------------------------------------------------
-// Task / kernel emission macros.
-//
-// The same source expresses two backends, selected by USE_TARGET:
-//
-//   * Host backend (USE_TARGET == 0): every computational loop nest is
-//     tasked at the tile granularity. OMP_TASK(...) emits "#pragma omp task"
-//     inside the loop body (as before), and OMP_TARGET_LOOP_TASK(...) expands to nothing.
-//
-//   * Target backend (USE_TARGET == 1): every computational loop nest becomes
-//     a single offloaded target task. OMP_TARGET_LOOP_TASK(...) emits
-//     "#pragma omp target teams distribute parallel for ... nowait depend(...)"
-//     right before the loop, and the per-tile OMP_TASK(...) expands to nothing
-//     so the loop body simply becomes the kernel body (one GPU thread per tile).
-//
-// OMP_TARGET_TASK(...) is for loop-less device work (a plain target region as a
-// task on the GPU; a host task on the CPU). OMP_HOST_TASK(...) is always a host
-// task (file I/O, printing, host-side scalar work, H2D/D2H staging).
-// ----------------------------------------------------------------------------
-// replayable(1) marks task-generating constructs so they are captured/replayed
-// in the taskgraph (they are created inside functions, not directly in the
-// taskgraph region). Applied to every task-generating macro below. OmpSs-2 has
-// no replayable clause, so it is never emitted for the OmpSs backend.
-#if USE_REPLAYABLE && !USE_OMPSS && !USE_SYNC
-#  define REPLAYABLE_CLAUSE replayable(1)
-#else
-#  define REPLAYABLE_CLAUSE
-#endif
-
-#if USE_SYNC
-
-    // Synchronous baseline: no tasks / nowait / depend / taskgraph. On the GPU
-    // each loop is still offloaded as one blocking `omp target` region; on the
-    // host the macros vanish and the loop body runs serially inline.
-    # if USE_TARGET
-    #define OMP_TASK(...)
-    #define OMP_TARGET_LOOP_TASK(...)      xPRAGMA(omp target teams distribute parallel for __VA_ARGS__)
-    #define OMP_TARGET_TASK(...)           xPRAGMA(omp target __VA_ARGS__)
-    # else
-    #define OMP_TASK(...)                                 /* nothing: serial loop */
-    #define OMP_TARGET_LOOP_TASK(...)                     /* nothing: serial loop */
-    #define OMP_TARGET_TASK(...)                          /* nothing: serial block */
-    # endif
-
-#elif USE_TARGET
-
-    // The tile-level task disappears; the loop body runs inside the OMP_TARGET_LOOP_TASK.
-    #define OMP_TASK(...)
-    #define OMP_TARGET_LOOP_TASK(...)      xPRAGMA(omp target teams distribute parallel for REPLAYABLE_CLAUSE nowait __VA_ARGS__)
-    #define OMP_TARGET_TASK(...) xPRAGMA(omp target REPLAYABLE_CLAUSE nowait __VA_ARGS__)
-
-#elif USE_OMPSS
-
-    // OmpSs-2 host backend: the same tiled tasks, emitted as `#pragma oss task`.
-    #define OMP_TASK(...)        xPRAGMA(oss task REPLAYABLE_CLAUSE __VA_ARGS__)
-    #define OMP_TARGET_LOOP_TASK(...)                 /* nothing: tiling is done by OMP_TASK */
-    #define OMP_TARGET_TASK(...) /* nothing, gpu not supported */
-
-#else
-
-    #define OMP_TASK(...)        xPRAGMA(omp task REPLAYABLE_CLAUSE __VA_ARGS__)
-    #define OMP_TARGET_LOOP_TASK(...)                 /* nothing: tiling is done by OMP_TASK */
-    #define OMP_TARGET_TASK(...) xPRAGMA(omp task REPLAYABLE_CLAUSE __VA_ARGS__)
-
-#endif /* USE_TARGET */
-
-// Always a host task, regardless of backend; runs inline under USE_SYNC.
-#if USE_SYNC
-    #define OMP_HOST_TASK(...)                            /* nothing: runs inline */
-#elif USE_OMPSS
-    #define OMP_HOST_TASK(...) xPRAGMA(oss task REPLAYABLE_CLAUSE __VA_ARGS__)
-#else
-    #define OMP_HOST_TASK(...) xPRAGMA(omp task REPLAYABLE_CLAUSE __VA_ARGS__)
-#endif
-
-// ----------------------------------------------------------------------------
-// Dependency-clause abstraction.
-//
-// Task dependencies are written once with DEPEND / DEPEND_MULTI and expanded to
-// the syntax of the active backend:
-//
-//   OpenMP (USE_OMPSS == 0):
-//       DEPEND(in, a[x:y], b)              -> depend(in: a[x:y], b)
-//       DEPEND_MULTI(in, (i=0:N:g), a[i:g]) -> depend(iterator(i=0:N:g), in: a[i:g])
-//
-//   OmpSs-2 (USE_OMPSS == 1):
-//       DEPEND(in, a[x:y], b)              -> in(a[x:y], b)
-//       DEPEND_MULTI(in, (i=0:N:g), a[i:g]) -> in({a[i:g], i=0:N:g})
-//
-// The iterator argument of DEPEND_MULTI must be parenthesized so its internal
-// commas are shielded from macro-argument splitting. `inoutset` maps to OmpSs
-// `concurrent`. Each DEPEND_MULTI must carry a single array expression (OmpSs
-// multideps allow one array per `{}`); shared-iterator sites use one clause per
-// array, exactly like the reference. Only the base address of a section drives
-// synchronization on this runtime, so keeping OpenMP `:` sections is correct.
-// ----------------------------------------------------------------------------
-#define UNWRAP(...) __VA_ARGS__
-
-#if USE_SYNC
-    // No tasks -> no dependences (program order is the schedule). ATOMIC is kept
-    // (needed inside the blocking GPU target loops; harmless on the serial host).
-    #define DEPEND(dir, ...)
-    #define DEPEND_MULTI(dir, iters, ...)
-
-    #define ATOMIC PRAGMA(omp atomic)
-#elif USE_OMPSS
-    // Dependency-direction keyword mapping, OpenMP -> OmpSs-2. Call sites always
-    // use the OpenMP keyword; only `inoutset` differs (OmpSs calls it
-    // `concurrent`), the rest map to themselves:
-    //     in       -> in
-    //     out      -> out
-    //     inout    -> inout
-    //     inoutset -> concurrent
-    #define OSS_DIR(dir)      OSS_DIR__##dir
-    #define OSS_DIR__in       in
-    #define OSS_DIR__out      out
-    #define OSS_DIR__inout    inout
-    #define OSS_DIR__inoutset concurrent
-
-    #define DEPEND(dir, ...)              OSS_DIR(dir)(__VA_ARGS__)
-    #define DEPEND_MULTI(dir, iters, ...) OSS_DIR(dir)({ __VA_ARGS__, UNWRAP iters })
-
-    #define ATOMIC PRAGMA(oss atomic)
-#else
-    #define DEPEND(dir, ...)              depend(dir: __VA_ARGS__)
-    #define DEPEND_MULTI(dir, iters, ...) depend(iterator iters, dir: __VA_ARGS__)
-
-    #define ATOMIC PRAGMA(omp atomic)
-#endif
 
 #if USE_OMPSS
 

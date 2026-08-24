@@ -24,8 +24,12 @@ USE_TARGET     ?= 0     # 0: host CPU tasks        1: GPU target offload
 USE_TASKGRAPH  ?= 1     # 1: record/replay graph   0: plain tasks/target
 USE_SYNC       ?= 0     # 0: asynchronous tasks     1: synchronous blocking
 USE_REPLAYABLE ?= 0     # mark task-generating constructs replayable(1)
+USE_OMPSS      ?= 0     # 1: emit OmpSs-2 (#pragma oss) host tasks instead of omp
 
 # ---- Common flags ---------------------------------------------------------
+# -I.. makes the shared apps/openmp/tasking.h resolvable as #include "tasking.h"
+# from each app's build dir (one level below apps/openmp).
+CFLAGS += -I..
 CFLAGS += -fopenmp -fopenmp-version=60
 CFLAGS += -O3
 #CFLAGS += -O0 -g
@@ -34,8 +38,17 @@ CFLAGS += -DUSE_TARGET=$(USE_TARGET)
 CFLAGS += -DUSE_TASKGRAPH=$(USE_TASKGRAPH)
 CFLAGS += -DUSE_SYNC=$(USE_SYNC)
 CFLAGS += -DUSE_REPLAYABLE=$(USE_REPLAYABLE)
+CFLAGS += -DUSE_OMPSS=$(USE_OMPSS)
 
 LDFLAGS += -lm
+
+# ---- OmpSs-2 host backend (USE_OMPSS=1); needs the OmpSs-2 compiler ----------
+# The shared tasking.h switches `omp task` -> `oss task` when USE_OMPSS=1. Enable
+# the OmpSs-2 compiler/runtime flags here (mutually exclusive with USE_TARGET):
+ifeq ($(USE_OMPSS),1)
+  CFLAGS  += -fompss-2=libnodes
+  LDFLAGS += -lnuma
+endif
 
 # ---- GPU (OpenMP target offload), active only when USE_TARGET=1 -----------
 # Adjust --offload-arch to your device (sm_80=A100, sm_90=H100, gfx942=MI300X);

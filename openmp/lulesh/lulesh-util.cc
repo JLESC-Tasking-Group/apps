@@ -215,6 +215,9 @@ double VerifyAndWriteFinalOutput(Real_t elapsed_time,
    printf("        MaxAbsDiff   = %12.6e\n",   MaxAbsDiff   );
    printf("        TotalAbsDiff = %12.6e\n",   TotalAbsDiff );
    printf("        MaxRelDiff   = %12.6e\n\n", MaxRelDiff   );
+   printf(":       TotalRelDiff = %12.6e\n",   TotalRelDiff );
+   printf(":   Verification (TrD<1e-09) : %s    \n", (TotalRelDiff < 1e-09)? "pass":"fail");
+
 
    // Timing information
    printf("\nElapsed time         = %10.2f (s)\n", elapsed_time);

@@ -19,7 +19,7 @@ CFLAGS += -DMAX_ITER=50
 
 # ---- Sources --------------------------------------------------------------
 COMMON_SRC = common/spmat.cpp common/kalloc.cpp common/kernels.cpp common/driver.cpp
-COMMON_HDR = common/spmat.h common/kalloc.h common/kernels.h common/tasking.h common/driver.h
+COMMON_HDR = common/spmat.h common/kalloc.h common/kernels.h ../tasking.h common/driver.h
 
 SOLVERS = cg cr bicgstab minres gmres
 

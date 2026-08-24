@@ -32,7 +32,7 @@ source = lulesh.cc \
 
 obj = $(source:.cc=.o)
 
-HDR = lulesh.h energy.h tasking.h
+HDR = lulesh.h energy.h ../tasking.h
 
 # =============================================================================
 # Targets to build

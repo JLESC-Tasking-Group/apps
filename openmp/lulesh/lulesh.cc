@@ -1396,7 +1396,7 @@ OMP_TARGET_ENTER_DATA( \
     for(Index_t b = 0; b < numElem; b+= EBS){
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, q[start], p[start]) DEPEND(out, sigxx[start]))
+      OMP_TILE(DEPEND(in, q[start], p[start]) DEPEND(out, sigxx[start]), num_teams(elem_teams) thread_limit(THREADS), )
       for (Index_t i = start; i < end; i++) {
         sigxx[i] = sigyy[i] = sigzz[i] = - p[i] - q[i] ;
       }
@@ -1410,7 +1410,7 @@ OMP_TARGET_ENTER_DATA( \
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
       Index_t nb = start / EBS;
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, sigxx[start]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND(out, fx_elem[8*start], determ[start]))
+      OMP_TILE(DEPEND(in, sigxx[start]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND(out, fx_elem[8*start], determ[start]), num_teams(elem_teams) thread_limit(THREADS), )
       for (Index_t k = start; k < end; k++) {
 
         const Index_t* const elemToNode = nodelist + Index_t(8)*k;
@@ -1475,7 +1475,7 @@ OMP_TARGET_ENTER_DATA( \
       Index_t start = b;
       Index_t end = min(start + NBS, numNode);
       Index_t nb = b/NBS;
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(in, (it=0:dep_fx_fy_fz_elem[nb].size()), fx_elem[dep_fx_fy_fz_elem[nb][it]]) DEPEND(out, fx[start]))
+      OMP_TILE(DEPEND_MULTI(in, (it=0:dep_fx_fy_fz_elem[nb].size()), fx_elem[dep_fx_fy_fz_elem[nb][it]]) DEPEND(out, fx[start]), num_teams(node_teams) thread_limit(THREADS), )
       for (Index_t gnode = start; gnode < end; gnode++) {
         // element count
         const Index_t count = nodeElemStart[gnode+1] - nodeElemStart[gnode];
@@ -1522,7 +1522,7 @@ OMP_TARGET_ENTER_DATA( \
     Index_t start = b;
     Index_t end = min(start + EBS, numElem);
     Index_t nb = start/EBS;
-    OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, v[start], vol_error[0]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND(out, determ[start], dvdx[8*start], x8n[8*start]) MAP(present: vol_error[0:1]))
+    OMP_TILE(DEPEND(in, v[start], vol_error[0]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND(out, determ[start], dvdx[8*start], x8n[8*start]), MAP(present: vol_error[0:1]) num_teams(elem_teams) thread_limit(THREADS), )
     for (Index_t i = start; i < end; i++) {
       Real_t  x1[8],  y1[8],  z1[8] ;
       Real_t pfx[8], pfy[8], pfz[8] ;
@@ -1605,7 +1605,7 @@ OMP_TARGET_ENTER_DATA( \
 	Index_t start = b;
 	Index_t end = min(start + EBS, numElem);
 	Index_t nb = start / EBS;
-        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, determ[start], x8n[8*start], ss[start], dvdx[8*start]) DEPEND_MULTI(in, (it=0:dep_xd_yd_zd[nb].size()), xd[dep_xd_yd_zd[nb][it]]) DEPEND(out, fx_elem[8*start]) MAP(present: gamma[0:32]))
+        OMP_TILE(DEPEND(in, determ[start], x8n[8*start], ss[start], dvdx[8*start]) DEPEND_MULTI(in, (it=0:dep_xd_yd_zd[nb].size()), xd[dep_xd_yd_zd[nb][it]]) DEPEND(out, fx_elem[8*start]), MAP(present: gamma[0:32]) num_teams(elem_teams) thread_limit(THREADS), )
         for (Index_t i2 = start; i2 < end; i2++) {
 
           Index_t i3 = 8*i2;
@@ -1796,7 +1796,7 @@ OMP_TARGET_ENTER_DATA( \
         Index_t start = b;
         Index_t end = min(start + NBS, numNode);
         Index_t nb = start/NBS;
-        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(in, (it=0:dep_fx_fy_fz_elem[nb].size()), fx_elem[dep_fx_fy_fz_elem[nb][it]]) DEPEND(out, fx[start]))
+        OMP_TILE(DEPEND_MULTI(in, (it=0:dep_fx_fy_fz_elem[nb].size()), fx_elem[dep_fx_fy_fz_elem[nb][it]]) DEPEND(out, fx[start]), num_teams(node_teams) thread_limit(THREADS), )
 	for (Index_t gnode = start; gnode < end; gnode++) {
           // element count
           const Index_t count = nodeElemStart[gnode+1] - nodeElemStart[gnode];
@@ -1825,7 +1825,7 @@ OMP_TARGET_ENTER_DATA( \
     for (Index_t b = 0; b < numNode; b+=NBS) {
       Index_t start = b;
       Index_t end = min(start + NBS, numNode);
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND(in, fx[start]) DEPEND(out, xdd[start]))
+      OMP_TILE(DEPEND(in, fx[start]) DEPEND(out, xdd[start]), num_teams(node_teams) thread_limit(THREADS), )
       for (Index_t i = start; i < end; i++) {
         Real_t one_over_nMass = Real_t(1.) / nodalMass[i];
         xdd[i] = fx[i] * one_over_nMass;
@@ -1846,28 +1846,28 @@ OMP_TARGET_ENTER_DATA( \
       if (s1 && s2 && s3) {}
       // 1 0 0
       else if (!s1 && s2 && s3) {
-        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(inout, (it=0:dep_xdd[nb].size()), xdd[dep_xdd[nb][it]]))
+        OMP_TILE(DEPEND_MULTI(inout, (it=0:dep_xdd[nb].size()), xdd[dep_xdd[nb][it]]), num_teams(node_teams) thread_limit(THREADS), )
 	for (Index_t i = start; i < end; i++) {
           xdd[symmX[i]] = Real_t(0.0) ;
         }
       }
       // 0 1 0
       else if (s1 && !s2 && s3) {
-        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(inout, (it=0:dep_ydd[nb].size()), ydd[dep_ydd[nb][it]]))
+        OMP_TILE(DEPEND_MULTI(inout, (it=0:dep_ydd[nb].size()), ydd[dep_ydd[nb][it]]), num_teams(node_teams) thread_limit(THREADS), )
 	for (Index_t i = start; i < end; i++) {
           ydd[symmY[i]] = Real_t(0.0) ;
         }
       }
       // 0 0 1
       else if (s1 && s2 && !s3) {
-        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(inout, (it=0:dep_zdd[nb].size()), zdd[dep_zdd[nb][it]]))
+        OMP_TILE(DEPEND_MULTI(inout, (it=0:dep_zdd[nb].size()), zdd[dep_zdd[nb][it]]), num_teams(node_teams) thread_limit(THREADS), )
 	for (Index_t i = start; i < end; i++) {
           zdd[symmZ[i]] = Real_t(0.0) ;
         }
       }
       // 1 1 0
       else if (!s1 && !s2 && s3) {
-        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(inout, (it=0:dep_xdd[nb].size()), xdd[dep_xdd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_ydd[nb].size()), ydd[dep_ydd[nb][it]]))
+        OMP_TILE(DEPEND_MULTI(inout, (it=0:dep_xdd[nb].size()), xdd[dep_xdd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_ydd[nb].size()), ydd[dep_ydd[nb][it]]), num_teams(node_teams) thread_limit(THREADS), )
 	for (Index_t i = start; i < end; i++) {
           xdd[symmX[i]] = Real_t(0.0) ;
 	  ydd[symmY[i]] = Real_t(0.0) ;
@@ -1875,7 +1875,7 @@ OMP_TARGET_ENTER_DATA( \
       }
       // 1 0 1
       else if (!s1 && s2 && !s3) {
-        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(inout, (it=0:dep_xdd[nb].size()), xdd[dep_xdd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_zdd[nb].size()), zdd[dep_zdd[nb][it]]))
+        OMP_TILE(DEPEND_MULTI(inout, (it=0:dep_xdd[nb].size()), xdd[dep_xdd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_zdd[nb].size()), zdd[dep_zdd[nb][it]]), num_teams(node_teams) thread_limit(THREADS), )
 	for (Index_t i = start; i < end; i++) {
           xdd[symmX[i]] = Real_t(0.0) ;
           zdd[symmZ[i]] = Real_t(0.0) ;
@@ -1883,7 +1883,7 @@ OMP_TARGET_ENTER_DATA( \
       }
       // 0 1 1
       else if (s1 && !s2 && !s3) {
-        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(inout, (it=0:dep_ydd[nb].size()), ydd[dep_ydd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_zdd[nb].size()), zdd[dep_zdd[nb][it]]))
+        OMP_TILE(DEPEND_MULTI(inout, (it=0:dep_ydd[nb].size()), ydd[dep_ydd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_zdd[nb].size()), zdd[dep_zdd[nb][it]]), num_teams(node_teams) thread_limit(THREADS), )
         for (Index_t i = start; i < end; i++) {
           ydd[symmY[i]] = Real_t(0.0) ;
           zdd[symmZ[i]] = Real_t(0.0) ;
@@ -1891,7 +1891,7 @@ OMP_TARGET_ENTER_DATA( \
       }
       // 1 1 1
       else if (!s1 && !s2 && !s3) {
-        OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND_MULTI(inout, (it=0:dep_xdd[nb].size()), xdd[dep_xdd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_ydd[nb].size()), ydd[dep_ydd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_zdd[nb].size()), zdd[dep_zdd[nb][it]]))
+        OMP_TILE(DEPEND_MULTI(inout, (it=0:dep_xdd[nb].size()), xdd[dep_xdd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_ydd[nb].size()), ydd[dep_ydd[nb][it]]) DEPEND_MULTI(inout, (it=0:dep_zdd[nb].size()), zdd[dep_zdd[nb][it]]), num_teams(node_teams) thread_limit(THREADS), )
         for (Index_t i = start; i < end; i++) {
 	  xdd[symmX[i]] = Real_t(0.0) ;
           ydd[symmY[i]] = Real_t(0.0) ;
@@ -1910,7 +1910,7 @@ OMP_TARGET_ENTER_DATA( \
     for (Index_t b = 0; b < numNode; b += NBS) {
       Index_t start = b;
       Index_t end = min(start + NBS, numNode);
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND(in, xdd[start], ydd[start], zdd[start], deltatime[0]) DEPEND(inout, xd[start]) MAP(present: deltatime[0:1]))
+      OMP_TILE(DEPEND(in, xdd[start], ydd[start], zdd[start], deltatime[0]) DEPEND(inout, xd[start]), MAP(present: deltatime[0:1]) num_teams(node_teams) thread_limit(THREADS), )
       for (Index_t i = start; i < end; i++) {
 
         Real_t xdtmp = xd[i] + xdd[i] * deltatime[0];
@@ -1941,7 +1941,7 @@ OMP_TARGET_ENTER_DATA( \
     for (Index_t b = 0; b < numNode; b += NBS) {
       Index_t start = b;
       Index_t end = min(start + NBS, numNode);
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(node_teams) thread_limit(THREADS)) DEPEND(in, xd[start], deltatime[0]) DEPEND(inout, x[start]) MAP(present: deltatime[0:1]))
+      OMP_TILE(DEPEND(in, xd[start], deltatime[0]) DEPEND(inout, x[start]), MAP(present: deltatime[0:1]) num_teams(node_teams) thread_limit(THREADS), )
       for (Index_t i = start; i < end; i++) {
         x[i] += xd[i] * deltatime[0];
         y[i] += yd[i] * deltatime[0];
@@ -1964,7 +1964,7 @@ OMP_TARGET_ENTER_DATA( \
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
       Index_t nb = start/EBS;
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, v[start], deltatime[0]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND_MULTI(in, (it=0:dep_xd_yd_zd[nb].size()), xd[dep_xd_yd_zd[nb][it]]) DEPEND(out, vnew[start], delv[start], arealg[start], dxx[start]) MAP(present: deltatime[0:1]))
+      OMP_TILE(DEPEND(in, v[start], deltatime[0]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND_MULTI(in, (it=0:dep_xd_yd_zd[nb].size()), xd[dep_xd_yd_zd[nb][it]]) DEPEND(out, vnew[start], delv[start], arealg[start], dxx[start]), MAP(present: deltatime[0:1]) num_teams(elem_teams) thread_limit(THREADS), )
       for (Index_t k = start; k < end; k++) {
         Real_t B[3][8] ; // shape function derivatives
         Real_t D[6] ;
@@ -2077,7 +2077,7 @@ OMP_TARGET_ENTER_DATA( \
     for (Index_t b = 0; b < numElem; b += EBS) {
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, dxx[start]) DEPEND(out, dxx[start], vdov[start]) MAP(present: vol_error[0:1]))
+      OMP_TILE(DEPEND(in, dxx[start]) DEPEND(out, dxx[start], vdov[start]), MAP(present: vol_error[0:1]) num_teams(elem_teams) thread_limit(THREADS), )
       for (Index_t k = start; k < end; k++) {
         Real_t vvdov = dxx[k] + dyy[k] + dzz[k] ;
         Real_t vdovthird = vvdov/Real_t(3.0) ;
@@ -2124,7 +2124,7 @@ OMP_TARGET_ENTER_DATA( \
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
       Index_t nb = start/EBS;
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, vnew[start]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND_MULTI(in, (it=0:dep_xd_yd_zd[nb].size()), xd[dep_xd_yd_zd[nb][it]]) DEPEND(out, delv_xi[start], delv_eta[start], delv_zeta[start], delx_xi[start], delx_eta[start], delx_zeta[start]))
+      OMP_TILE(DEPEND(in, vnew[start]) DEPEND_MULTI(in, (it=0:dep_x_y_z[nb].size()), x[dep_x_y_z[nb][it]]) DEPEND_MULTI(in, (it=0:dep_xd_yd_zd[nb].size()), xd[dep_xd_yd_zd[nb][it]]) DEPEND(out, delv_xi[start], delv_eta[start], delv_zeta[start], delx_xi[start], delx_eta[start], delx_zeta[start]), num_teams(elem_teams) thread_limit(THREADS), )
       for (Index_t i = start; i < end; i++) {
         Real_t ax,ay,az ;
         Real_t dxv,dyv,dzv ;
@@ -2272,7 +2272,7 @@ OMP_TARGET_ENTER_DATA( \
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
       Index_t nb = start/EBS;
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, delv_xi[start], delv_eta[start], delv_zeta[start], delx_xi[start], delx_eta[start], delx_zeta[start], vnew[start]) DEPEND_MULTI(in, (it=0:dep_delv_xi[nb].size()), delv_xi[dep_delv_xi[nb][it]]) DEPEND_MULTI(in, (it=0:dep_delv_eta[nb].size()), delv_eta[dep_delv_eta[nb][it]]) DEPEND_MULTI(in, (it=0:dep_delv_zeta[nb].size()), delv_zeta[dep_delv_zeta[nb][it]]) DEPEND(out, qq[start], ql[start]))
+      OMP_TILE(DEPEND(in, delv_xi[start], delv_eta[start], delv_zeta[start], delx_xi[start], delx_eta[start], delx_zeta[start], vnew[start]) DEPEND_MULTI(in, (it=0:dep_delv_xi[nb].size()), delv_xi[dep_delv_xi[nb][it]]) DEPEND_MULTI(in, (it=0:dep_delv_eta[nb].size()), delv_eta[dep_delv_eta[nb][it]]) DEPEND_MULTI(in, (it=0:dep_delv_zeta[nb].size()), delv_zeta[dep_delv_zeta[nb][it]]) DEPEND(out, qq[start], ql[start]), num_teams(elem_teams) thread_limit(THREADS), )
       for (Index_t i = start; i < end; i++) {
 
         Real_t qlin, qquad ;
@@ -2422,7 +2422,7 @@ OMP_TARGET_ENTER_DATA( \
     for (Index_t b = 0; b < numElem; b+=EBS) {
       Index_t start = b;
       Index_t end = min(b + EBS, numElem);
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, q[start]))
+      OMP_TILE(DEPEND(in, q[start]), num_teams(elem_teams) thread_limit(THREADS), )
       for (Index_t i = start; i < end; i++) {
         if(q[i] > qstop) {
 	  printf("QStopError idx: %d\n", i);
@@ -2437,7 +2437,7 @@ OMP_TARGET_ENTER_DATA( \
     for (Index_t b = 0; b < numElem; b+=EBS) {
       Index_t start = b;
       Index_t end = min(b + EBS, numElem);
-      OMP_TARGET_LOOP_TASK(GPU_CLAUSES(num_teams(elem_teams) thread_limit(THREADS)) DEPEND(in, vnew[start], v[start], e[start], delv[start], q[start], p[start], qq[start], ql[start]) DEPEND(out, q[start], p[start], e[start], ss[start], v[start]))
+      OMP_TILE(DEPEND(in, vnew[start], v[start], e[start], delv[start], q[start], p[start], qq[start], ql[start]) DEPEND(out, q[start], p[start], e[start], ss[start], v[start]), num_teams(elem_teams) thread_limit(THREADS), )
       for (Index_t elem = start; elem < end; elem++) {
         Index_t rep = elemRep[elem];
         Real_t e_old, delvc, p_old, q_old, qq_old, ql_old;

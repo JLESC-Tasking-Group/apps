@@ -76,7 +76,10 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apps", default="", help="comma list (default: all)")
     ap.add_argument("--variants", default="", help="comma list to filter variants")
-    ap.add_argument("--sizes", default="", help="comma list to override sizes")
+    ap.add_argument("--sizes", default="", help="problem sizes: a global comma list "
+                    "(e.g. '8,16,24') and/or per-app 'app=list' items, separated by ';' "
+                    "(e.g. 'krylov=32,48,64;lulesh=30,45,60'). A per-app list overrides the "
+                    "global list, which overrides each app's built-in default.")
     ap.add_argument("--iters", type=int, default=0, help="override iterations")
     ap.add_argument("--opts", default="", help="semicolon-separated CGIR opt combos, each "
                     "a comma/space list of passes (e.g. 'reduce-node,reduce-edge;batch'); "
@@ -113,7 +116,10 @@ def main():
         if a not in APPS:
             ap.error(f"unknown app '{a}' (known: {', '.join(APPS)})")
     variant_filter = {v.strip() for v in args.variants.split(",") if v.strip()}
-    size_override = [int(s) for s in args.sizes.split(",") if s.strip()]
+    size_default, size_by_app = _parse_sizes(args.sizes)
+    for a in size_by_app:
+        if a not in APPS:
+            ap.error(f"unknown app '{a}' in --sizes (known: {', '.join(APPS)})")
     configs = default_configs(_parse_opts(args.opts))
     backend_vars = {"USE_TARGET": "1" if args.target == "gpu" else "0"}
 
@@ -158,8 +164,13 @@ def main():
 
     for app_name in selected:
         app = APPS[app_name]
-        variants = [v for v in app.variants if not variant_filter or v in variant_filter]
-        sizes = size_override or app.sizes
+        # A variant-less app (variants == [""]) always runs; the --variants filter
+        # only applies to apps that expose real variants (e.g. krylov's solvers).
+        if app.variants == [""]:
+            variants = [""]
+        else:
+            variants = [v for v in app.variants if not variant_filter or v in variant_filter]
+        sizes = size_by_app.get(app_name) or size_default or app.sizes
         iters = args.iters or app.iters
 
         for variant in variants:
@@ -249,6 +260,25 @@ def _parse_opts(arg):
     if not arg:
         return list(DEFAULT_OPTS)
     return [o.strip() for o in re.split(r"[;]", arg) if o.strip()]
+
+
+def _parse_sizes(arg):
+    """Parse --sizes into (global_default_or_None, {app: [sizes]}).
+
+    Items are ';'-separated; an item 'app=8,16,24' sets that app's sizes, a bare
+    item '8,16,24' sets the global default. E.g. '8,16;lulesh=30,45' -> default
+    [8,16] with lulesh overridden to [30,45]. Empty -> (None, {})."""
+    default, by_app = None, {}
+    for chunk in arg.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" in chunk:
+            app, _, lst = chunk.partition("=")
+            by_app[app.strip()] = [int(s) for s in lst.split(",") if s.strip()]
+        else:
+            default = [int(s) for s in chunk.split(",") if s.strip()]
+    return default, by_app
 
 
 if __name__ == "__main__":

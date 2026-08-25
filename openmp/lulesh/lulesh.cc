@@ -1299,10 +1299,14 @@ OMP_TARGET_ENTER_DATA( \
   double *iter_times = (double *) malloc(sizeof(double) * (opts.its > 0 ? opts.its : 1));
   double prev_ts = 0.0;
 
+  Int_t numThreads = 0;
+
 #pragma omp parallel
 {
 #pragma omp single
 {
+    numThreads = omp_get_num_threads();
+
     t0 = omp_get_wtime();
     prev_ts = t0;
   for (Int_t iter = 0; iter < opts.its; ++iter) {
@@ -2764,7 +2768,7 @@ OMP_TARGET_ENTER_DATA( \
 
   double fom = 0;
   if ((myRank == 0) && (opts.quiet == 0)) {
-    fom = VerifyAndWriteFinalOutput(elapsed_time, *locDom, opts.nx, numRanks);
+    fom = VerifyAndWriteFinalOutput(elapsed_time, locDom, opts.nx, numRanks, numThreads);
   }
 
   // Release resources

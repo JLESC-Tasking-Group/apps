@@ -176,55 +176,59 @@ void ParseCommandLineOptions(int argc, char *argv[],
 /////////////////////////////////////////////////////////////////////
 
 double VerifyAndWriteFinalOutput(Real_t elapsed_time,
-                               Domain& locDom,
+                               Domain * domain,
                                Int_t nx,
-                               Int_t numRanks)
+                               Int_t numRanks,
+                               Int_t numThreads)
 {
    // GrindTime1 only takes a single domain into account, and is thus a good way to measure
    // processor speed indepdendent of MPI parallelism.
    // GrindTime2 takes into account speedups from MPI parallelism
-   Real_t grindTime1 = ((elapsed_time*1e6)/locDom.cycle())/(nx*nx*nx);
-   Real_t grindTime2 = ((elapsed_time*1e6)/locDom.cycle())/(nx*nx*nx*numRanks);
+   Real_t grindTime1 = ((elapsed_time*1e6)/domain->cycle())/(nx*nx*nx);
+   Real_t grindTime2 = grindTime1 / numRanks;
+   Real_t fom = 1000.0/grindTime2; // zones per second
 
    Index_t ElemId = 0;
    printf("Run completed:  \n");
-   printf("   Problem size        =  %i \n",    nx);
-   printf("   MPI tasks           =  %i \n",    numRanks);
-   printf("   Iteration count     =  %i \n",    locDom.cycle());
-   printf("   Final Origin Energy = %12.6e \n", locDom.e(ElemId));
+   printf(":   Problem size             :  %i \n",    nx);
+   printf(":   MPI tasks                :  %i \n",    numRanks);
+   printf(":   OpenMP threads           :  %i \n",    numThreads);
+   printf(":   Iteration count          :  %i \n",    domain->cycle());
+   printf(":   Final Origin Energy      : %12.6e \n", domain->e(ElemId));
 
    Real_t   MaxAbsDiff = Real_t(0.0);
    Real_t TotalAbsDiff = Real_t(0.0);
    Real_t   MaxRelDiff = Real_t(0.0);
+   Real_t TotalRelDiff = Real_t(0.0);
 
    for (Index_t j=0; j<nx; ++j) {
       for (Index_t k=j+1; k<nx; ++k) {
-         Real_t AbsDiff = FABS(locDom.e(j*nx+k)-locDom.e(k*nx+j));
+         Real_t AbsDiff = FABS(domain->e(j*nx+k)-domain->e(k*nx+j));
          TotalAbsDiff  += AbsDiff;
 
          if (MaxAbsDiff <AbsDiff) MaxAbsDiff = AbsDiff;
 
-         Real_t RelDiff = AbsDiff / locDom.e(k*nx+j);
+         Real_t RelDiff = AbsDiff / domain->e(k*nx+j);
+         if ( domain->e(k*nx+j) != .0 ) TotalRelDiff  += FABS(RelDiff);
+         else TotalRelDiff  += FABS(AbsDiff);
 
          if (MaxRelDiff <RelDiff)  MaxRelDiff = RelDiff;
       }
    }
 
    // Quick symmetry check
-   printf("   Testing Plane 0 of Energy Array on rank 0:\n");
-   printf("        MaxAbsDiff   = %12.6e\n",   MaxAbsDiff   );
-   printf("        TotalAbsDiff = %12.6e\n",   TotalAbsDiff );
-   printf("        MaxRelDiff   = %12.6e\n\n", MaxRelDiff   );
-   printf(":       TotalRelDiff = %12.6e\n",   TotalRelDiff );
+   printf("Testing Plane 0 of Energy Array on rank 0:\n");
+   printf(":      MaxAbsDiff            : %12.6e\n", MaxAbsDiff   );
+   printf(":      TotalAbsDiff          : %12.6e\n", TotalAbsDiff );
+   printf(":      MaxRelDiff            : %12.6e\n", MaxRelDiff   );
+   printf(":      TotalRelDiff          : %12.6e\n", TotalRelDiff );
    printf(":   Verification (TrD<1e-09) : %s    \n", (TotalRelDiff < 1e-09)? "pass":"fail");
 
-
    // Timing information
-   printf("\nElapsed time         = %10.2f (s)\n", elapsed_time);
-   printf("Grind time (us/z/c)  = %10.8g (per dom)  (%10.8g overall)\n", grindTime1, grindTime2);
-
-   double fom = 1000.0/grindTime2;
-   printf("FOM                  = %10.8g (z/s)\n", fom); // zones per second
+   printf(":Elapsed time (s)            : %10.2f \n", elapsed_time);
+   printf(":Grind time (us/z/c) per dom : %10.8g \n", grindTime1);
+   printf(":Grind time (us/z/c) overall : %10.8g \n", grindTime2);
+   printf(":FOM (z/s)                   : %10.8g \t\n", fom);
 
    return fom;
 }

@@ -684,9 +684,10 @@ Real_t CalcElemVolume( const Real_t x[8],
 void ParseCommandLineOptions(int argc, char *argv[],
                              Int_t myRank, struct cmdLineOpts *opts);
 double VerifyAndWriteFinalOutput(Real_t elapsed_time,
-                               Domain& locDom,
+                               Domain * domain,
                                Int_t nx,
-                               Int_t numRanks);
+                               Int_t numRanks,
+                               Int_t numThreads);
 
 // lulesh-viz
 void DumpToVisit(Domain& domain, int numFiles, int myRank, int numRanks);

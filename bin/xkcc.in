@@ -1,2 +1,2 @@
 #!/bin/sh
-exec clang -fopenmp "$@" -L"@CMAKE_INSTALL_PREFIX@/lib" -lxkomp
+exec clang -fopenmp "$@" #-L"@CMAKE_INSTALL_PREFIX@/lib" -lxkomp

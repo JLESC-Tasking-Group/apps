@@ -1,2 +1,2 @@
 #!/bin/sh
-exec clang++ -fopenmp -std=c++20 "$@" -L"@CMAKE_INSTALL_PREFIX@/lib" -lxkomp
+exec clang++ -fopenmp -std=c++20 "$@" #-L"@CMAKE_INSTALL_PREFIX@/lib" -lxkomp

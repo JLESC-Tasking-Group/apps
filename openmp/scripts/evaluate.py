@@ -64,7 +64,7 @@ def sanitize(s):
 def build_cmd(app, variant, cfg, size, iters, backend_vars, grain):
     variables = dict(cfg.build)
     variables.update(backend_vars)
-    argv = ["make", "-C", app.directory, app.make_target(variant)]
+    argv = ["make", "-C", app.directory, "clean", app.make_target(variant)]
     argv += [f"{k}={v}" for k, v in variables.items()]
     if app.rebuild_per_size and app.llmc_defs:
         # grain is a compile-time macro (GRAN_TMP) for llm.c; on sync it is 1/loop.

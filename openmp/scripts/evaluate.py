@@ -80,7 +80,9 @@ def main():
                     "(e.g. '8,16,24') and/or per-app 'app=list' items, separated by ';' "
                     "(e.g. 'krylov=32,48,64;lulesh=30,45,60'). A per-app list overrides the "
                     "global list, which overrides each app's built-in default.")
-    ap.add_argument("--iters", type=int, default=0, help="override iterations")
+    ap.add_argument("--iters", default="", help="iterations: a global value (e.g. '200') "
+                    "and/or per-app 'app=N' items separated by ';' (e.g. 'krylov=200;lulesh=30'). "
+                    "A per-app value overrides the global one, which overrides each app's default.")
     ap.add_argument("--opts", default="", help="semicolon-separated CGIR opt combos, each "
                     "a comma/space list of passes (e.g. 'reduce-node,reduce-edge;batch'); "
                     "each combo -> one taskgraph:<opt> config. Default from appspecs.")
@@ -120,6 +122,10 @@ def main():
     for a in size_by_app:
         if a not in APPS:
             ap.error(f"unknown app '{a}' in --sizes (known: {', '.join(APPS)})")
+    iters_default, iters_by_app = _parse_iters(args.iters)
+    for a in iters_by_app:
+        if a not in APPS:
+            ap.error(f"unknown app '{a}' in --iters (known: {', '.join(APPS)})")
     configs = default_configs(_parse_opts(args.opts))
     backend_vars = {"USE_TARGET": "1" if args.target == "gpu" else "0"}
 
@@ -171,7 +177,7 @@ def main():
         else:
             variants = [v for v in app.variants if not variant_filter or v in variant_filter]
         sizes = size_by_app.get(app_name) or size_default or app.sizes
-        iters = args.iters or app.iters
+        iters = iters_by_app.get(app_name) or iters_default or app.iters
 
         for variant in variants:
             for cfg in configs:
@@ -278,6 +284,22 @@ def _parse_sizes(arg):
             by_app[app.strip()] = [int(s) for s in lst.split(",") if s.strip()]
         else:
             default = [int(s) for s in chunk.split(",") if s.strip()]
+    return default, by_app
+
+
+def _parse_iters(arg):
+    """Parse --iters into (global_default_or_None, {app: int}), like _parse_sizes
+    but with a single int per entry. E.g. 'krylov=200;lulesh=30' or '200'."""
+    default, by_app = None, {}
+    for chunk in str(arg).split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" in chunk:
+            app, _, v = chunk.partition("=")
+            by_app[app.strip()] = int(v)
+        else:
+            default = int(chunk)
     return default, by_app
 
 

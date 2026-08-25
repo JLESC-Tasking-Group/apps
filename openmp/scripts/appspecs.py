@@ -140,14 +140,15 @@ class AppSpec:
 
 
 # ---- krylov: grid n, matrix N=n^3, work ~ n^3; -t/-s = task counts (0=threads) --
-# grain = tasks per loop -> -t <grain> (and -s 1, one SpMV sub-task per block, so
-# every loop has exactly <grain> tasks). None -> the app default (-t 0 -s 0 = auto,
-# i.e. omp threads). The synchronous config is always 1 task/loop (-t 1 -s 1).
+# grain is a positional list [T1, T2]: T1 -> -t (tasks per vector op), T2 -> -s
+# (SpMV sub-tasks per block, default 1 so every loop has T1 tasks). None -> the
+# app default (-t 0 -s 0 = auto, i.e. omp threads). Sync is always 1/loop (-t 1 -s 1).
 def _krylov_run(variant, size, iters, cfg, grain):
     if cfg.grain1:
         t, s = "1", "1"
     elif grain:
-        t, s = str(grain), "1"
+        t = str(grain[0])
+        s = str(grain[1]) if len(grain) > 1 else "1"
     else:
         t, s = "0", "0"
     return ["-n", str(size), "-i", str(iters), "-t", t, "-s", s, "-S", "27"]
@@ -166,10 +167,10 @@ KRYLOV = AppSpec(
 )
 
 # ---- lulesh: mesh side s, zones = s^3; -nb = tasks per loop ---------------------
-# grain = -nb <grain> (tasks per loop). None -> the app default (-nb 32). The
-# synchronous config is always 1 task/loop (-nb 1).
+# grain is a positional list [nb]: nb -> -nb (tasks per loop). None -> the app
+# default (-nb 32). The synchronous config is always 1 task/loop (-nb 1).
 def _lulesh_run(variant, size, iters, cfg, grain):
-    nb = "1" if cfg.grain1 else (str(grain) if grain else "32")
+    nb = "1" if cfg.grain1 else (str(grain[0]) if grain else "32")
     return ["-i", str(iters), "-s", str(size), "-r", "11", "-b", "1", "-c", "1", "-nb", nb]
 
 LULESH = AppSpec(
@@ -186,16 +187,18 @@ LULESH = AppSpec(
 )
 
 # ---- llm.c: SEQUENCE_SIZE T is a compile-time macro -> rebuild per size ---------
-# grain maps to GRAN_TMP (tokens per task tile -- a compile-time macro), so it is
-# injected at build time rather than as a run argument. None -> the source default
-# (GRAN_TMP = USE_TARGET ? 1 : 8).
+# grain is a positional list mapping to the compile-time granularity macros
+# [GRAN_TMP, OC_SPLIT, OC_BACK_SPLIT] (extras ignored); injected at build time
+# rather than as run arguments. None -> the source defaults.
+_LLMC_GRAIN_MACROS = ["GRAN_TMP", "OC_SPLIT", "OC_BACK_SPLIT"]
+
 def _llmc_run(variant, size, iters, cfg, grain):
     return []  # no runtime args; size/steps/grain are compiled in
 
 def _llmc_defs(size, iters, batch, grain):
     defs = f"-DSEQUENCE_SIZE={size} -DNB_STEPS={iters} -DBATCH_SIZE={batch}"
-    if grain:
-        defs += f" -DGRAN_TMP={grain}"
+    for name, val in zip(_LLMC_GRAIN_MACROS, grain or []):
+        defs += f" -D{name}={val}"
     return defs
 
 LLMC = AppSpec(

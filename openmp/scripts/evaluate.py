@@ -85,10 +85,11 @@ def main():
     ap.add_argument("--iters", default="", help="iterations: a global value (e.g. '200') "
                     "and/or per-app 'app=N' items separated by ';' (e.g. 'krylov=200;lulesh=30'). "
                     "A per-app value overrides the global one, which overrides each app's default.")
-    ap.add_argument("--grain", default="", help="tasks per loop: a global value (e.g. '8') "
-                    "and/or per-app 'app=N' items separated by ';' (e.g. 'krylov=8;lulesh=64'). "
-                    "Maps to krylov -t, lulesh -nb, llm.c GRAN_TMP (compile-time tile). Applies "
-                    "to the async configs only; the synchronous config is always 1 task/loop. "
+    ap.add_argument("--grain", default="", help="tasks-per-loop granularity: a per-app "
+                    "comma-separated list, items ';'-separated (e.g. 'krylov=8,2;lulesh=64'); a "
+                    "bare list is the global default. Interpreted positionally per app: krylov "
+                    "[T1,T2] -> -t/-s, lulesh [nb] -> -nb, llm.c [GRAN_TMP,OC_SPLIT,OC_BACK_SPLIT] "
+                    "(compile-time). Applies to the async configs only (sync is always 1 task/loop). "
                     "Unset -> each app's default granularity.")
     ap.add_argument("--opts", default="", help="semicolon-separated CGIR opt combos, each "
                     "a comma/space list of passes (e.g. 'reduce-node,reduce-edge;batch'); "
@@ -133,7 +134,7 @@ def main():
     for a in iters_by_app:
         if a not in APPS:
             ap.error(f"unknown app '{a}' in --iters (known: {', '.join(APPS)})")
-    grain_default, grain_by_app = _parse_ints(args.grain)
+    grain_default, grain_by_app = _parse_sizes(args.grain)   # per-app list of ints
     for a in grain_by_app:
         if a not in APPS:
             ap.error(f"unknown app '{a}' in --grain (known: {', '.join(APPS)})")
@@ -163,7 +164,8 @@ def main():
     def do_build(app, variant, cfg, size, iters, grain):
         key = (app.name, variant, cfg.label, args.target)
         if app.rebuild_per_size:
-            key = key + (size, grain)   # grain (GRAN_TMP) is compile-time for llm.c
+            # grain (GRAN_TMP/...) is compile-time for llm.c; tuple() to stay hashable
+            key = key + (size, tuple(grain) if grain else None)
         if key in built:
             return built[key]
         cmd = build_cmd(app, variant, cfg, size, iters, backend_vars, grain)
@@ -229,7 +231,7 @@ def main():
                                                {**cfg.build, **backend_vars}.items()),
                         "backend": args.target, "size": size,
                         "work": work, "work_label": work_label, "iters": iters,
-                        "grain": (grain if grain else ""),
+                        "grain": (",".join(map(str, grain)) if grain else ""),
                         "cmd": pretty,
                     })
 

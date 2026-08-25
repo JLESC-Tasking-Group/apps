@@ -240,6 +240,20 @@
 # define MAP(...)
 #endif
 
+/* Host-only shared() clause -- the counterpart of MAP for the host backends.
+ * With DEFAULT_NONE, every variable used in a task needs an explicit data-sharing
+ * attribute. On the GPU backend that comes from the map() clause, so SHARED
+ * expands to nothing; on the host/OmpSs backends it emits shared(...) for
+ * variables whose lifetime is protected by the task dependences (e.g. the
+ * solver-scope scalar buffers, live for the whole solve and ordered by depend).
+ * Per-task values that must be captured by value (loop indices, tile bounds) use
+ * firstprivate instead. Assumes SHARED is only used on host-executed tasks. */
+#if USE_TARGET
+# define SHARED(...)
+#else
+# define SHARED(...) shared(__VA_ARGS__)
+#endif
+
 # define DEFAULT_NONE default(none)
 
 /* ---- Device data-management directives ----

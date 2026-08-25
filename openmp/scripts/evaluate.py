@@ -160,6 +160,7 @@ def main():
 
     built = {}
     n_ok = n_fail = 0
+    fail_by_app = {}   # app_name -> failed run count
 
     def do_build(app, variant, cfg, size, iters, grain):
         key = (app.name, variant, cfg.label, args.target)
@@ -241,6 +242,7 @@ def main():
                         row["status"] = "build_fail"
                         row["returncode"] = 1
                         n_fail += 1
+                        fail_by_app[app_name] = fail_by_app.get(app_name, 0) + 1
                         writer.writerow(row); fh.flush()
                         continue
 
@@ -257,11 +259,13 @@ def main():
                             n_ok += 1
                         else:
                             n_fail += 1
+                            fail_by_app[app_name] = fail_by_app.get(app_name, 0) + 1
                             sys.stderr.write(p.stdout[-2000:] + "\n")
                     except subprocess.TimeoutExpired:
                         row["status"] = "timeout"
                         row["returncode"] = -1
                         n_fail += 1
+                        fail_by_app[app_name] = fail_by_app.get(app_name, 0) + 1
                         print(f"      -> timeout after {args.timeout:.0f}s", file=sys.stderr)
 
                     writer.writerow(row); fh.flush()
@@ -270,6 +274,9 @@ def main():
         fh.close()
     print("", file=sys.stderr)
     print(f"ok={n_ok} fail={n_fail}", file=sys.stderr)
+    if fail_by_app:
+        print("fail by app: " + ", ".join(f"{a}={n}" for a, n in sorted(fail_by_app.items())),
+              file=sys.stderr)
     if not args.dry_run:
         print(f"runs    -> {runs_csv}", file=sys.stderr)
         if not args.no_stats:

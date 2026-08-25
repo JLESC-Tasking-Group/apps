@@ -2,17 +2,20 @@
 """
 plot.py - plot the sweep produced by scripts/evaluate.py.
 
-Reads results/runs.csv (and optionally results/cgstats.csv) and writes PNGs under
-results/figures:
+Reads results/runs.csv (and optionally results/cgstats.csv) and writes figures
+under results/figures (PDF by default; see --format):
 
-  * time-<app>[-<variant>].png : grouped bars of avg execution time / iteration
+  * time-<app>[-<variant>] : grouped bars of avg execution time / iteration
     (ms) with stddev error bars, one group per problem size and one bar per
     configuration (synchronous / no-taskgraph / taskgraph:none / taskgraph:<opt>).
     The problem size is on the bottom axis and the work (FLOPs / zones / tokens)
     on the top axis.
-  * graph-<app>.png : per-CGIR-pass command-graph reduction (nodes & edges
+  * graph-<app> : per-CGIR-pass command-graph reduction (nodes & edges
     before -> after) and per-pass wall time, from cgstats.csv joined on the run
     tag. Only the taskgraph configurations contribute here.
+
+A per-(app, variant) coverage summary is printed first, so runs that failed (and
+are therefore not plottable) are reported rather than silently omitted.
 
 Uses only matplotlib + the standard library.
 """
@@ -28,6 +31,8 @@ APPS_OPENMP = Path(__file__).resolve().parent.parent
 # Canonical CGIR pipeline order for the graph-stats x axis.
 PASS_ORDER = ["copy-normalize", "copy-fuse", "reduce-node", "reduce-edge",
               "prog-fuse", "jit", "sequence", "batch"]
+
+OK_STATUS = ("ok", "", None)
 
 
 def fnum(x):
@@ -46,13 +51,9 @@ def median(xs):
 
 
 def load_runs(path):
-    rows = []
+    """All rows (including failed ones, so coverage can be reported)."""
     with open(path, newline="") as fh:
-        for r in csv.DictReader(fh):
-            if r.get("status") not in ("ok", "", None):
-                continue
-            rows.append(r)
-    return rows
+        return list(csv.DictReader(fh))
 
 
 def ordered_unique(seq):
@@ -63,7 +64,38 @@ def ordered_unique(seq):
     return out
 
 
-def plot_time(rows, figdir, dpi, logy):
+def report_coverage(rows):
+    """Print per-(app,variant) plottable/total, warning about groups that have
+    runs but nothing plottable (e.g. all failed) -- so they aren't silently
+    dropped from the figures. Returns the list of plottable-status rows."""
+    groups = {}
+    for r in rows:
+        key = (r["app"], r.get("variant", ""))
+        g = groups.setdefault(key, {"total": 0, "ok": 0, "plottable": 0, "rc": defaultdict(int)})
+        g["total"] += 1
+        if r.get("status") in OK_STATUS:
+            g["ok"] += 1
+            if r.get("avg_ms", "") != "":
+                g["plottable"] += 1
+        else:
+            g["rc"][str(r.get("returncode", "?"))] += 1
+
+    print("run coverage (plottable / total):", file=sys.stderr)
+    for (app, variant), g in sorted(groups.items()):
+        name = f"{app}/{variant}" if variant else app
+        line = f"  {name:18s} {g['plottable']}/{g['total']}"
+        nfail = g["total"] - g["ok"]
+        if nfail:
+            line += f"  ({nfail} failed, returncodes {dict(g['rc'])})"
+        print(line, file=sys.stderr)
+        if g["total"] and not g["plottable"]:
+            print(f"    WARNING: {name} has no plottable runs -> omitted from the figures "
+                  f"(all failed/empty; check --sizes and the build).", file=sys.stderr)
+
+    return [r for r in rows if r.get("status") in OK_STATUS]
+
+
+def plot_time(rows, figdir, dpi, logy, fmt, show):
     import matplotlib.pyplot as plt
 
     groups = defaultdict(list)  # (app, variant) -> rows
@@ -118,10 +150,10 @@ def plot_time(rows, figdir, dpi, logy):
         ax.set_title(title, fontsize=10, pad=28)
         fig.tight_layout()
         name = "time-" + app + (f"-{variant}" if variant else "")
-        _save(fig, figdir, name, dpi)
+        _save(fig, figdir, name, dpi, fmt, show)
 
 
-def plot_graph_stats(rows, cgstats_path, figdir, dpi):
+def plot_graph_stats(rows, cgstats_path, figdir, dpi, fmt, show):
     import matplotlib.pyplot as plt
 
     tag_app = {r["run_id"]: r["app"] for r in rows}
@@ -170,16 +202,17 @@ def plot_graph_stats(rows, cgstats_path, figdir, dpi):
         axt.set_axisbelow(True)
         fig.suptitle(f"{app}: CGIR command-graph reduction per pass", fontsize=10)
         fig.tight_layout()
-        _save(fig, figdir, f"graph-{app}", dpi)
+        _save(fig, figdir, f"graph-{app}", dpi, fmt, show)
 
 
-def _save(fig, figdir, name, dpi):
+def _save(fig, figdir, name, dpi, fmt, show):
     import matplotlib.pyplot as plt
     figdir.mkdir(parents=True, exist_ok=True)
-    path = figdir / f"{name}.png"
+    path = figdir / f"{name}.{fmt}"
     fig.savefig(path, dpi=dpi)
-    plt.close(fig)
     print(f"wrote {path}", file=sys.stderr)
+    if not show:                 # keep figures open for an interactive plt.show()
+        plt.close(fig)
 
 
 def main():
@@ -189,12 +222,17 @@ def main():
     ap.add_argument("--runs", default="", help="runs.csv (default: <outdir>/runs.csv)")
     ap.add_argument("--cgstats", default="", help="cgstats.csv (default: <outdir>/cgstats.csv)")
     ap.add_argument("--figdir", default="", help="figure dir (default: <outdir>/figures)")
+    ap.add_argument("--format", default="pdf", choices=["pdf", "png", "svg"],
+                    help="output image format (default: pdf)")
+    ap.add_argument("--show", action="store_true",
+                    help="display the figures interactively (in addition to writing them)")
     ap.add_argument("--logy", action="store_true", help="logarithmic y axis (time plot)")
     ap.add_argument("--dpi", type=int, default=140)
     args = ap.parse_args()
 
     import matplotlib
-    matplotlib.use("Agg")
+    if not args.show:
+        matplotlib.use("Agg")   # headless: only write files
 
     outdir = Path(args.outdir)
     runs_csv = Path(args.runs) if args.runs else outdir / "runs.csv"
@@ -203,15 +241,23 @@ def main():
 
     if not runs_csv.exists():
         ap.error(f"no runs.csv at {runs_csv} (run evaluate.py first)")
-    rows = load_runs(runs_csv)
-    if not rows:
-        ap.error("runs.csv has no successful rows")
 
-    plot_time(rows, figdir, args.dpi, args.logy)
+    allrows = load_runs(runs_csv)
+    if not allrows:
+        ap.error(f"{runs_csv} is empty")
+    rows = report_coverage(allrows)
+    if not any(r.get("avg_ms", "") != "" for r in rows):
+        ap.error("no plottable rows (see the coverage report above)")
+
+    plot_time(rows, figdir, args.dpi, args.logy, args.format, args.show)
     if cgstats_csv.exists():
-        plot_graph_stats(rows, cgstats_csv, figdir, args.dpi)
+        plot_graph_stats(rows, cgstats_csv, figdir, args.dpi, args.format, args.show)
     else:
         print(f"(no {cgstats_csv}; skipping CGIR graph-stats plot)", file=sys.stderr)
+
+    if args.show:
+        import matplotlib.pyplot as plt
+        plt.show()
 
 
 if __name__ == "__main__":

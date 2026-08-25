@@ -140,9 +140,16 @@ class AppSpec:
 
 
 # ---- krylov: grid n, matrix N=n^3, work ~ n^3; -t/-s = task counts (0=threads) --
-def _krylov_run(variant, size, iters, cfg):
-    t = "1" if cfg.grain1 else "0"
-    s = "1" if cfg.grain1 else "0"
+# grain = tasks per loop -> -t <grain> (and -s 1, one SpMV sub-task per block, so
+# every loop has exactly <grain> tasks). None -> the app default (-t 0 -s 0 = auto,
+# i.e. omp threads). The synchronous config is always 1 task/loop (-t 1 -s 1).
+def _krylov_run(variant, size, iters, cfg, grain):
+    if cfg.grain1:
+        t, s = "1", "1"
+    elif grain:
+        t, s = str(grain), "1"
+    else:
+        t, s = "0", "0"
     return ["-n", str(size), "-i", str(iters), "-t", t, "-s", s, "-S", "27"]
 
 KRYLOV = AppSpec(
@@ -159,8 +166,10 @@ KRYLOV = AppSpec(
 )
 
 # ---- lulesh: mesh side s, zones = s^3; -nb = tasks per loop ---------------------
-def _lulesh_run(variant, size, iters, cfg):
-    nb = "1" if cfg.grain1 else "32"
+# grain = -nb <grain> (tasks per loop). None -> the app default (-nb 32). The
+# synchronous config is always 1 task/loop (-nb 1).
+def _lulesh_run(variant, size, iters, cfg, grain):
+    nb = "1" if cfg.grain1 else (str(grain) if grain else "32")
     return ["-i", str(iters), "-s", str(size), "-r", "11", "-b", "1", "-c", "1", "-nb", nb]
 
 LULESH = AppSpec(
@@ -177,11 +186,17 @@ LULESH = AppSpec(
 )
 
 # ---- llm.c: SEQUENCE_SIZE T is a compile-time macro -> rebuild per size ---------
-def _llmc_run(variant, size, iters, cfg):
-    return []  # no runtime args; size/steps are compiled in
+# grain maps to GRAN_TMP (tokens per task tile -- a compile-time macro), so it is
+# injected at build time rather than as a run argument. None -> the source default
+# (GRAN_TMP = USE_TARGET ? 1 : 8).
+def _llmc_run(variant, size, iters, cfg, grain):
+    return []  # no runtime args; size/steps/grain are compiled in
 
-def _llmc_defs(size, iters, batch):
-    return f"-DSEQUENCE_SIZE={size} -DNB_STEPS={iters} -DBATCH_SIZE={batch}"
+def _llmc_defs(size, iters, batch, grain):
+    defs = f"-DSEQUENCE_SIZE={size} -DNB_STEPS={iters} -DBATCH_SIZE={batch}"
+    if grain:
+        defs += f" -DGRAN_TMP={grain}"
+    return defs
 
 LLMC = AppSpec(
     name="llm.c",

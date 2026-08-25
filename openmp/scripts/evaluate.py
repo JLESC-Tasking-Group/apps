@@ -50,7 +50,7 @@ DEFAULT_ENV = {
 CSV_FIELDS = [
     "run_id", "timestamp", "machine",
     "app", "variant", "config", "opt", "build_vars", "backend",
-    "size", "work", "work_label", "iters",
+    "size", "work", "work_label", "iters", "grain",
     "avg_ms", "stddev_ms", "iter0_ms", "elapsed_s", "fom", "flops", "gflops",
     "residual", "error",
     "returncode", "status", "cmd",
@@ -61,13 +61,15 @@ def sanitize(s):
     return re.sub(r"[^A-Za-z0-9._-]+", "-", str(s)).strip("-")
 
 
-def build_cmd(app, variant, cfg, size, iters, backend_vars):
+def build_cmd(app, variant, cfg, size, iters, backend_vars, grain):
     variables = dict(cfg.build)
     variables.update(backend_vars)
     argv = ["make", "-C", app.directory, app.make_target(variant)]
     argv += [f"{k}={v}" for k, v in variables.items()]
     if app.rebuild_per_size and app.llmc_defs:
-        argv.append("LLMC_DEFS=" + app.llmc_defs(size, iters, app.batch))
+        # grain is a compile-time macro (GRAN_TMP) for llm.c; on sync it is 1/loop.
+        g = None if cfg.grain1 else grain
+        argv.append("LLMC_DEFS=" + app.llmc_defs(size, iters, app.batch, g))
     return argv
 
 
@@ -83,6 +85,11 @@ def main():
     ap.add_argument("--iters", default="", help="iterations: a global value (e.g. '200') "
                     "and/or per-app 'app=N' items separated by ';' (e.g. 'krylov=200;lulesh=30'). "
                     "A per-app value overrides the global one, which overrides each app's default.")
+    ap.add_argument("--grain", default="", help="tasks per loop: a global value (e.g. '8') "
+                    "and/or per-app 'app=N' items separated by ';' (e.g. 'krylov=8;lulesh=64'). "
+                    "Maps to krylov -t, lulesh -nb, llm.c GRAN_TMP (compile-time tile). Applies "
+                    "to the async configs only; the synchronous config is always 1 task/loop. "
+                    "Unset -> each app's default granularity.")
     ap.add_argument("--opts", default="", help="semicolon-separated CGIR opt combos, each "
                     "a comma/space list of passes (e.g. 'reduce-node,reduce-edge;batch'); "
                     "each combo -> one taskgraph:<opt> config. Default from appspecs.")
@@ -122,10 +129,14 @@ def main():
     for a in size_by_app:
         if a not in APPS:
             ap.error(f"unknown app '{a}' in --sizes (known: {', '.join(APPS)})")
-    iters_default, iters_by_app = _parse_iters(args.iters)
+    iters_default, iters_by_app = _parse_ints(args.iters)
     for a in iters_by_app:
         if a not in APPS:
             ap.error(f"unknown app '{a}' in --iters (known: {', '.join(APPS)})")
+    grain_default, grain_by_app = _parse_ints(args.grain)
+    for a in grain_by_app:
+        if a not in APPS:
+            ap.error(f"unknown app '{a}' in --grain (known: {', '.join(APPS)})")
     configs = default_configs(_parse_opts(args.opts))
     backend_vars = {"USE_TARGET": "1" if args.target == "gpu" else "0"}
 
@@ -149,13 +160,13 @@ def main():
     built = {}
     n_ok = n_fail = 0
 
-    def do_build(app, variant, cfg, size, iters):
+    def do_build(app, variant, cfg, size, iters, grain):
         key = (app.name, variant, cfg.label, args.target)
         if app.rebuild_per_size:
-            key = key + (size,)
+            key = key + (size, grain)   # grain (GRAN_TMP) is compile-time for llm.c
         if key in built:
             return built[key]
-        cmd = build_cmd(app, variant, cfg, size, iters, backend_vars)
+        cmd = build_cmd(app, variant, cfg, size, iters, backend_vars, grain)
         print("[build] " + " ".join(cmd), file=sys.stderr)
         if args.dry_run or args.skip_build:
             built[key] = True
@@ -178,16 +189,17 @@ def main():
             variants = [v for v in app.variants if not variant_filter or v in variant_filter]
         sizes = size_by_app.get(app_name) or size_default or app.sizes
         iters = iters_by_app.get(app_name) or iters_default or app.iters
+        grain = grain_by_app.get(app_name) or grain_default   # None -> app default
 
         for variant in variants:
             for cfg in configs:
                 for size in sizes:
-                    ok = do_build(app, variant, cfg, size, iters)
+                    ok = do_build(app, variant, cfg, size, iters, grain)
                     work, work_label = app.work(size)
                     vtag = f"-{variant}" if variant else ""
                     disp = f"{app_name}/{variant}" if variant else app_name
                     run_id = sanitize(f"{app_name}{vtag}-{args.target}-{cfg.label}-n{size}-{ts_run}")
-                    argv = [app.binary(variant)] + list(app.run_args(variant, size, iters, cfg))
+                    argv = [app.binary(variant)] + list(app.run_args(variant, size, iters, cfg, grain))
                     workdir = APPS_OPENMP / app.directory
 
                     env = dict(os.environ)
@@ -217,6 +229,7 @@ def main():
                                                {**cfg.build, **backend_vars}.items()),
                         "backend": args.target, "size": size,
                         "work": work, "work_label": work_label, "iters": iters,
+                        "grain": (grain if grain else ""),
                         "cmd": pretty,
                     })
 
@@ -287,9 +300,10 @@ def _parse_sizes(arg):
     return default, by_app
 
 
-def _parse_iters(arg):
-    """Parse --iters into (global_default_or_None, {app: int}), like _parse_sizes
-    but with a single int per entry. E.g. 'krylov=200;lulesh=30' or '200'."""
+def _parse_ints(arg):
+    """Parse a --iters/--grain style spec into (global_default_or_None, {app: int}),
+    like _parse_sizes but with a single int per entry. E.g. 'krylov=200;lulesh=30'
+    or '200'."""
     default, by_app = None, {}
     for chunk in str(arg).split(";"):
         chunk = chunk.strip()

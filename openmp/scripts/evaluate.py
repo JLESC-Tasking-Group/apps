@@ -3,8 +3,11 @@
 evaluate.py - shared evaluation sweep for the apps/openmp taskgraph apps
 (krylov, lulesh, llm.c). For each app x variant x configuration x problem size it
 builds the right binary, runs it, parses the per-iteration timing, and appends a
-row to results/runs.csv. Per-pass CGIR command-graph stats are collected
-alongside via CGIR_STATS_CSV (auto, unless --no-stats).
+row to results/runs.csv. Alongside (auto, unless --no-stats), for taskgraph
+configs CGIR writes two side files that join runs.csv on run_id == tag:
+per-pass command-graph stats via CGIR_STATS_CSV -> results/cgstats.csv, and the
+per-run JIT compile breakdown + cache reuse via CGIR_JIT_STATS_CSV ->
+results/jitstats.csv (rows only for opts that include the `jit` pass).
 
 Configurations always include the three references (synchronous, no-taskgraph,
 taskgraph:none) plus one taskgraph:<opt> per CGIR optimization combo (see
@@ -144,6 +147,7 @@ def main():
     outdir = Path(args.outdir)
     runs_csv = Path(args.out) if args.out else outdir / "runs.csv"
     stats_csv = outdir / "cgstats.csv"
+    jit_csv = outdir / "jitstats.csv"
     if not args.dry_run:
         outdir.mkdir(parents=True, exist_ok=True)
 
@@ -213,10 +217,14 @@ def main():
                         env["OMP_NUM_THREADS"] = str(args.threads)
                     if cfg.opt is not None:
                         env["OMP_TASKGRAPH_OPT"] = cfg.opt
-                    # CGIR per-pass stats: only taskgraph configs produce passes.
+                    # CGIR stats: only taskgraph configs produce passes. cgstats
+                    # is per-pass command-graph stats; jitstats is the per-run JIT
+                    # compile breakdown + cache reuse (populated only for opts that
+                    # include the `jit` pass). Both join runs.csv on run_id == tag.
                     if not args.no_stats and cfg.opt is not None:
                         env["CGIR_STATS_CSV"] = str(stats_csv)
                         env["CGIR_STATS_TAG"] = run_id
+                        env["CGIR_JIT_STATS_CSV"] = str(jit_csv)
 
                     pretty = " ".join(argv)
                     print(f"[run ] {cfg.label:34s} {disp} n={size} : {pretty}",
@@ -278,9 +286,10 @@ def main():
         print("fail by app: " + ", ".join(f"{a}={n}" for a, n in sorted(fail_by_app.items())),
               file=sys.stderr)
     if not args.dry_run:
-        print(f"runs    -> {runs_csv}", file=sys.stderr)
+        print(f"runs     -> {runs_csv}", file=sys.stderr)
         if not args.no_stats:
-            print(f"cgstats -> {stats_csv}", file=sys.stderr)
+            print(f"cgstats  -> {stats_csv}", file=sys.stderr)
+            print(f"jitstats -> {jit_csv}", file=sys.stderr)
     return 0 if n_fail == 0 else 1
 
 

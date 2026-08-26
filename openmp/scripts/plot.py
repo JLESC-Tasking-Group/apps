@@ -17,7 +17,10 @@ under results/figures (PDF by default; see --format):
 A per-(app, variant) coverage summary is printed first, so runs that failed (and
 are therefore not plottable) are reported rather than silently omitted.
 
-Uses only matplotlib + the standard library.
+Figures follow the conference camera-ready guidance: all text is >=10pt (default
+leading is ~1.2x, i.e. >=12pt), and series are distinguished by hatch patterns +
+black edges (not colour alone) so they stay readable when printed in grayscale
+without magnification. Uses only matplotlib + the standard library.
 """
 
 import argparse
@@ -33,6 +36,27 @@ PASS_ORDER = ["copy-normalize", "copy-fuse", "reduce-node", "reduce-edge",
               "prog-fuse", "jit", "sequence", "batch"]
 
 OK_STATUS = ("ok", "", None)
+
+# Publication style: >=10pt fonts everywhere (default leading is ~1.2x -> >=12pt),
+# and hatch patterns + black edges so grouped bars stay distinguishable when the
+# figure is printed in grayscale without magnification. See the conference guide.
+STYLE = {
+    "font.size":            11,
+    "axes.titlesize":       12,
+    "axes.labelsize":       11,
+    "xtick.labelsize":      10,
+    "ytick.labelsize":      10,
+    "legend.fontsize":      10,
+    "legend.title_fontsize": 10,
+    "figure.titlesize":     13,
+    "hatch.linewidth":      0.6,
+    "savefig.bbox":         "tight",
+}
+# Distinct hatches (paired with the color cycle) so each series is identifiable
+# both in color and in grayscale.
+HATCHES = ["", "//", "\\\\", "xx", "..", "oo", "++", "--", "||", "OO"]
+BAR_EDGE = dict(edgecolor="black", linewidth=0.6)
+ERR_KW = dict(elinewidth=1.0, ecolor="black")
 
 
 def fnum(x):
@@ -118,13 +142,13 @@ def plot_time(rows, figdir, dpi, logy, fmt, show):
 
         x = list(range(len(sizes)))
         width = 0.8 / max(len(configs), 1)
-        fig, ax = plt.subplots(figsize=(max(7.0, 1.3 * len(sizes) + 2.0), 5.0))
+        fig, ax = plt.subplots(figsize=(max(9.0, 1.6 * len(sizes) + 3.0), 5.5))
         for i, c in enumerate(configs):
             heights = [(data[c].get(s) or (float("nan"), 0.0))[0] for s in sizes]
             errs = [(data[c].get(s) or (float("nan"), 0.0))[1] for s in sizes]
             offs = [xi - 0.4 + width * (i + 0.5) for xi in x]
-            ax.bar(offs, heights, width, yerr=errs, capsize=2, label=c,
-                   error_kw={"elinewidth": 1, "alpha": 0.7})
+            ax.bar(offs, heights, width, yerr=errs, capsize=3, label=c,
+                   hatch=HATCHES[i % len(HATCHES)], error_kw=ERR_KW, **BAR_EDGE)
 
         ax.set_xticks(x)
         ax.set_xticklabels([str(s) for s in sizes])
@@ -134,20 +158,23 @@ def plot_time(rows, figdir, dpi, logy, fmt, show):
             ax.set_yscale("log")
         ax.grid(axis="y", ls=":", alpha=0.6)
         ax.set_axisbelow(True)
-        ax.legend(title="configuration", fontsize=8, ncol=2)
+        # Legend below the axes so >=10pt entries do not overflow the plot area.
+        ncol = 2 if len(configs) > 4 else 1
+        ax.legend(title="configuration", ncol=ncol, loc="upper center", bbox_to_anchor=(0.5, -0.22))
+        # ax.legend(title="configuration", fontsize=8, ncol=2)
 
         if any(work_by.get(s) for s in sizes):
             axtop = ax.twiny()
             axtop.set_xlim(ax.get_xlim())
             axtop.set_xticks(x)
             axtop.set_xticklabels(["%.1e" % work_by[s] if work_by.get(s) else "-" for s in sizes],
-                                  rotation=40, ha="left", fontsize=8)
+                                  rotation=40, ha="left")
             axtop.set_xlabel(wlabel or "work")
 
         title = app + (f" / {variant}" if variant else "")
         r0 = grp[0]
         title += f"  |  {r0.get('backend','?')} backend, {r0.get('iters','?')} iters"
-        ax.set_title(title, fontsize=10, pad=28)
+        ax.set_title(title, pad=28)
         fig.tight_layout()
         name = "time-" + app + (f"-{variant}" if variant else "")
         _save(fig, figdir, name, dpi, fmt, show)
@@ -176,31 +203,34 @@ def plot_graph_stats(rows, cgstats_path, figdir, dpi, fmt, show):
                         key=lambda p: PASS_ORDER.index(p) if p in PASS_ORDER else 99)
         if not passes:
             continue
-        fig, axes = plt.subplots(1, 3, figsize=(11.0, 3.2))
+        fig, axes = plt.subplots(1, 3, figsize=(13.0, 4.2))
         for ax, (lo, hi, ttl) in zip(
                 axes[:2], [("nodes_before", "nodes_after", "nodes"),
                            ("edges_before", "edges_after", "edges")]):
             xs = range(len(passes))
             before = [median(acc[(app, p)].get(lo, [])) or 0 for p in passes]
             after = [median(acc[(app, p)].get(hi, [])) or 0 for p in passes]
-            ax.bar([x - 0.2 for x in xs], before, width=0.4, label="before")
-            ax.bar([x + 0.2 for x in xs], after, width=0.4, label="after")
+            # grayscale-safe: distinct grays + a hatch on "after".
+            ax.bar([x - 0.2 for x in xs], before, width=0.4, label="before",
+                   color="0.80", **BAR_EDGE)
+            ax.bar([x + 0.2 for x in xs], after, width=0.4, label="after",
+                   color="0.45", hatch="//", **BAR_EDGE)
             ax.set_xticks(list(xs))
-            ax.set_xticklabels(passes, rotation=30, ha="right", fontsize=7)
+            ax.set_xticklabels(passes, rotation=30, ha="right")
             ax.set_ylabel(ttl)
-            ax.legend(fontsize=7)
+            ax.legend()
             ax.grid(axis="y", ls=":", alpha=0.6)
             ax.set_axisbelow(True)
         # third panel: per-pass wall time
         axt = axes[2]
         ms = [median(acc[(app, p)].get("pass_ms", [])) or 0 for p in passes]
-        axt.bar(list(range(len(passes))), ms, width=0.6, color="tab:gray")
+        axt.bar(list(range(len(passes))), ms, width=0.6, color="0.6", **BAR_EDGE)
         axt.set_xticks(list(range(len(passes))))
-        axt.set_xticklabels(passes, rotation=30, ha="right", fontsize=7)
+        axt.set_xticklabels(passes, rotation=30, ha="right")
         axt.set_ylabel("pass_ms")
         axt.grid(axis="y", ls=":", alpha=0.6)
         axt.set_axisbelow(True)
-        fig.suptitle(f"{app}: CGIR command-graph reduction per pass", fontsize=10)
+        fig.suptitle(f"{app}: CGIR command-graph reduction per pass")
         fig.tight_layout()
         _save(fig, figdir, f"graph-{app}", dpi, fmt, show)
 
@@ -233,6 +263,8 @@ def main():
     import matplotlib
     if not args.show:
         matplotlib.use("Agg")   # headless: only write files
+    import matplotlib.pyplot as plt
+    plt.rcParams.update(STYLE)  # >=10pt fonts + grayscale-friendly hatch width
 
     outdir = Path(args.outdir)
     runs_csv = Path(args.runs) if args.runs else outdir / "runs.csv"

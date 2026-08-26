@@ -33,7 +33,7 @@ CFLAGS += -I..
 CFLAGS += -fopenmp -fopenmp-version=60
 CFLAGS += -O3
 #CFLAGS += -O0 -g
-CFLAGS += -fopenmp-task-jit-type=packed        # XKOMP JIT (none|pointers|packed)
+CFLAGS += -fopenmp-task-jit-abi=packed        # XKOMP JIT (none|pointers|packed)
 CFLAGS += -DUSE_TARGET=$(USE_TARGET)
 CFLAGS += -DUSE_TASKGRAPH=$(USE_TASKGRAPH)
 CFLAGS += -DUSE_SYNC=$(USE_SYNC)

@@ -105,6 +105,17 @@ def _parse_lulesh(text):
     }
 
 
+def _parse_mnmg(text):
+    # tc.cpp prints per-solve timing lines (see MNMGDatalog/tc.cpp): the timed
+    # repeats' avg/stddev, the warm-up ("solve 0") time, and the total.
+    return {
+        "avg_ms":    _grab(text, r"timed solves \(avg\)\s*:\s*" + _F + r"\s*ms"),
+        "stddev_ms": _grab(text, r"timed solves \(stddev\)\s*:\s*" + _F + r"\s*ms"),
+        "iter0_ms":  _grab(text, r"solve 0 \(warmup\)\s*:\s*" + _F + r"\s*ms"),
+        "elapsed_s": _grab(text, r"total solve time\s*:\s*" + _F),
+    }
+
+
 def _parse_llmc(text):
     # llm.c prints one "Iteration runtime : X ms" per step (to stderr); compute
     # the avg/stddev over the steady steps (drop step 0 = warmup/first build).
@@ -216,4 +227,31 @@ LLMC = AppSpec(
     llmc_defs=_llmc_defs,
 )
 
-APPS: Dict[str, AppSpec] = {a.name: a for a in (KRYLOV, LULESH, LLMC)}
+# ---- mnmg: Datalog transitive closure; dataset data_<N>.bin, N = #edges --------
+# The "size" selects the input ../MNMGDatalog-reference/data/data_<size>.bin
+# (size = edge count) and the x-axis work is that edge count. capacity_mult sizes
+# the result set (next_pow2(edges * mult); must be >= ~2x TC or the run aborts
+# with an overflow message), and iters = number of timed solve repeats. TC has no
+# task-count knob, so grain / the synchronous 1-task/loop are irrelevant here.
+_MNMG_DATA = "../MNMGDatalog-reference/data"
+_MNMG_MULT = {7035: 64, 23874: 64}     # verified small graphs (TC 146120 / 481121)
+_MNMG_MULT_DEFAULT = 4096              # generous default; raise via a larger set
+
+def _mnmg_run(variant, size, iters, cfg, grain):
+    mult = _MNMG_MULT.get(size, _MNMG_MULT_DEFAULT)
+    return [f"{_MNMG_DATA}/data_{size}.bin", str(mult), str(iters)]
+
+MNMG = AppSpec(
+    name="mnmg",
+    directory="MNMGDatalog",
+    variants=[""],
+    make_target=lambda v: "tc",
+    binary=lambda v: "./tc.x",
+    run_args=_mnmg_run,
+    parse=_parse_mnmg,
+    work=lambda n: (float(n), "edges"),
+    sizes=[7035, 23874],
+    iters=5,
+)
+
+APPS: Dict[str, AppSpec] = {a.name: a for a in (KRYLOV, LULESH, LLMC, MNMG)}

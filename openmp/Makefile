@@ -14,7 +14,7 @@
 # build it standalone via `make -C cholesky`.
 # =============================================================================
 
-APPS = krylov lulesh llmc
+APPS = krylov lulesh llmc mnmg
 
 all: $(APPS)
 
@@ -27,9 +27,13 @@ lulesh:
 llmc:
 	$(MAKE) -C llm.c all
 
+mnmg:
+	$(MAKE) -C MNMGDatalog all
+
 clean:
 	$(MAKE) -C krylov clean
 	$(MAKE) -C lulesh clean
 	$(MAKE) -C llm.c  clean
+	$(MAKE) -C MNMGDatalog clean
 
 .PHONY: all $(APPS) clean

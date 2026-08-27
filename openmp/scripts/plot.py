@@ -25,6 +25,7 @@ without magnification. Uses only matplotlib + the standard library.
 
 import argparse
 import csv
+import math
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -74,6 +75,13 @@ def median(xs):
     return xs[n // 2] if n % 2 else 0.5 * (xs[n // 2 - 1] + xs[n // 2])
 
 
+def geomean(xs):
+    xs = [x for x in xs if x is not None and x > 0]
+    if not xs:
+        return None
+    return math.exp(sum(math.log(x) for x in xs) / len(xs))
+
+
 def load_runs(path):
     """All rows (including failed ones, so coverage can be reported)."""
     with open(path, newline="") as fh:
@@ -118,6 +126,49 @@ def report_coverage(rows):
 
     return [r for r in rows if r.get("status") in OK_STATUS]
 
+def report_speedups(rows, reference):
+    """Print (to stdout) the average speedup of every configuration against the
+    reference configuration, per (app, variant). The speedup at a given size is
+    ref_time / config_time (>1 = faster than the reference); the reported value is
+    the geometric mean over the sizes the two configurations have in common."""
+    # groups[(app,variant)][config][size] = avg_ms ; keep sweep order of configs.
+    groups = defaultdict(lambda: defaultdict(dict))
+    order = defaultdict(list)
+    for r in rows:
+        if r.get("avg_ms", "") == "" or r.get("size", "") == "":
+            continue
+        v = fnum(r["avg_ms"])
+        if v is None:
+            continue
+        key = (r["app"], r.get("variant", ""))
+        c = r["config"]
+        groups[key][c][int(r["size"])] = v
+        if c not in order[key]:
+            order[key].append(c)
+
+    print(f"average speedup vs reference '{reference}' "
+          f"(geomean over sizes; >1 = faster):")
+    if not groups:
+        print("  (no plottable rows)")
+        return
+    for key in sorted(groups):
+        app, variant = key
+        name = f"{app}/{variant}" if variant else app
+        data = groups[key]
+        if reference not in data:
+            print(f"  {name}: reference '{reference}' not found "
+                  f"(available: {', '.join(order[key])})")
+            continue
+        ref = data[reference]
+        width = max(len(c) for c in order[key])
+        print(f"  {name}:")
+        for c in order[key]:
+            sp = [ref[s] / data[c][s] for s in data[c]
+                  if s in ref and data[c][s] > 0 and ref[s] > 0]
+            g = geomean(sp)
+            tag = "  (reference)" if c == reference else ""
+            cell = "   n/a" if g is None else f"{g:6.2f}x"
+            print(f"    {c:<{width}}  {cell}{tag}")
 
 def plot_time(rows, figdir, dpi, logy, fmt, show):
     import matplotlib.pyplot as plt
@@ -257,6 +308,9 @@ def main():
     ap.add_argument("--show", action="store_true",
                     help="display the figures interactively (in addition to writing them)")
     ap.add_argument("--logy", action="store_true", help="logarithmic y axis (time plot)")
+    ap.add_argument("--reference", default="", help="print (to stdout) the geomean "
+                    "speedup of every configuration vs this reference config, per app "
+                    "(e.g. --reference no-taskgraph)")
     ap.add_argument("--dpi", type=int, default=140)
     args = ap.parse_args()
 
@@ -280,6 +334,9 @@ def main():
     rows = report_coverage(allrows)
     if not any(r.get("avg_ms", "") != "" for r in rows):
         ap.error("no plottable rows (see the coverage report above)")
+
+    if args.reference:
+        report_speedups(rows, args.reference)
 
     plot_time(rows, figdir, args.dpi, args.logy, args.format, args.show)
     if cgstats_csv.exists():

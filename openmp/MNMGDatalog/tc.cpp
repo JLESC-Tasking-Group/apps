@@ -596,7 +596,7 @@ static void tc_print_csv(const char *csv, int input, int iters, u64 tc, double t
 /* ------------------------------------------------------------------------- */
 int main(int argc, char **argv)
 {
-    const char *input_file = (argc >= 2) ? argv[1] : "../MNMGDatalog-reference/data/data_10.bin";
+    const char *input_file = (argc >= 2) ? argv[1] : "./MNMGDatalog/data/data_10.bin";
     long capacity_mult  = (argc >= 3) ? atol(argv[2]) : 64;
     int  repeats        = (argc >= 4) ? atoi(argv[3]) : 1;
     long frontier_slots = (argc >= 5) ? atol(argv[4]) : 0;
@@ -618,11 +618,13 @@ int main(int argc, char **argv)
     #pragma omp parallel
     #pragma omp single
     {
+        // warmup
         tc_reset_state(ctx);
         double w0 = omp_get_wtime();
         iterations = tc_run_fixpoint(ctx);
         warm = omp_get_wtime() - w0;
 
+        // measurements
         for (int r = 0; r < repeats; r++) {
             tc_reset_state(ctx);
             double s0 = omp_get_wtime();

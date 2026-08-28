@@ -25,7 +25,7 @@
  */
 #include "spmat.h"
 #include "tasking.h"
-#include "kalloc.h"
+#include "alloc.h"
 #include "kernels.h"
 #include "driver.h"
 
@@ -60,24 +60,24 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
     tiling_init(&tl, n, T1, T2);
 
     /* Device-mapped working vectors (pinned on GPU builds). */
-    real_t *r   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *p   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *q   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* q = A*p (recurrence) */
-    real_t *Ar  = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *Mq  = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* M^-1 q            */
-    real_t *inv = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* 1/diag(A)         */
+    real_t *r   = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *p   = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *q   = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* q = A*p (recurrence) */
+    real_t *Ar  = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *Mq  = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* M^-1 q            */
+    real_t *inv = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* 1/diag(A)         */
 
     /* Device-mapped length-1 scalar buffers. */
-    real_t *rho     = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *rho_bar = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *qMq     = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *alpha   = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *beta    = (real_t *) kr_alloc(sizeof(real_t));
+    real_t *rho     = (real_t *) host_alloc(sizeof(real_t));
+    real_t *rho_bar = (real_t *) host_alloc(sizeof(real_t));
+    real_t *qMq     = (real_t *) host_alloc(sizeof(real_t));
+    real_t *alpha   = (real_t *) host_alloc(sizeof(real_t));
+    real_t *beta    = (real_t *) host_alloc(sizeof(real_t));
 
     /* Per-block partial dot sums (device-resident; the dot decomposes into T1
      * partial reductions into these + a finalize, on both backends). */
-    real_t *part_qMq = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_rho = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_qMq = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_rho = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t));
 
     /* Host init: inv_diag = 1/diag(A), x = 0, r = M b = inv_diag .* b (x0 = 0). */
     spmat_extract_diagonal(A, inv);
@@ -152,9 +152,9 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
                                       rho[0:1], rho_bar[0:1], qMq[0:1], alpha[0:1], beta[0:1],
                                       part_qMq[0:tl.NTB1], part_rho[0:tl.NTB1]))
 
-    kr_free(r); kr_free(p); kr_free(q); kr_free(Ar); kr_free(Mq); kr_free(inv);
-    kr_free(rho); kr_free(rho_bar); kr_free(qMq); kr_free(alpha); kr_free(beta);
-    kr_free(part_qMq); kr_free(part_rho);
+    host_free(r); host_free(p); host_free(q); host_free(Ar); host_free(Mq); host_free(inv);
+    host_free(rho); host_free(rho_bar); host_free(qMq); host_free(alpha); host_free(beta);
+    host_free(part_qMq); host_free(part_rho);
     st->total_s = t1 - t0;
 }
 

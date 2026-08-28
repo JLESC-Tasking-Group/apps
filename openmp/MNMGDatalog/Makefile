@@ -16,8 +16,8 @@ include ../common.mk
 
 CFLAGS += -Wall -Wextra
 
-# Datasets live in the reference checkout alongside this app.
-DATA_DIR ?= ../MNMGDatalog-reference/data
+# Datasets live in the reference checkout inside this app directory.
+DATA_DIR ?= MNMGDatalog-reference/data
 DATA     ?= $(DATA_DIR)/data_7035.bin
 MULT     ?= 64
 REPEATS  ?= 5
@@ -26,8 +26,8 @@ program = tc.x
 
 all: tc
 
-tc: tc.cpp ../tasking.h
-	$(CC) $(CFLAGS) tc.cpp -o $(program) $(LDFLAGS)
+tc: tc.cpp ../tasking.h ../alloc.h ../alloc.c
+	$(CC) $(CFLAGS) tc.cpp ../alloc.c -o $(program) $(LDFLAGS)
 
 # data_7035.bin -> TC=146120 in 64 iterations (see the reference README).
 test: tc

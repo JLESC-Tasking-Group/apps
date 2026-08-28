@@ -27,7 +27,7 @@
  */
 #include "spmat.h"
 #include "tasking.h"
-#include "kalloc.h"
+#include "alloc.h"
 #include "kernels.h"
 #include "driver.h"
 
@@ -62,23 +62,23 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
     tiling_init(&tl, n, T1, T2);
 
     /* Device-mapped working vectors (pinned on GPU builds). */
-    real_t *r   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *p   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *Ap  = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *z   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *inv = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* 1/diag(A) */
+    real_t *r   = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *p   = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *Ap  = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *z   = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *inv = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* 1/diag(A) */
 
     /* Device-mapped length-1 scalar buffers. */
-    real_t *gamma = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *g_new = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *pAp   = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *alpha = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *beta  = (real_t *) kr_alloc(sizeof(real_t));
+    real_t *gamma = (real_t *) host_alloc(sizeof(real_t));
+    real_t *g_new = (real_t *) host_alloc(sizeof(real_t));
+    real_t *pAp   = (real_t *) host_alloc(sizeof(real_t));
+    real_t *alpha = (real_t *) host_alloc(sizeof(real_t));
+    real_t *beta  = (real_t *) host_alloc(sizeof(real_t));
 
     /* Per-block partial dot sums (device-resident: the dot decomposes into T1
      * partial reductions into these + a finalize, on both backends). */
-    real_t *part1 = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t)); /* <p,Ap> */
-    real_t *part2 = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t)); /* <r,z>  */
+    real_t *part1 = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t)); /* <p,Ap> */
+    real_t *part2 = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t)); /* <r,z>  */
 
     /* Host initialization: inv_diag = 1/diag(A), x = 0, r = b (since x0 = 0). */
     spmat_extract_diagonal(A, inv);
@@ -156,9 +156,9 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
                                       p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1],
                                       part1[0:tl.NTB1], part2[0:tl.NTB1]))
 
-    kr_free(r); kr_free(p); kr_free(Ap); kr_free(z); kr_free(inv);
-    kr_free(gamma); kr_free(g_new); kr_free(pAp); kr_free(alpha); kr_free(beta);
-    kr_free(part1); kr_free(part2);
+    host_free(r); host_free(p); host_free(Ap); host_free(z); host_free(inv);
+    host_free(gamma); host_free(g_new); host_free(pAp); host_free(alpha); host_free(beta);
+    host_free(part1); host_free(part2);
     st->total_s = t1 - t0;
 }
 

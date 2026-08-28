@@ -771,20 +771,11 @@ void CalcElemVelocityGradient(
 
 /******************************************/
 
-# if ALLOC_OMP
-omp_allocator_handle_t allocator;
-# endif
-
 int main(int argc, char *argv[])
 {
-  # if ALLOC_OMP
-  omp_alloctrait_t traits[2] = {omp_atk_pinned, omp_atk_pin_device};
-  allocator = omp_init_allocator(omp_default_mem_space, 2, traits);
-  if (allocator == omp_null_allocator) {
-      fprintf(stderr, "Failed to initialize allocator\n");
-      return 1;
-  }
-  # endif
+  /* The pinned host allocator is now the shared ../alloc.c (host_alloc/
+   * host_free), which creates its OpenMP allocator lazily on first use -- no
+   * per-app omp_init_allocator/omp_destroy_allocator handling here. */
 
   power_init();
 
@@ -2815,10 +2806,6 @@ OMP_TARGET_ENTER_DATA( \
   free(iter_times);
 
   power_deinit();
-
-  # if ALLOC_OMP
-  omp_destroy_allocator(allocator);
-  # endif
 
   return 0 ;
 }

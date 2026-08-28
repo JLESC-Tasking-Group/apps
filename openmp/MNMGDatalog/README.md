@@ -1,6 +1,6 @@
 # MNMGDatalog TC - OpenMP target-task port
 
-An OpenMP port of `../MNMGDatalog-reference/tc_benchmark` (CUDA). It computes the
+An OpenMP port of `MNMGDatalog-reference/tc_benchmark` (CUDA). It computes the
 Datalog-style semi-naive **Transitive Closure** fixpoint
 
 ```
@@ -30,19 +30,32 @@ has no conditional-node support yet. The remaining toggles are orthogonal:
 - `USE_SYNC=1` synchronous blocking schedule (each kernel runs to completion).
 
 The per-iteration body `reset -> expand -> promote -> set_sizes` is wrapped in
-`TASKGRAPH_BEGIN/END`; the host copies `new_count` back after each round (a
-`taskwait` + a device->host read) to test convergence -- the same host round-trip
-the CUDA `v2_cudagraph` pays. Eliminating that round-trip is what `v3_conditional`
-would do on the GPU.
+`TASKGRAPH_BEGIN/END` together with a `k_writeback` async D2H of `new_count`; the
+host then tests convergence on that (pinned) host scalar after a `taskwait` -- the
+same host round-trip the CUDA `v2_cudagraph` pays. Eliminating that round-trip is
+what `v3_conditional` would do on the GPU.
 
 ## Design notes
 
 - **Device memory:** the large buffers (`edges`, `edge_table`, `result_set`, the
   two frontiers) are device-only via `omp_target_alloc`, reached through
   `is_device_ptr(...)` -- the direct analog of the reference's `cudaMalloc`, with
-  no host mirror of the (possibly multi-GB) result set. Small scalars are read
-  back with `omp_target_memcpy`. On the CPU backend the same pointers are `malloc`
-  and the kernels become host tasks.
+  no host mirror of the (possibly multi-GB) result set. On the CPU backend the
+  same pointers are `malloc` and the kernels become host tasks.
+- **`new_count` is the exception:** it is the one scalar the host reads *every*
+  iteration, so it is pinned host memory from the shared allocator
+  (`../alloc.h`, `host_alloc`/`host_free`) with a device copy created by
+  `map(alloc:)` and reached from the kernels with `map(present:)` -- exactly how
+  the Krylov solvers handle their scalars. `k_writeback` refreshes the host side
+  with an `omp target update from(...) nowait` recorded *inside* the taskgraph, so
+  the timed loop contains no blocking `omp_target_memcpy`. The remaining scalars
+  (`frontier_size`, `result_count`, `overflow`) stay device-only and are read once
+  after the fixpoint.
+- **The `taskwait` after `TASKGRAPH_END` is required.** Under `USE_TASKGRAPH=1`
+  the region is already effectively blocking (xkomp does an implicit taskwait
+  while recording, and replay is synchronous), so it is free; but with
+  `USE_TASKGRAPH=0` the macros vanish and the `nowait` tasks would still be in
+  flight, so without it the loop would read a stale `new_count` and stop early.
 - **Atomics:** the open-addressing result set and edge table are built with a
   compare-and-swap (`#pragma omp atomic compare capture`, OpenMP 5.1); the append
   counters use fetch-add (`#pragma omp atomic capture`). One portable code path

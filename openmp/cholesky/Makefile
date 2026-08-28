@@ -21,6 +21,10 @@ CC = xkcxx -DUSE_XKOMP=1
 
 # ---- Common flags (edit me) ----------------------------------------------
 CFLAGS  =
+# -I.. resolves the shared apps/openmp/alloc.h (the pinned host allocator that
+# used to be cholesky's local kalloc.{c,h}). Cholesky keeps its OWN tasking.h:
+# a quoted include searches main.c's directory first, so the local copy wins.
+CFLAGS += -I..
 CFLAGS += -fopenmp -fopenmp-version=60
 CFLAGS += -O3
 #CFLAGS += -ffast-math
@@ -54,7 +58,7 @@ LDFLAGS += -lm
 ##CFLAGS += -foffload-lto
 #LDFLAGS += -lcudart
 
-# Pinned host-memory backend for the mapped matrix (see kalloc.h). The default
+# Pinned host-memory backend for the mapped matrix (see ../alloc.h). The default
 # (nothing set) uses the OpenMP pinned allocator (omp_alloc); pick a vendor path
 # for an explicit one:
 #CFLAGS  += -DALLOC_CUDA                    # cudaMallocHost (uses -lcudart above)
@@ -62,8 +66,8 @@ LDFLAGS += -lm
 #LDFLAGS += -lamdhip64                      # ... its runtime lib, for ALLOC_HIP
 
 # ---- Sources --------------------------------------------------------------
-SRC = main.c kalloc.c
-HDR = tasking.h kalloc.h kernels.h
+SRC = main.c ../alloc.c
+HDR = tasking.h ../alloc.h kernels.h
 
 cholesky: $(SRC) $(HDR)
 	$(CC) $(CFLAGS) $(SRC) -o cholesky $(LDFLAGS)

@@ -22,7 +22,7 @@
  */
 #include "spmat.h"
 #include "tasking.h"
-#include "kalloc.h"
+#include "alloc.h"
 #include "kernels.h"
 #include "driver.h"
 
@@ -57,34 +57,34 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
     tiling_init(&tl, n, T1, T2);
 
     /* Device-mapped working vectors (pinned on GPU builds). */
-    real_t *r   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *c   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* shadow residual r0 */
-    real_t *p   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *q   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* A p                */
-    real_t *v   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* M q                */
-    real_t *s   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *d   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* A s                */
-    real_t *t   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* M d                */
-    real_t *inv = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* 1/diag(A)          */
+    real_t *r   = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *c   = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* shadow residual r0 */
+    real_t *p   = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *q   = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* A p                */
+    real_t *v   = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* M q                */
+    real_t *s   = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *d   = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* A s                */
+    real_t *t   = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* M d                */
+    real_t *inv = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* 1/diag(A)          */
 
     /* Device-mapped length-1 scalar buffers. */
-    real_t *rho      = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *next_rho = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *cv       = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *ts       = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *tt       = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *alpha    = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *omega    = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *beta     = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *rr       = (real_t *) kr_alloc(sizeof(real_t)); /* <r,r> for the residual */
+    real_t *rho      = (real_t *) host_alloc(sizeof(real_t));
+    real_t *next_rho = (real_t *) host_alloc(sizeof(real_t));
+    real_t *cv       = (real_t *) host_alloc(sizeof(real_t));
+    real_t *ts       = (real_t *) host_alloc(sizeof(real_t));
+    real_t *tt       = (real_t *) host_alloc(sizeof(real_t));
+    real_t *alpha    = (real_t *) host_alloc(sizeof(real_t));
+    real_t *omega    = (real_t *) host_alloc(sizeof(real_t));
+    real_t *beta     = (real_t *) host_alloc(sizeof(real_t));
+    real_t *rr       = (real_t *) host_alloc(sizeof(real_t)); /* <r,r> for the residual */
 
     /* Per-block partial dot sums (device-resident; the dot decomposes into T1
      * partial reductions into these + a finalize, on both backends). */
-    real_t *part_cv = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_ts = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_tt = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_nr = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_rr = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_cv = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_ts = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_tt = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_nr = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_rr = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t));
 
     /* Host init: inv_diag = 1/diag(A), x = 0, r = b (true residual, x0 = 0). */
     spmat_extract_diagonal(A, inv);
@@ -178,11 +178,11 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
                                       part_cv[0:tl.NTB1], part_ts[0:tl.NTB1], part_tt[0:tl.NTB1],
                                       part_nr[0:tl.NTB1], part_rr[0:tl.NTB1]))
 
-    kr_free(r); kr_free(c); kr_free(p); kr_free(q); kr_free(v);
-    kr_free(s); kr_free(d); kr_free(t); kr_free(inv);
-    kr_free(rho); kr_free(next_rho); kr_free(cv); kr_free(ts); kr_free(tt);
-    kr_free(alpha); kr_free(omega); kr_free(beta); kr_free(rr);
-    kr_free(part_cv); kr_free(part_ts); kr_free(part_tt); kr_free(part_nr); kr_free(part_rr);
+    host_free(r); host_free(c); host_free(p); host_free(q); host_free(v);
+    host_free(s); host_free(d); host_free(t); host_free(inv);
+    host_free(rho); host_free(next_rho); host_free(cv); host_free(ts); host_free(tt);
+    host_free(alpha); host_free(omega); host_free(beta); host_free(rr);
+    host_free(part_cv); host_free(part_ts); host_free(part_tt); host_free(part_nr); host_free(part_rr);
     st->total_s = t1 - t0;
 }
 

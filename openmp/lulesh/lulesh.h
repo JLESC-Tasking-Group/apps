@@ -6,13 +6,9 @@
 #include <set>
 #include <omp.h>
 
-# ifdef ALLOC_CUDA
-#include <cuda.h>
-#include <cuda_runtime.h>
-# elif ALLOC_HIP
-#define __HIP_PLATFORM_AMD__
-#include <hip/hip_runtime.h>
-# endif
+/* Shared pinned host allocator (host_alloc/host_free); the per-backend
+ * cudaMallocHost / hipHostMalloc / omp_alloc selection now lives there. */
+#include "alloc.h"
 
 //**************************************************
 // Allow flexibility for arithmetic representations
@@ -101,41 +97,21 @@ void Release(T **ptr)
   }
 }
 
-# if ALLOC_OMP
-extern omp_allocator_handle_t allocator;
-# endif
-
+/* Device-mapped buffers go through the shared host allocator (../alloc.c):
+ * pinned host memory on a GPU build (cudaMallocHost / hipHostMalloc / omp_alloc
+ * with omp_atk_pinned, per -DALLOC_CUDA / -DALLOC_HIP / default), plain malloc
+ * on a CPU build. */
 template <typename T>
 T *AllocateForTarget(size_t size)
 {
-    # if ALLOC_OMP
-    return (T *) omp_alloc(sizeof(T) * size, allocator);
-    # elif ALLOC_HIP
-    T * p;
-    int r = (int) hipHostMalloc(&p, sizeof(T) * size, hipHostMallocDefault);
-    return p;
-    # elif ALLOC_CUDA
-    T * p;
-    cudaMallocHost(&p, sizeof(T) * size);
-    return p;
-    # else
-    return (T *)malloc(sizeof(T) * size);
-    # endif
+    return (T *) host_alloc(sizeof(T) * size);
 }
 
 template <typename T>
 void ReleaseForTarget(T **ptr)
 {
     if (ptr && *ptr) {
-        # if ALLOC_OMP
-        omp_free(*ptr, allocator);
-        # elif ALLOC_HIP
-        int r = (int) hipHostFree(*ptr);
-        # elif ALLOC_CUDA
-        cudaFreeHost(*ptr);
-        # else
-        free(*ptr);
-        # endif
+        host_free(*ptr);
         *ptr = NULL ;
     }
 }

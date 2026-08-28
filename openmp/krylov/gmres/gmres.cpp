@@ -25,7 +25,7 @@
  */
 #include "spmat.h"
 #include "tasking.h"
-#include "kalloc.h"
+#include "alloc.h"
 #include "kernels.h"
 #include "driver.h"
 
@@ -111,22 +111,22 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     tiling_init(&tl, n, T1, T2);
 
     /* Device-mapped vectors: basis V[0..m], plus work vectors. */
-    real_t *Vd  = (real_t *) kr_alloc((size_t)(m + 1) * (size_t) n * sizeof(real_t));
-    real_t *w   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* A v (SpMV output)  */
-    real_t *q   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* M w, MGS work      */
-    real_t *res = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* b - A x            */
-    real_t *bd  = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* device copy of b   */
-    real_t *inv = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* 1/diag(A)          */
+    real_t *Vd  = (real_t *) host_alloc((size_t)(m + 1) * (size_t) n * sizeof(real_t));
+    real_t *w   = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* A v (SpMV output)  */
+    real_t *q   = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* M w, MGS work      */
+    real_t *res = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* b - A x            */
+    real_t *bd  = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* device copy of b   */
+    real_t *inv = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* 1/diag(A)          */
 
     /* Device-mapped scalars and small arrays. */
-    real_t *H     = (real_t *) kr_alloc((size_t) ld * (size_t) m * sizeof(real_t)); /* Hessenberg */
-    real_t *y     = (real_t *) kr_alloc((size_t) m * sizeof(real_t));               /* LS solution */
-    real_t *one   = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *beta  = (real_t *) kr_alloc(sizeof(real_t)); /* ||r0|| (also <q,q> then sqrt) */
-    real_t *ibeta = (real_t *) kr_alloc(sizeof(real_t)); /* 1/beta  */
-    real_t *hh    = (real_t *) kr_alloc(sizeof(real_t)); /* <q,q>   */
-    real_t *ih    = (real_t *) kr_alloc(sizeof(real_t)); /* 1/||q|| */
-    real_t *part  = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t)); /* per-block dot partials (device-resident) */
+    real_t *H     = (real_t *) host_alloc((size_t) ld * (size_t) m * sizeof(real_t)); /* Hessenberg */
+    real_t *y     = (real_t *) host_alloc((size_t) m * sizeof(real_t));               /* LS solution */
+    real_t *one   = (real_t *) host_alloc(sizeof(real_t));
+    real_t *beta  = (real_t *) host_alloc(sizeof(real_t)); /* ||r0|| (also <q,q> then sqrt) */
+    real_t *ibeta = (real_t *) host_alloc(sizeof(real_t)); /* 1/beta  */
+    real_t *hh    = (real_t *) host_alloc(sizeof(real_t)); /* <q,q>   */
+    real_t *ih    = (real_t *) host_alloc(sizeof(real_t)); /* 1/||q|| */
+    real_t *part  = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t)); /* per-block dot partials (device-resident) */
     real_t *Hhost = (real_t *) malloc((size_t) ld * (size_t) m * sizeof(real_t)); /* host H (least-squares) */
 
     /* Host init: inv_diag, x = 0, b on device, H = 0, one = 1. */
@@ -230,9 +230,9 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                                       one[0:1], beta[0:1], ibeta[0:1], hh[0:1], ih[0:1],
                                       part[0:tl.NTB1]))
 
-    kr_free(Vd); kr_free(w); kr_free(q); kr_free(res); kr_free(bd); kr_free(inv);
-    kr_free(H); kr_free(y); kr_free(one); kr_free(beta); kr_free(ibeta); kr_free(hh); kr_free(ih);
-    kr_free(part); free(Hhost);
+    host_free(Vd); host_free(w); host_free(q); host_free(res); host_free(bd); host_free(inv);
+    host_free(H); host_free(y); host_free(one); host_free(beta); host_free(ibeta); host_free(hh); host_free(ih);
+    host_free(part); free(Hhost);
     st->total_s = t1 - t0;
 }
 

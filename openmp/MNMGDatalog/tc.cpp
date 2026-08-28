@@ -7,9 +7,10 @@
  *     path(a, c) :- path(a, b), edge(b, c).
  *
  * over fixed pre-allocated device buffers, with all per-iteration SIZES resident
- * in device memory (d_frontier_size / d_new_count). The kernels read those sizes
- * on the device at launch, so the per-iteration kernel sequence is byte-identical
- * every round -- which is exactly what lets one recorded task graph be replayed.
+ * in device memory (d_frontier_size / the device copy of new_count). The kernels
+ * read those sizes on the device at launch, so the per-iteration kernel sequence
+ * is byte-identical every round -- which is exactly what lets one recorded task
+ * graph be replayed.
  *
  * One source, several backends, chosen at compile time by the shared toggles in
  * ../tasking.h (see ../common.mk). The two CUDA "versions" map to toggles:
@@ -20,7 +21,7 @@
  *     USE_TASKGRAPH == 1  ->  "cudagraph" (CUDA v2_cudagraph): the loop-invariant
  *                             per-iteration kernel sequence is recorded once with
  *                             TASKGRAPH_BEGIN/END and replayed each iteration; the
- *                             host still copies new_count back to test convergence.
+ *                             host still reads new_count back to test convergence.
  *
  * USE_TARGET selects GPU offload (1) vs host CPU tasks (0); USE_SYNC selects a
  * blocking (synchronous) schedule. v3_conditional (on-GPU conditional loop) is
@@ -29,8 +30,12 @@
  * Memory model: the large buffers are device-only (omp_target_alloc) and every
  * target construct reaches them via is_device_ptr(...) -- the direct analog of
  * the reference's cudaMalloc, with no host mirror of the (possibly multi-GB)
- * result set. Small scalars are read back with omp_target_memcpy. On the CPU
- * backend the same pointers are plain malloc and the kernels become host tasks.
+ * result set. The ONE exception is new_count, the scalar the host must read every
+ * iteration: it is pinned host memory (shared ../alloc.h host_alloc) mapped with
+ * map(alloc:)/map(present:) like the Krylov scalars, refreshed by an in-graph
+ * async D2H (k_writeback). The remaining scalars are only read once, after the
+ * fixpoint, via omp_target_memcpy. On the CPU backend every pointer is plain
+ * host memory and the kernels become host tasks.
  *
  * Atomics: the open-addressing hash set / edge table are built with a
  * compare-and-swap (#pragma omp atomic compare capture, OpenMP 5.1) and the
@@ -39,6 +44,7 @@
  * codegen must be confirmed on your XKOMP/clang + NVPTX toolchain.
  */
 #include "tasking.h"
+#include "alloc.h"
 
 #include <omp.h>
 #include <cstdio>
@@ -273,7 +279,13 @@ struct TCContext {
     int  frontier_cap   = 0;
 
     int *d_frontier_size = nullptr;
-    int *d_new_count     = nullptr;
+    /* new_count is the ONE scalar the host reads every iteration (the fixpoint
+     * convergence test), so unlike the other buffers it is pinned HOST memory
+     * (host_alloc) mapped onto the device with map(alloc:)/map(present:), as the
+     * Krylov solvers do for their scalars. k_writeback then refreshes the host
+     * copy with an in-graph async D2H, so no blocking omp_target_memcpy is
+     * needed inside the timed loop. */
+    int *new_count       = nullptr;
     u64 *d_result_count  = nullptr;
     int *d_overflow      = nullptr;
 
@@ -342,9 +354,9 @@ static void compact(TCContext &ctx, u64 *out, u64 *out_count)
 /* ------------------------------------------------------------------------- */
 static void k_reset(TCContext &ctx)
 {
-    int *nc = ctx.d_new_count;
+    int *nc = ctx.new_count;
 #if USE_TARGET
-    OMP_TARGET_TASK(DEPEND(out, nc[0]) is_device_ptr(nc))
+    OMP_TARGET_TASK(DEPEND(out, nc[0]) MAP(present: nc[0:1]))
     { nc[0] = 0; }
 #else
     OMP_TASK(DEFAULT_NONE firstprivate(nc) DEPEND(out, nc[0]))
@@ -358,12 +370,13 @@ static void k_expand(TCContext &ctx)
     u64 *fr = ctx.d_frontier; int *fs = ctx.d_frontier_size;
     u64 *rs = ctx.d_result_set; long rc = ctx.result_cap;
     u64 *nf = ctx.d_new_frontier; int nfc = ctx.frontier_cap;
-    int *ncnt = ctx.d_new_count; u64 *rcnt = ctx.d_result_count; int *ov = ctx.d_overflow;
-    /* GPU: is_device_ptr (mp slot) carries the device buffers; CPU: default(none)
-     * firstprivate (fp slot) captures the pointers/scalars. Bound fs[0] is read on
-     * the device each launch, so replay uses the current frontier size. */
+    int *ncnt = ctx.new_count; u64 *rcnt = ctx.d_result_count; int *ov = ctx.d_overflow;
+    /* GPU: is_device_ptr (mp slot) carries the device-only buffers and
+     * map(present:) the pinned-host new_count; CPU: default(none) firstprivate
+     * (fp slot) captures the pointers/scalars. Bound fs[0] is read on the device
+     * each launch, so replay uses the current frontier size. */
     OMP_TILE(DEPEND(in, fs[0], fr[0]) DEPEND(inout, rs[0], ncnt[0], rcnt[0], ov[0]) DEPEND(out, nf[0]),
-             is_device_ptr(et, fr, fs, rs, nf, ncnt, rcnt, ov),
+             is_device_ptr(et, fr, fs, rs, nf, rcnt, ov) MAP(present: ncnt[0:1]),
              DEFAULT_NONE firstprivate(et, ec, fr, fs, rs, rc, nf, nfc, ncnt, rcnt, ov))
     for (int i = 0; i < fs[0]; i++)
         tc_expand_one(i, et, ec, fr, rs, rc, nf, nfc, ncnt, rcnt, ov);
@@ -371,18 +384,18 @@ static void k_expand(TCContext &ctx)
 
 static void k_promote(TCContext &ctx)
 {
-    u64 *fr = ctx.d_frontier; u64 *nf = ctx.d_new_frontier; int *nc = ctx.d_new_count;
+    u64 *fr = ctx.d_frontier; u64 *nf = ctx.d_new_frontier; int *nc = ctx.new_count;
     OMP_TILE(DEPEND(in, nc[0], nf[0]) DEPEND(out, fr[0]),
-             is_device_ptr(fr, nf, nc),
+             is_device_ptr(fr, nf) MAP(present: nc[0:1]),
              DEFAULT_NONE firstprivate(fr, nf, nc))
     for (int i = 0; i < nc[0]; i++) fr[i] = nf[i];
 }
 
 static void k_set_sizes(TCContext &ctx)
 {
-    int *fs = ctx.d_frontier_size; int *nc = ctx.d_new_count;
+    int *fs = ctx.d_frontier_size; int *nc = ctx.new_count;
 #if USE_TARGET
-    OMP_TARGET_TASK(DEPEND(in, nc[0]) DEPEND(out, fs[0]) is_device_ptr(fs, nc))
+    OMP_TARGET_TASK(DEPEND(in, nc[0]) DEPEND(out, fs[0]) is_device_ptr(fs) MAP(present: nc[0:1]))
     { fs[0] = nc[0]; }
 #else
     OMP_TASK(DEFAULT_NONE firstprivate(fs, nc) DEPEND(in, nc[0]) DEPEND(out, fs[0]))
@@ -390,29 +403,50 @@ static void k_set_sizes(TCContext &ctx)
 #endif
 }
 
+/* Refresh the HOST copy of new_count so the fixpoint loop can test convergence.
+ * This is an async D2H recorded INSIDE the taskgraph (depend-ordered after the
+ * kernels that update it), i.e. one more replayed command -- the same shape as
+ * the Krylov residual read-back (cg.cpp) and xkomp's taskgraph_dot_target test.
+ * On the host backend it vanishes: new_count already IS the host memory. */
+static void k_writeback(TCContext &ctx)
+{
+    int *nc = ctx.new_count;
+    OMP_TARGET_UPDATE(from(nc[0:1]) NOWAIT DEPEND(in, nc[0]))
+}
+
 /* One full fixpoint solve; returns the number of rounds. MUST be called from
  * inside a single region (see the enclosing `omp parallel/single` in main): the
  * warm-up and every timed repeat share that one region so the per-iteration body
  * (reset -> expand -> promote -> set_sizes) is recorded once (first round of the
  * warm-up) and REPLAYED for every subsequent round of every repeat -- the direct
- * analog of CUDA v2_cudagraph's build-once / replay. After each round the host
- * copies new_count back (a taskwait, then a device->host read) to test
- * convergence -- the same host round-trip the CUDA v2_cudagraph pays. */
+ * analog of CUDA v2_cudagraph's build-once / replay. Convergence is tested on
+ * the pinned-host new_count, refreshed by k_writeback's in-graph async D2H --
+ * the same host round-trip the CUDA v2_cudagraph pays, minus the blocking copy.
+ *
+ * The taskwait is required: it is what makes new_count[0] complete before the
+ * host reads it. Under USE_TASKGRAPH the region is already effectively blocking
+ * (xkomp_taskgraph_end does an implicit taskwait while recording, and replay is
+ * synchronous), so it costs nothing there; but with USE_TASKGRAPH=0 the
+ * TASKGRAPH_BEGIN/END macros vanish and the nowait tasks would still be in
+ * flight, so without it the loop would read a stale count and stop early. */
 static int tc_run_fixpoint(TCContext &ctx)
 {
     int iterations = 0;
-    while (true) {
+    int *nc = ctx.new_count;
+    nc[0] = 1;                      /* prime: enter the loop (host copy only) */
+    for (iterations = 0; nc[0] > 0; ++iterations)
+    {
         TASKGRAPH_BEGIN
         {
             k_reset(ctx);
             k_expand(ctx);
             k_promote(ctx);
             k_set_sizes(ctx);
+            k_writeback(ctx);
         }
         TASKGRAPH_END
 
-        iterations++;
-        if (tc_read_i32(ctx.d_new_count) == 0) break;
+        #pragma omp taskwait
     }
     return iterations;
 }
@@ -504,9 +538,16 @@ static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
     ctx.d_frontier      = (u64 *)dalloc((size_t)ctx.frontier_cap * sizeof(u64));
     ctx.d_new_frontier  = (u64 *)dalloc((size_t)ctx.frontier_cap * sizeof(u64));
     ctx.d_frontier_size = (int *)dalloc(sizeof(int));
-    ctx.d_new_count     = (int *)dalloc(sizeof(int));
     ctx.d_result_count  = (u64 *)dalloc(sizeof(u64));
     ctx.d_overflow      = (int *)dalloc(sizeof(int));
+
+    /* new_count: pinned host memory (shared ../alloc.c) with a device copy
+     * created here, so the kernels reach it with map(present:) and k_writeback
+     * can refresh the host side with an in-graph async D2H. */
+    ctx.new_count = (int *)host_alloc(sizeof(int));
+    int *new_count = ctx.new_count;
+    new_count[0] = 0;
+    OMP_TARGET_ENTER_DATA(MAP(alloc: new_count[0:1]))
     ctx.t_setup = tc_now() - t0;
 
     ctx.peak_mem_mb = (double)((size_t)ctx.n_edges * 2 * sizeof(int)
@@ -523,9 +564,10 @@ static void tc_reset_state(TCContext &ctx)
     int z = 0; u64 z64 = 0;
     dmemset(ctx.d_result_set, 0xFF, ctx.result_cap * sizeof(u64));
     to_dev(ctx.d_frontier_size, &z, sizeof(int));
-    to_dev(ctx.d_new_count,     &z, sizeof(int));
     to_dev(ctx.d_result_count,  &z64, sizeof(u64));
     to_dev(ctx.d_overflow,      &z, sizeof(int));
+    /* new_count needs no reset here: k_reset zeroes the device copy at the top
+     * of every fixpoint round, and tc_run_fixpoint primes the host copy. */
     init_base(ctx);
 }
 
@@ -544,8 +586,15 @@ static void tc_teardown(TCContext &ctx)
 {
     dfree(ctx.d_edges);       dfree(ctx.d_edge_table);   dfree(ctx.d_result_set);
     dfree(ctx.d_frontier);    dfree(ctx.d_new_frontier);
-    dfree(ctx.d_frontier_size); dfree(ctx.d_new_count);
+    dfree(ctx.d_frontier_size);
     dfree(ctx.d_result_count);  dfree(ctx.d_overflow);
+
+    int *new_count = ctx.new_count;
+    if (new_count) {
+        OMP_TARGET_EXIT_DATA(MAP(release: new_count[0:1]))
+        host_free(new_count);
+        ctx.new_count = nullptr;
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -596,7 +645,7 @@ static void tc_print_csv(const char *csv, int input, int iters, u64 tc, double t
 /* ------------------------------------------------------------------------- */
 int main(int argc, char **argv)
 {
-    const char *input_file = (argc >= 2) ? argv[1] : "./MNMGDatalog/data/data_10.bin";
+    const char *input_file = (argc >= 2) ? argv[1] : "MNMGDatalog-reference/data/data_10.bin";
     long capacity_mult  = (argc >= 3) ? atol(argv[2]) : 64;
     int  repeats        = (argc >= 4) ? atoi(argv[3]) : 1;
     long frontier_slots = (argc >= 5) ? atol(argv[4]) : 0;

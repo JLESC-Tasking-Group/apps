@@ -228,12 +228,12 @@ LLMC = AppSpec(
 )
 
 # ---- mnmg: Datalog transitive closure; dataset data_<N>.bin, N = #edges --------
-# The "size" selects the input ../MNMGDatalog-reference/data/data_<size>.bin
+# The "size" selects the input MNMGDatalog-reference/data/data_<size>.bin
 # (size = edge count) and the x-axis work is that edge count. capacity_mult sizes
 # the result set (next_pow2(edges * mult); must be >= ~2x TC or the run aborts
 # with an overflow message), and iters = number of timed solve repeats. TC has no
 # task-count knob, so grain / the synchronous 1-task/loop are irrelevant here.
-_MNMG_DATA = "../MNMGDatalog-reference/data"
+_MNMG_DATA = "MNMGDatalog-reference/data"
 _MNMG_MULT = {7035: 64, 23874: 64}     # verified small graphs (TC 146120 / 481121)
 _MNMG_MULT_DEFAULT = 4096              # generous default; raise via a larger set
 

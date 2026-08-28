@@ -19,7 +19,7 @@
  */
 #include "spmat.h"
 #include "tasking.h"
-#include "kalloc.h"
+#include "alloc.h"
 #include "kernels.h"
 #include "driver.h"
 
@@ -55,38 +55,38 @@ static void minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     tiling_init(&tl, n, T1, T2);
 
     /* Device-mapped vectors. */
-    real_t *v    = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* Lanczos vector (M^-1 r2) */
-    real_t *Av   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* A v (SpMV output)        */
-    real_t *y    = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* working Lanczos residual */
-    real_t *r1   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *r2   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *wcur = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* w_k                      */
-    real_t *wm1  = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* w_{k-1}                  */
-    real_t *wm2  = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* w_{k-2}                  */
-    real_t *inv  = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* 1/diag(A)                */
+    real_t *v    = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* Lanczos vector (M^-1 r2) */
+    real_t *Av   = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* A v (SpMV output)        */
+    real_t *y    = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* working Lanczos residual */
+    real_t *r1   = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *r2   = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *wcur = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* w_k                      */
+    real_t *wm1  = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* w_{k-1}                  */
+    real_t *wm2  = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* w_{k-2}                  */
+    real_t *inv  = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* 1/diag(A)                */
 
     /* Device-mapped scalars: persistent Lanczos/Givens state + per-iter temps. */
-    real_t *beta      = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *oldb      = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *dbar      = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *eps       = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *cs        = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *sn        = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *phibar    = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *inv_beta  = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *bob       = (real_t *) kr_alloc(sizeof(real_t)); /* beta/oldbeta */
-    real_t *vy        = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *alpha     = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *delta     = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *aob       = (real_t *) kr_alloc(sizeof(real_t)); /* alpha/beta */
-    real_t *r2v       = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *phi       = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *gamma_inv = (real_t *) kr_alloc(sizeof(real_t));
+    real_t *beta      = (real_t *) host_alloc(sizeof(real_t));
+    real_t *oldb      = (real_t *) host_alloc(sizeof(real_t));
+    real_t *dbar      = (real_t *) host_alloc(sizeof(real_t));
+    real_t *eps       = (real_t *) host_alloc(sizeof(real_t));
+    real_t *cs        = (real_t *) host_alloc(sizeof(real_t));
+    real_t *sn        = (real_t *) host_alloc(sizeof(real_t));
+    real_t *phibar    = (real_t *) host_alloc(sizeof(real_t));
+    real_t *inv_beta  = (real_t *) host_alloc(sizeof(real_t));
+    real_t *bob       = (real_t *) host_alloc(sizeof(real_t)); /* beta/oldbeta */
+    real_t *vy        = (real_t *) host_alloc(sizeof(real_t));
+    real_t *alpha     = (real_t *) host_alloc(sizeof(real_t));
+    real_t *delta     = (real_t *) host_alloc(sizeof(real_t));
+    real_t *aob       = (real_t *) host_alloc(sizeof(real_t)); /* alpha/beta */
+    real_t *r2v       = (real_t *) host_alloc(sizeof(real_t));
+    real_t *phi       = (real_t *) host_alloc(sizeof(real_t));
+    real_t *gamma_inv = (real_t *) host_alloc(sizeof(real_t));
 
     /* Per-block partial dot sums (device-resident; the dot decomposes into T1
      * partial reductions into these + a finalize, on both backends). */
-    real_t *part_vy  = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_r2v = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_vy  = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_r2v = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t));
 
     /* Host init: inv_diag, x = 0, r1 = r2 = b, v = M^-1 b = inv .* b, w's = 0. */
     spmat_extract_diagonal(A, inv);
@@ -244,12 +244,12 @@ static void minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                                       r2v[0:1], phi[0:1], gamma_inv[0:1],
                                       part_vy[0:tl.NTB1], part_r2v[0:tl.NTB1]))
 
-    kr_free(v); kr_free(Av); kr_free(y); kr_free(r1); kr_free(r2);
-    kr_free(wcur); kr_free(wm1); kr_free(wm2); kr_free(inv);
-    kr_free(beta); kr_free(oldb); kr_free(dbar); kr_free(eps); kr_free(cs); kr_free(sn); kr_free(phibar);
-    kr_free(inv_beta); kr_free(bob); kr_free(vy); kr_free(alpha); kr_free(delta); kr_free(aob);
-    kr_free(r2v); kr_free(phi); kr_free(gamma_inv);
-    kr_free(part_vy); kr_free(part_r2v);
+    host_free(v); host_free(Av); host_free(y); host_free(r1); host_free(r2);
+    host_free(wcur); host_free(wm1); host_free(wm2); host_free(inv);
+    host_free(beta); host_free(oldb); host_free(dbar); host_free(eps); host_free(cs); host_free(sn); host_free(phibar);
+    host_free(inv_beta); host_free(bob); host_free(vy); host_free(alpha); host_free(delta); host_free(aob);
+    host_free(r2v); host_free(phi); host_free(gamma_inv);
+    host_free(part_vy); host_free(part_r2v);
     st->total_s = t1 - t0;
 }
 

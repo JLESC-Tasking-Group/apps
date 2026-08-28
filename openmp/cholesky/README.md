@@ -17,7 +17,8 @@ record and replay. It is kept as a standalone tasks/target benchmark; the `reps`
 argument simply re-runs the factorization to average the timing.
 
 Files: `main.c` (driver + DAG), `kernels.h` (tile kernels), `tasking.h` (task /
-target macros), `kalloc.h`/`kalloc.c` (pinned host allocator).
+target macros). The pinned host allocator is the shared `../alloc.h`/`../alloc.c`
+(`host_alloc`/`host_free`), formerly cholesky's local `kalloc.h`/`kalloc.c`.
 
 Build and run:
 

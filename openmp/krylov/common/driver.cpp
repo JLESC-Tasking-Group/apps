@@ -8,7 +8,7 @@
  */
 #include "driver.h"
 #include "spmat.h"
-#include "kalloc.h"
+#include "alloc.h"
 #include "tasking.h" /* USE_TARGET / USE_TASKGRAPH for the banner */
 
 #include <math.h>
@@ -227,7 +227,7 @@ int main(int argc, char **argv)
     printf("  tasks      : T1 = %d (vectors), T2 = %d (SpMV sub-blocks)\n", prm.T1, prm.T2);
     printf("  omp threads: %d\n", omp_get_max_threads());
 
-    real_t *x = (real_t *) kr_alloc((size_t) A.n * sizeof(real_t));
+    real_t *x = (real_t *) host_alloc((size_t) A.n * sizeof(real_t));
 
     KrylovStats st;
     krylov_stats_init(&st, prm.iters);
@@ -252,7 +252,7 @@ int main(int argc, char **argv)
     krylov_stats_report(&st, d->restarted ? "restart" : "iteration",
                         USE_TASKGRAPH && !USE_SYNC, flops);
 
-    free(Ax); kr_free(x); free(b); free(xexact);
+    free(Ax); host_free(x); free(b); free(xexact);
     spmat_free(&A);
     krylov_stats_free(&st);
     return 0;

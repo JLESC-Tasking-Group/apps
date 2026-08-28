@@ -30,4 +30,14 @@ pragma_omp_taskgraph(
     # endif
 }
 
+static inline void
+pragma_omp_taskgraphloop(
+    xkomp_taskgraph_id_t graph_id,
+    xkomp_taskgraph_flags_t flags,
+    std::function<void(void)> f,
+    xkomp_taskgraphloop_event_handle_t evt
+) {
+    // TODO
+}
+
 #endif /* __XKOMP_PLUS_PLUS_H__ */

@@ -1,9 +1,8 @@
 # include <xkomp/xkomp.h>
 
-extern "C"
-xkomp_taskgraph_t *
-xkomp_taskgraph_begin(
-    int graph_id,
+static inline void
+coherence_checks(
+    xkomp_taskgraph_id_t graph_id,
     xkomp_taskgraph_flags_t flags
 ) {
     // clauses are not supported yet
@@ -15,6 +14,18 @@ xkomp_taskgraph_begin(
 
     if (flags & XKOMP_TASKGRAPH_FLAG_NOGROUP)
         LOGGER_FATAL("Not supported");
+
+    if (graph_id != 0)
+        LOGGER_FATAL("Only supporting graph_id == 0, and a single taskgraph");
+}
+
+extern "C"
+xkomp_taskgraph_t *
+xkomp_taskgraph_begin(
+    xkomp_taskgraph_id_t graph_id,
+    xkomp_taskgraph_flags_t flags
+) {
+    coherence_checks(graph_id, flags);
 
     // retrieve tdg
     xkomp_t * xkomp = xkomp_get();
@@ -66,4 +77,20 @@ xkomp_taskgraph_end(xkomp_taskgraph_t * taskgraph)
     {
         // TODO
     }
+}
+
+extern "C"
+xkomp_taskgraphloop_t *
+xkomp_taskgraphloop_begin(
+    xkomp_taskgraph_id_t graph_id,
+    xkomp_taskgraph_flags_t flags
+) {
+    coherence_checks(graph_id, flags);
+    return NULL;
+}
+
+extern "C"
+void
+xkomp_taskgraphloop_end(xkomp_taskgraphloop_t * loop)
+{
 }

@@ -73,6 +73,8 @@ extern "C"
 
     }               omp_sync_hint_t;
 
+    typedef void * omp_event_handle_t;
+
 #ifdef __cplusplus
 };
 #endif /* __cplusplus */

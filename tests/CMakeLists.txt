@@ -248,7 +248,7 @@ function(_xkomp_test_offload_setup tgt)
 endfunction()
 
 # Expected-to-PASS test compiled with the PACKED task-body JIT ABI
-# (-fopenmp-task-jit-type=packed): each task body is forwarded to CGIR as a
+# (-fopenmp-task-jit-abi=packed): each task body is forwarded to CGIR as a
 # self-contained void(void*,size_t) kernel over a packed capture buffer. Same
 # source as xkomp_add_test but a distinct target/CTest/output name (suffix
 # "_packed") so one source can be registered under both ABIs. Requires the
@@ -260,14 +260,14 @@ function(xkomp_add_packed_test src label)
     set(_xk_base "${_xk_base}_packed")
     add_executable(${_xk_tgt} ${src})
     _xkomp_test_setup(${_xk_tgt})
-    target_compile_options(${_xk_tgt} PRIVATE -fopenmp-task-jit-type=packed)
+    target_compile_options(${_xk_tgt} PRIVATE -fopenmp-task-jit-abi=packed)
     _xkomp_test_output(${_xk_tgt} "${_xk_dir}" "${_xk_base}")
     add_test(NAME "${_xk_test}" COMMAND ${_xk_tgt})
     set_tests_properties("${_xk_test}" PROPERTIES LABELS "${label};packed" TIMEOUT ${XKOMP_TEST_TIMEOUT})
 endfunction()
 
 # Expected-to-PASS test compiled with the POINTERS task-body JIT ABI
-# (-fopenmp-task-jit-type=pointers): each task body is forwarded to CGIR as a
+# (-fopenmp-task-jit-abi=pointers): each task body is forwarded to CGIR as a
 # void(void**) kernel with one deduplicable per-value parameter per capture.
 # The compiler default is now 'none' (no IR forwarded), so this variant is what
 # keeps the pointers JIT/fusion path covered in-tree. Suffix "_pointers" so one
@@ -279,7 +279,7 @@ function(xkomp_add_pointers_test src label)
     set(_xk_base "${_xk_base}_pointers")
     add_executable(${_xk_tgt} ${src})
     _xkomp_test_setup(${_xk_tgt})
-    target_compile_options(${_xk_tgt} PRIVATE -fopenmp-task-jit-type=pointers)
+    target_compile_options(${_xk_tgt} PRIVATE -fopenmp-task-jit-abi=pointers)
     _xkomp_test_output(${_xk_tgt} "${_xk_dir}" "${_xk_base}")
     add_test(NAME "${_xk_test}" COMMAND ${_xk_tgt})
     set_tests_properties("${_xk_test}" PROPERTIES LABELS "${label};pointers" TIMEOUT ${XKOMP_TEST_TIMEOUT})
@@ -439,7 +439,7 @@ xkomp_add_test(xkomp/taskgraph/xkomp_taskgraph_axpby_host_local.cc  taskgraph)
 # both to check the fallback stays correct and the packed aggregate path works.
 xkomp_add_test(xkomp/taskgraph/xkomp_taskgraph_axpby_host_struct.cc taskgraph)
 
-# pointers task-body JIT ABI (-fopenmp-task-jit-type=pointers) coverage. The
+# pointers task-body JIT ABI (-fopenmp-task-jit-abi=pointers) coverage. The
 # compiler default is 'none' (no IR forwarded), so these explicit variants keep
 # the pointers JIT/fusion path exercised:
 #   axpby_host        : scalar firstprivate only + externalized globals (no captures)
@@ -455,7 +455,7 @@ xkomp_add_pointers_test(xkomp/taskgraph/xkomp_taskgraph_axpy_host_global.cc  tas
 xkomp_add_pointers_test(xkomp/taskgraph/xkomp_taskgraph_axpy_host_local.cc   taskgraph)
 xkomp_add_pointers_test(xkomp/taskgraph/xkomp_taskgraph_axpy_host_ptr.cc     taskgraph)
 
-# packed task-body JIT ABI (-fopenmp-task-jit-type=packed) coverage:
+# packed task-body JIT ABI (-fopenmp-task-jit-abi=packed) coverage:
 #   host        : scalar firstprivate only + externalized globals (no captures)
 #   host_local  : scalar firstprivate + shared-array (SHARED_ADDR) chain
 #   host_struct : aggregate (struct) firstprivate + shared-array chain

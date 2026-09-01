@@ -30,6 +30,7 @@ pragma_omp_taskgraph(
     # endif
 }
 
+# if 0
 static inline void
 pragma_omp_taskgraphloop(
     xkomp_taskgraph_id_t graph_id,
@@ -39,5 +40,6 @@ pragma_omp_taskgraphloop(
 ) {
     // TODO
 }
+# endif
 
 #endif /* __XKOMP_PLUS_PLUS_H__ */

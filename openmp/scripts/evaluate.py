@@ -95,7 +95,7 @@ def main():
                     "(compile-time). Applies to the async configs only (sync is always 1 task/loop). "
                     "Unset -> each app's default granularity.")
     ap.add_argument("--opts", default="", help="semicolon-separated CGIR opt combos, each "
-                    "a comma/space list of passes (e.g. 'reduce-node,reduce-edge;batch'); "
+                    "a comma/space list of passes (e.g. 'reduce-node,transitive-reduction;batch'); "
                     "each combo -> one taskgraph:<opt> config. Default from appspecs.")
     ap.add_argument("--target", choices=["cpu", "gpu"], default="cpu",
                     help="backend for every build (USE_TARGET); default cpu")

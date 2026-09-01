@@ -33,7 +33,7 @@ from pathlib import Path
 APPS_OPENMP = Path(__file__).resolve().parent.parent
 
 # Canonical CGIR pipeline order for the graph-stats x axis.
-PASS_ORDER = ["copy-normalize", "copy-fuse", "reduce-node", "reduce-edge",
+PASS_ORDER = ["copy-fuse", "reduce-node", "transitive-reduction",
               "prog-fuse", "jit", "sequence", "batch"]
 
 OK_STATUS = ("ok", "", None)

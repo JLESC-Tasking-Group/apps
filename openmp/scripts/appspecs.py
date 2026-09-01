@@ -30,17 +30,17 @@ from typing import Callable, Dict, List, Optional
 
 # CGIR optimization combos compared on top of the references (each -> one
 # taskgraph:<opt> configuration). Names are XKOMP OMP_TASKGRAPH_OPT passes
-# (comma or space separated): copy-normalize copy-fuse reduce-node reduce-edge
+# (comma or space separated): copy-normalize copy-fuse reduce-node transitive-reduction
 # jit prog-fuse sequence batch.
 DEFAULT_OPTS = [
-    "reduce-node,reduce-edge",
-    "reduce-node,reduce-edge,batch",
+    "reduce-node,transitive-reduction",
+    "reduce-node,transitive-reduction,batch",
 ]
 
 
 @dataclass
 class Config:
-    label: str                 # legend label, e.g. "taskgraph:reduce-node,reduce-edge"
+    label: str                 # legend label, e.g. "taskgraph:reduce-node,transitive-reduction"
     build: Dict[str, str]      # make variables, e.g. {"USE_SYNC": "1", ...}
     opt: Optional[str]         # OMP_TASKGRAPH_OPT value (None if no taskgraph)
     grain1: bool = False       # run with one task/kernel per loop (sync baseline)

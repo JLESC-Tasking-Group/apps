@@ -63,7 +63,7 @@ xkomp_env_init_parse_taskgraph_opt(void)
     // via OMP_TASKGRAPH_OPT for vendor-graph capture).
     if (value == NULL)
         return cgir::COMMAND_GRAPH_PASS_REDUCE_NODE_BIT
-             | cgir::COMMAND_GRAPH_PASS_REDUCE_EDGE_BIT
+             | cgir::COMMAND_GRAPH_PASS_TRANSITIVE_REDUCTION_BIT
              | cgir::COMMAND_GRAPH_PASS_SEQUENCE_BIT;
 
     // set (possibly empty) -> parse tokens; an empty string yields no tokens == "none"

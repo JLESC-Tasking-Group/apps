@@ -22,7 +22,8 @@ __kmpc_for_static_init_8(
     kmp_int64 incr,
     kmp_int64 chunk
 ) {
-    LOGGER_FATAL("Not impl");
+    assert(schedtype == kmp_sch_static);
+    team_t::parallel_for_thread_bounds(plastiter, plower, pupper, incr);
 }
 
 extern "C"

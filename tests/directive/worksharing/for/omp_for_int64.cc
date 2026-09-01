@@ -1,6 +1,9 @@
-// xkomp: XFAIL - signed 64-bit loop counters lower to __kmpc_for_static_init_8,
-//        which is `LOGGER_FATAL("Not impl")` in src/kmp/for.cc.  The symbol
-//        links, so this fails at *runtime* (abort), not at link time.
+// xkomp: supported  (__kmpc_for_static_init_8)
+//
+// Signed 64-bit loop counters lower to __kmpc_for_static_init_8, the last of
+// the four static worksharing entry points to be implemented in src/kmp/for.cc.
+// The unsigned 64-bit path (_8u) is covered by omp_for_unsigned.cc, the signed
+// 32-bit one (_4) by omp_for.cc.
 
 #include "common.h"
 

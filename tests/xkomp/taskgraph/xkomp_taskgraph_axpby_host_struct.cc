@@ -6,7 +6,7 @@
 // scalar. This exercises the packed task-body ABI's aggregate path -- the packed
 // kernel memcpys the struct from the buffer, which the individual-parameter
 // kernel cannot do (an aggregate-by-value parameter is C-ABI coerced, breaking
-// fusion/dedup). Only meaningful under -fopenmp-task-jit-type=packed (registered
+// fusion/dedup). Only meaningful under -fopenmp-task-jit-abi=packed (registered
 // by xkomp_add_packed_test); the arrays are captured `shared` (SHARED_ADDR). Per
 // pass y <- alpha*x + beta*y; validated against a serial host reference.
 #include "common.h"

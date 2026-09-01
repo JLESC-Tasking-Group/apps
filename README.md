@@ -22,8 +22,8 @@ xkcc main.c -o main
 ```
 
 # Remarks
-- Pass `-fopenmp-task-jit-type=[pointers|packed]` to `xkcxx` so that the LLVM-IR/PTX of tasks/targets is kept after compile-time, and passed to the XKOMP runtime for JIT during taskgraph optimizations. With `pointers`, all arguments (firstprivate, shared, etc.) are stored in a `void ** args` array, referenced within the outlined region. With `packed`, they are packed in a `void * args, size_t size` compact structure.
-- The `OMP_TASKGRAPH_OPT=opt1,opt2,...,optn` can be used to enable `taskgraph` optimizations. Available optimizations are: `reduce-edge`, `reduce-node`, `batch`, `prog-fuse`, `jit`, `copy-normalize`, `copy-fuse`, `sequence`
+- Pass `-fopenmp-task-jit-abi=[pointers|packed]` to `xkcxx` so that the LLVM-IR/PTX of tasks/targets is kept after compile-time, and passed to the XKOMP runtime for JIT during taskgraph optimizations. With `pointers`, all arguments (firstprivate, shared, etc.) are stored in a `void ** args` array, referenced within the outlined region. With `packed`, they are packed in a `void * args, size_t size` compact structure.
+- The `OMP_TASKGRAPH_OPT=opt1,opt2,...,optn` can be used to enable `taskgraph` optimizations. Available optimizations are: `transitive-reduction`, `reduce-node`, `batch`, `prog-fuse`, `jit`, `copy-normalize`, `copy-fuse`, `sequence`
 
 # Bits of history
 XKRT is a fork of XKaapi, that it extended with support for task dependencies over intersecting regions of memory (https://gitlab.inria.fr/xkaapi/dev-v2)

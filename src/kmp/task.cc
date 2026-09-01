@@ -260,7 +260,7 @@ get_or_create_loc_format(
     void * scatter                          // != NULL => unpacked (individual params); NULL => packed (args[0]==tt)
 ) {
     // the forwarded task body IR + its resolution tables + ABI, or {NULL,0,...}
-    // when no IR was forwarded (e.g. -fopenmp-task-jit-type=none)
+    // when no IR was forwarded (e.g. -fopenmp-task-jit-abi=none)
     void * ir      = jit_desc ? (void *) jit_desc->ir : NULL;
     size_t ir_size = jit_desc ? jit_desc->ir_size      : 0;
 
@@ -312,7 +312,7 @@ get_or_create_loc_format(
             // Parameter descriptors + entry prototype: an unpacked task body exposes
             // one value parameter per capture (the fusion unit); a packed body has
             // a single void** args block (args[0] == kmp_task_t*).
-            // -fopenmp-task-jit-type=packed (jit_desc->proto==2) requests a packed-buffer
+            // -fopenmp-task-jit-abi=packed (jit_desc->proto==2) requests a packed-buffer
             // fused program; otherwise an unpacked (individual-param) body has a
             // scatter, and a packed-args-block (args[0]==tt) proxy has none.
             src->content.llvmir.proto          =

@@ -14,17 +14,33 @@
  * Dependencies use SINGLE-ELEMENT depend items at chunk-aligned addresses (never
  * array sections): OpenMP only matches depend items that are *identical or
  * disjoint*. Vector chunks are keyed by the data address at the block start
- * (v[t1*BS]). An SpMV output vector is keyed the same way, on its own addresses:
- * the T2 sub-blocks of one output tile all use `inoutset` on the tile's first
- * address (v[t1*BS]) so they run concurrently (they write disjoint rows), while
- * a consumer waits on the whole set with a single `in` on that address.
+ * (v[t1*BS]). An SpMV *output* is finer-grained: each of the T2 sub-blocks owns
+ * its OWN token at its own start address (v[t1*BS + t2*SBS]) and declares it
+ * `out`, so the sub-blocks are independent because their tokens are disjoint --
+ * not because of a shared concurrent set. A consumer of the whole tile joins
+ * over those tokens with a depend iterator over the tile's non-empty sub-blocks
+ * (tiling_nsub). This mirrors the reference HPCCG task implementation and keeps
+ * every access strictly in/out (no `inoutset`).
+ *
+ * The SpMV *input* dependency is likewise exact rather than conservative: for
+ * each sub-block we precompute, from the matrix column indices, the set of x
+ * blocks it actually reads (Tiling::spmv_deps). Depending on all NTB1 blocks
+ * instead would make every SpMV sub-task a reader of every x chunk, which turns
+ * the next writer of x into a node with NTB1*T2 predecessors and inflates the
+ * graph to O(NTB1^2 * T2) edges.
  */
 #ifndef KRYLOV_KERNELS_H
 #define KRYLOV_KERNELS_H
 
-#include "spmat.h" /* real_t, idx_t */
+#include "spmat.h" /* real_t, idx_t, SpMatrix */
 
-/* Task tiling parameters (granularity only). */
+/* The x blocks that one SpMV sub-block reads (precomputed from col_idx). */
+typedef struct {
+    int    size;      /* number of distinct x blocks read                     */
+    idx_t *indices;   /* [size] their block-start offsets (b * BS)            */
+} SpMVDeps;
+
+/* Task tiling parameters (granularity) + the precomputed SpMV dependencies. */
 typedef struct {
     idx_t n;
     int   T1;      /* number of tasks per vector op                          */
@@ -32,16 +48,26 @@ typedef struct {
     idx_t BS;      /* rows per vector block   = ceil(n / T1)                  */
     idx_t SBS;     /* rows per SpMV sub-block = ceil(BS / T2)                 */
     int   NTB1;    /* actual number of vector blocks = ceil(n / BS) (<= T1)   */
+    SpMVDeps *spmv_deps; /* [NTB1*T2]; (t1*T2+t2) valid for t2 < tiling_nsub  */
 } Tiling;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-void tiling_init(Tiling *tl, idx_t n, int T1, int T2);
+/* Build the tiling and precompute the SpMV input dependencies from A. */
+void tiling_init(Tiling *tl, const SpMatrix *A, int T1, int T2);
 
-/* y = A*x   (CSR SpMV). The T2 sub-blocks of each output tile are `inoutset` on
- * the tile's first address, so consumers depend (in) on y at that address. */
+/* Release the precomputed dependencies (call once per solve, after the tasks). */
+void tiling_fini(Tiling *tl);
+
+/* Number of NON-EMPTY sub-blocks of tile t1: min(T2, ceil(tile_rows / SBS)).
+ * A ragged last tile has fewer than T2 of them; producer and consumers must use
+ * the same count so their token sets match exactly. */
+int  tiling_nsub(const Tiling *tl, int t1);
+
+/* y = A*x   (CSR SpMV). Each sub-block declares `out` on its own start address
+ * y[t1*BS + t2*SBS]; consumers join over those tokens (see the *_spmv variants). */
 void task_spmv(const idx_t *row_ptr, const idx_t *col_idx, const real_t *val,
                idx_t nnz, const real_t *x, real_t *y, const Tiling *tl);
 
@@ -54,7 +80,8 @@ void task_axpy     (const Tiling *tl, const real_t *s, real_t sign, const real_t
 void task_xpby     (const Tiling *tl, const real_t *x, const real_t *s, real_t *y);    /* y = x + s*y  */
 void task_dot      (const Tiling *tl, const real_t *a, const real_t *b, real_t *part, real_t *result); /* result = <a,b> */
 
-/* --- variants consuming a fresh SpMV-output vector `ys` --- */
+/* --- variants consuming a fresh SpMV-output vector `ys` ---
+ * Each waits on ALL sub-block tokens of its tile (iterator over tiling_nsub). */
 void task_copy_spmv(const Tiling *tl, const real_t *ys, real_t *y);                  /* y = ys      */
 void task_vmul_spmv(const Tiling *tl, const real_t *d, const real_t *ys, real_t *y); /* y = d .* ys */
 void task_axpy_spmv(const Tiling *tl, const real_t *s, real_t sign, const real_t *ys, real_t *y); /* y += sign*s*ys */

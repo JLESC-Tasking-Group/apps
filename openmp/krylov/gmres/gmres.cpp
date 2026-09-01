@@ -108,7 +108,7 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     const int     ld      = m + 1; /* leading dim of H */
 
     Tiling tl;
-    tiling_init(&tl, n, T1, T2);
+    tiling_init(&tl, A, T1, T2);
 
     /* Device-mapped vectors: basis V[0..m], plus work vectors. */
     real_t *Vd  = (real_t *) host_alloc((size_t)(m + 1) * (size_t) n * sizeof(real_t));
@@ -233,6 +233,7 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     host_free(Vd); host_free(w); host_free(q); host_free(res); host_free(bd); host_free(inv);
     host_free(H); host_free(y); host_free(one); host_free(beta); host_free(ibeta); host_free(hh); host_free(ih);
     host_free(part); free(Hhost);
+    tiling_fini(&tl);
     st->total_s = t1 - t0;
 }
 

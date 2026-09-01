@@ -59,7 +59,7 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
     const real_t *val     = A->val;
 
     Tiling tl;
-    tiling_init(&tl, n, T1, T2);
+    tiling_init(&tl, A, T1, T2);
 
     /* Device-mapped working vectors (pinned on GPU builds). */
     real_t *r   = (real_t *) host_alloc((size_t) n * sizeof(real_t));
@@ -159,6 +159,7 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
     host_free(r); host_free(p); host_free(Ap); host_free(z); host_free(inv);
     host_free(gamma); host_free(g_new); host_free(pAp); host_free(alpha); host_free(beta);
     host_free(part1); host_free(part2);
+    tiling_fini(&tl);
     st->total_s = t1 - t0;
 }
 

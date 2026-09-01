@@ -52,7 +52,7 @@ static void minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     const real_t *val     = A->val;
 
     Tiling tl;
-    tiling_init(&tl, n, T1, T2);
+    tiling_init(&tl, A, T1, T2);
 
     /* Device-mapped vectors. */
     real_t *v    = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* Lanczos vector (M^-1 r2) */
@@ -250,6 +250,7 @@ static void minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     host_free(inv_beta); host_free(bob); host_free(vy); host_free(alpha); host_free(delta); host_free(aob);
     host_free(r2v); host_free(phi); host_free(gamma_inv);
     host_free(part_vy); host_free(part_r2v);
+    tiling_fini(&tl);
     st->total_s = t1 - t0;
 }
 

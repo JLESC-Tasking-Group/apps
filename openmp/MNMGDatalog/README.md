@@ -78,7 +78,29 @@ make test                                # data_7035.bin (TC=146120, 64 iters)
 
 Environment: `TC_WRITE=1` writes `<input>_<version>_tc.bin` (off by default so
 sweeps stay clean); `TC_DUMP=<f>` writes a `src dst` text dump; `TC_CSV=<f>` writes
-the reference's 15-column metric row.
+the reference's 15-column metric row; `TC_WORKERS=<n>` overrides the GPU
+grid-stride worker count (see below).
+
+## Device-resident sizes and the loop bound
+
+The two size-driven fixpoint kernels (`k_expand`, `k_promote`) are **grid-stride
+loops over a fixed host-constant worker count**, not loops bounded by the
+device-resident size. That is not a stylistic choice: for a combined
+`target teams distribute parallel for`, clang evaluates the loop trip count on
+the *host*, inside the target task, to fill the `LoopTripCount` argument of
+`__tgt_target_kernel` (`SizeEmitter` in `CGStmtOpenMP.cpp` ->
+`CGOpenMPRuntime::emitTargetNumIterationsCall`). Writing
+`for (i = 0; i < d_frontier_size[0]; i++)` over an `is_device_ptr` buffer makes
+the host load a device address and segfault; with a host-resident scalar it
+instead bakes a stale size into the recorded launch.
+
+So the OpenMP bound is `ctx.n_workers` (fixed once in `tc_setup`, hence an
+identical launch on every replay) and the size is read from device memory inside
+the body -- exactly the reference's fixed `<<<32*numSM, 512>>>` geometry with
+`int n = *frontier_size;` read in the kernel. Default is `1<<21`
+(`-DTC_WORKERS_DEFAULT=<n>` at build time, `TC_WORKERS=<n>` at run time), clamped
+to `frontier_cap`. On the CPU backend it is 1 and the nest collapses to the plain
+loop.
 
 ## Capacity
 

@@ -7,10 +7,13 @@
  *     path(a, c) :- path(a, b), edge(b, c).
  *
  * over fixed pre-allocated device buffers, with all per-iteration SIZES resident
- * in device memory (d_frontier_size / the device copy of new_count). The kernels
- * read those sizes on the device at launch, so the per-iteration kernel sequence
- * is byte-identical every round -- which is exactly what lets one recorded task
- * graph be replayed.
+ * in device memory (d_frontier_size / the device copy of new_count). The two
+ * size-driven kernels are grid-stride loops over a FIXED host-constant worker
+ * count (ctx.n_workers) that read those sizes from device memory in their body,
+ * so the per-iteration kernel sequence is byte-identical every round -- which is
+ * exactly what lets one recorded task graph be replayed. Using a size as the
+ * OpenMP loop bound would not work: clang evaluates a target loop's trip count on
+ * the host (see the comment above the fixpoint kernels).
  *
  * One source, several backends, chosen at compile time by the shared toggles in
  * ../tasking.h (see ../common.mk). The two CUDA "versions" map to toggles:
@@ -59,6 +62,24 @@ typedef unsigned long long u64;
 
 /* Empty-slot marker: 0xFF bytes -> every int becomes -1, every u64 becomes this. */
 #define TC_EMPTY64 0xFFFFFFFFFFFFFFFFULL
+
+/* Number of grid-stride workers of the two size-driven fixpoint kernels.
+ *
+ * An OpenMP loop bound is NOT a device-only expression: for a combined
+ * `target teams distribute parallel for`, clang evaluates the trip count on the
+ * HOST, inside the target task, to fill the LoopTripCount of __tgt_target_kernel
+ * (CGStmtOpenMP.cpp SizeEmitter -> CGOpenMPRuntime::emitTargetNumIterationsCall,
+ * reached from emitTargetCall). The bound must therefore be a loop-invariant
+ * HOST scalar; the device-resident size is read inside the body by a grid-stride
+ * loop instead -- the direct analog of the reference's fixed <<<32*numSM, 512>>>
+ * launch geometry with `int n = *frontier_size;` read in the kernel.
+ *
+ * Default ~= 32*132*512 (an H100 at the reference's occupancy); override at build
+ * time with -DTC_WORKERS_DEFAULT=<n> or at run time with TC_WORKERS=<n>. It is
+ * resolved once in tc_setup, so it stays constant across taskgraph replays. */
+#ifndef TC_WORKERS_DEFAULT
+# define TC_WORKERS_DEFAULT (1L << 21)
+#endif
 
 /* Edge slot for the open-addressing edge table (key = source, value = dest). */
 struct Entity { int key; int value; };
@@ -260,6 +281,25 @@ static void dmemset(void *p, int byte, size_t bytes)
 static inline int tc_read_i32(int *dev) { int h;  from_dev(&h, dev, sizeof(int)); return h; }
 static inline u64 tc_read_u64(u64 *dev) { u64 h;  from_dev(&h, dev, sizeof(u64)); return h; }
 
+/* Abort on a failed allocation instead of letting the NULL reach a kernel. On the
+ * GPU backend this also catches an OpenMP runtime whose omp_target_alloc is a
+ * stub: every buffer here is device-only and dereferenced by device code, so a
+ * silent NULL would only surface much later as an unattributable fault. */
+#if USE_TARGET
+# define TC_ALLOC_HINT "omp_target_alloc failed or is not implemented by the OpenMP runtime in use"
+#else
+# define TC_ALLOC_HINT "out of host memory"
+#endif
+static void *tc_dcheck(void *p, const char *what, size_t bytes)
+{
+    if (!p) {
+        fprintf(stderr, "ERROR: allocation of %s (%zu bytes) returned NULL.\n"
+                        "       %s.\n", what, bytes, TC_ALLOC_HINT);
+        exit(2);
+    }
+    return p;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Context.                                                                   */
 /* ------------------------------------------------------------------------- */
@@ -277,6 +317,12 @@ struct TCContext {
     u64 *d_frontier     = nullptr;
     u64 *d_new_frontier = nullptr;
     int  frontier_cap   = 0;
+
+    /* Fixed grid-stride worker count of k_expand / k_promote (see
+     * TC_WORKERS_DEFAULT). Resolved once in tc_setup and never changed, so the
+     * recorded kernel launch is identical on every replay. 1 on the CPU backend,
+     * where the grid-stride nest collapses to the plain loop. */
+    int  n_workers      = 1;
 
     int *d_frontier_size = nullptr;
     /* new_count is the ONE scalar the host reads every iteration (the fixpoint
@@ -341,16 +387,28 @@ static void compact(TCContext &ctx, u64 *out, u64 *out_count)
 /* Each is emitted as the SAME combined construct the Krylov solvers use --   */
 /* OMP_TILE (GPU: one `omp target teams distribute parallel for`; CPU: one    */
 /* `omp task`) for the data-parallel loops, and OMP_TARGET_TASK for the two   */
-/* single-statement device ops. This is what replays correctly:               */
-/* pragma_omp_taskgraph() runs the region body only on the first (record)     */
-/* pass; on replay it re-submits the recorded *kernel commands*. A combined   */
-/* construct is recorded as one such kernel command, and the loop bound       */
-/* `fs[0]`/`nc[0]` is an is_device_ptr dereference evaluated ON THE DEVICE at  */
-/* every launch -- the recorded command captures only the (stable) buffer     */
-/* pointer, never the size value -- so each replay reads the current frontier  */
-/* size, exactly like the CUDA reference's device-resident *d_frontier_size.   */
-/* (A bare `omp target` + a separate `omp teams distribute parallel for` is    */
-/* NOT this shape and does not replay; see xkomp's taskgraph target tests.)   */
+/* single-statement device ops. A combined construct is recorded as ONE kernel */
+/* command: pragma_omp_taskgraph() runs the region body only on the first     */
+/* (record) pass and re-submits those commands on replay.                     */
+/*                                                                            */
+/* The per-iteration sizes therefore CANNOT be OpenMP loop bounds. An OpenMP  */
+/* loop bound is not a device-only expression: for a combined                 */
+/* `target teams distribute parallel for` clang evaluates the trip count on   */
+/* the HOST, inside the target task, to fill the LoopTripCount argument of    */
+/* __tgt_target_kernel (clang: CGStmtOpenMP.cpp SizeEmitter ->                */
+/* CGOpenMPRuntime::emitTargetNumIterationsCall, called from emitTargetCall). */
+/* Writing `for (i = 0; i < fs[0]; ...)` over an is_device_ptr buffer makes   */
+/* the host load a device address -> SIGSEGV; and even for a host-resident    */
+/* scalar the host would bake a stale value into the recorded launch.         */
+/*                                                                            */
+/* So both size-driven kernels are GRID-STRIDE loops: the OpenMP loop bound is */
+/* the loop-invariant host scalar ctx.n_workers (fixed once in tc_setup, hence */
+/* an identical launch on every replay) and the size is read from device       */
+/* memory INSIDE the body, once per worker. This is exactly the reference's    */
+/* fixed <<<32*numSM, 512>>> geometry with `int n = *frontier_size;` read in   */
+/* the kernel (MNMGDatalog-reference/tc_benchmark/common/tc_core.cuh,          */
+/* tc_expand / tc_promote), so each replay sees the current frontier size.     */
+/* On the CPU backend n_workers == 1 and the nest collapses to the plain loop. */
 /* ------------------------------------------------------------------------- */
 static void k_reset(TCContext &ctx)
 {
@@ -371,24 +429,36 @@ static void k_expand(TCContext &ctx)
     u64 *rs = ctx.d_result_set; long rc = ctx.result_cap;
     u64 *nf = ctx.d_new_frontier; int nfc = ctx.frontier_cap;
     int *ncnt = ctx.new_count; u64 *rcnt = ctx.d_result_count; int *ov = ctx.d_overflow;
+    int nw = ctx.n_workers;
     /* GPU: is_device_ptr (mp slot) carries the device-only buffers and
      * map(present:) the pinned-host new_count; CPU: default(none) firstprivate
-     * (fp slot) captures the pointers/scalars. Bound fs[0] is read on the device
-     * each launch, so replay uses the current frontier size. */
+     * (fp slot) captures the pointers/scalars. The OpenMP bound is the host
+     * constant nw; the frontier size fs[0] is read on the DEVICE by every worker,
+     * so replay uses the current frontier size. */
     OMP_TILE(DEPEND(in, fs[0], fr[0]) DEPEND(inout, rs[0], ncnt[0], rcnt[0], ov[0]) DEPEND(out, nf[0]),
              is_device_ptr(et, fr, fs, rs, nf, rcnt, ov) MAP(present: ncnt[0:1]),
-             DEFAULT_NONE firstprivate(et, ec, fr, fs, rs, rc, nf, nfc, ncnt, rcnt, ov))
-    for (int i = 0; i < fs[0]; i++)
-        tc_expand_one(i, et, ec, fr, rs, rc, nf, nfc, ncnt, rcnt, ov);
+             DEFAULT_NONE firstprivate(et, ec, fr, fs, rs, rc, nf, nfc, ncnt, rcnt, ov, nw))
+    for (int t = 0; t < nw; t++) {
+        const int n = fs[0];
+        for (int i = t; i < n; i += nw)
+            tc_expand_one(i, et, ec, fr, rs, rc, nf, nfc, ncnt, rcnt, ov);
+    }
 }
 
 static void k_promote(TCContext &ctx)
 {
     u64 *fr = ctx.d_frontier; u64 *nf = ctx.d_new_frontier; int *nc = ctx.new_count;
+    int nw = ctx.n_workers;
+    /* Same grid-stride shape as k_expand: nc[0] is the DEVICE copy of new_count
+     * (map(present:)), read inside the body. Reading it as the OpenMP bound would
+     * take the host copy, which still holds the PREVIOUS round's count. */
     OMP_TILE(DEPEND(in, nc[0], nf[0]) DEPEND(out, fr[0]),
              is_device_ptr(fr, nf) MAP(present: nc[0:1]),
-             DEFAULT_NONE firstprivate(fr, nf, nc))
-    for (int i = 0; i < nc[0]; i++) fr[i] = nf[i];
+             DEFAULT_NONE firstprivate(fr, nf, nc, nw))
+    for (int t = 0; t < nw; t++) {
+        const int n = nc[0];
+        for (int i = t; i < n; i += nw) fr[i] = nf[i];
+    }
 }
 
 static void k_set_sizes(TCContext &ctx)
@@ -513,16 +583,18 @@ static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
     ctx.t_fileio = tc_now() - t0;
 
     t0 = tc_now();
-    ctx.d_edges = (int *)dalloc((size_t)ctx.n_edges * 2 * sizeof(int));
-    to_dev(ctx.d_edges, edges_host, (size_t)ctx.n_edges * 2 * sizeof(int));
+    size_t nb = (size_t)ctx.n_edges * 2 * sizeof(int);
+    ctx.d_edges = (int *)tc_dcheck(dalloc(nb), "edges", nb);
+    to_dev(ctx.d_edges, edges_host, nb);
     ctx.t_h2d = tc_now() - t0;
     free(edges_host);
 
     t0 = tc_now();
     ctx.edge_cap = (int)tc_next_pow2((long)std::ceil(ctx.n_edges / 0.6));
     if (ctx.edge_cap < 2) ctx.edge_cap = 2;
-    ctx.d_edge_table = (Entity *)dalloc((size_t)ctx.edge_cap * sizeof(Entity));
-    dmemset(ctx.d_edge_table, 0xFF, (size_t)ctx.edge_cap * sizeof(Entity));
+    nb = (size_t)ctx.edge_cap * sizeof(Entity);
+    ctx.d_edge_table = (Entity *)tc_dcheck(dalloc(nb), "edge table", nb);
+    dmemset(ctx.d_edge_table, 0xFF, nb);
     build_edges(ctx);
 
     long est = (long)ctx.n_edges * capacity_mult;
@@ -533,18 +605,34 @@ static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
     if (fcap > ctx.result_cap) fcap = ctx.result_cap;
     ctx.frontier_cap = (int)fcap;
 
-    ctx.d_result_set    = (u64 *)dalloc(ctx.result_cap * sizeof(u64));
-    dmemset(ctx.d_result_set, 0xFF, ctx.result_cap * sizeof(u64));
-    ctx.d_frontier      = (u64 *)dalloc((size_t)ctx.frontier_cap * sizeof(u64));
-    ctx.d_new_frontier  = (u64 *)dalloc((size_t)ctx.frontier_cap * sizeof(u64));
-    ctx.d_frontier_size = (int *)dalloc(sizeof(int));
-    ctx.d_result_count  = (u64 *)dalloc(sizeof(u64));
-    ctx.d_overflow      = (int *)dalloc(sizeof(int));
+    /* Fixed grid-stride worker count of k_expand / k_promote. Resolved ONCE, here,
+     * so the recorded task graph replays with an identical launch (see
+     * TC_WORKERS_DEFAULT). Never more workers than the frontier can ever hold. */
+#if USE_TARGET
+    long nworkers = TC_WORKERS_DEFAULT;
+    const char *wenv = getenv("TC_WORKERS");
+    if (wenv && wenv[0]) nworkers = atol(wenv);
+    if (nworkers < 1) nworkers = 1;
+    if (nworkers > ctx.frontier_cap) nworkers = ctx.frontier_cap;
+    ctx.n_workers = (int)nworkers;
+#else
+    ctx.n_workers = 1;              /* host task: the nest collapses to one loop */
+#endif
+
+    nb = (size_t)ctx.result_cap * sizeof(u64);
+    ctx.d_result_set    = (u64 *)tc_dcheck(dalloc(nb), "result set", nb);
+    dmemset(ctx.d_result_set, 0xFF, nb);
+    nb = (size_t)ctx.frontier_cap * sizeof(u64);
+    ctx.d_frontier      = (u64 *)tc_dcheck(dalloc(nb), "frontier", nb);
+    ctx.d_new_frontier  = (u64 *)tc_dcheck(dalloc(nb), "new frontier", nb);
+    ctx.d_frontier_size = (int *)tc_dcheck(dalloc(sizeof(int)),  "frontier size", sizeof(int));
+    ctx.d_result_count  = (u64 *)tc_dcheck(dalloc(sizeof(u64)),  "result count", sizeof(u64));
+    ctx.d_overflow      = (int *)tc_dcheck(dalloc(sizeof(int)),  "overflow flag", sizeof(int));
 
     /* new_count: pinned host memory (shared ../alloc.c) with a device copy
      * created here, so the kernels reach it with map(present:) and k_writeback
      * can refresh the host side with an in-graph async D2H. */
-    ctx.new_count = (int *)host_alloc(sizeof(int));
+    ctx.new_count = (int *)tc_dcheck(host_alloc(sizeof(int)), "new_count", sizeof(int));
     int *new_count = ctx.new_count;
     new_count[0] = 0;
     OMP_TARGET_ENTER_DATA(MAP(alloc: new_count[0:1]))
@@ -693,8 +781,10 @@ int main(int argc, char **argv)
      * copy exactly TC tuples to the host. Compaction is result-producing GPU work
      * (folded into compute); d2h times only the device->host copy. */
     double c0 = tc_now();
-    u64 *d_compact = (u64 *)dalloc((size_t)(tc ? tc : 1) * sizeof(u64));
-    u64 *d_cnt = (u64 *)dalloc(sizeof(u64)); u64 z64 = 0; to_dev(d_cnt, &z64, sizeof(u64));
+    size_t cb = (size_t)(tc ? tc : 1) * sizeof(u64);
+    u64 *d_compact = (u64 *)tc_dcheck(dalloc(cb), "compact output", cb);
+    u64 *d_cnt = (u64 *)tc_dcheck(dalloc(sizeof(u64)), "compact counter", sizeof(u64));
+    u64 z64 = 0; to_dev(d_cnt, &z64, sizeof(u64));
     compact(ctx, d_compact, d_cnt);
     double compact_s = tc_now() - c0;
 

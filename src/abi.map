@@ -1,5 +1,8 @@
 OMP_API_VERSION {
     global:
+        omp_target_alloc;
+        omp_target_free;
+
         omp_get_thread_num;
         omp_get_num_threads;
         omp_get_max_threads;

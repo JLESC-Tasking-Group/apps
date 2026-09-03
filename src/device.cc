@@ -58,6 +58,22 @@ xkomp_is_initial_device(void)
 }
 EXPORT_OMP_ABI(is_initial_device);
 
+extern "C"
+void *
+xkomp_target_alloc(size_t size, int device_num)
+{
+   return NULL;
+}
+EXPORT_OMP_ABI(target_alloc);
+
+extern "C"
+void
+xkomp_target_free(void * device_ptr, int device_num)
+{
+}
+EXPORT_OMP_ABI(target_free);
+
+
 /////////////////////////////
 // TARGET MEMORY TRANSFERS //
 /////////////////////////////

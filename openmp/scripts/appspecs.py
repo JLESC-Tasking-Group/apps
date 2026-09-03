@@ -106,13 +106,27 @@ def _parse_lulesh(text):
 
 
 def _parse_mnmg(text):
-    # tc.cpp prints per-solve timing lines (see MNMGDatalog/tc.cpp): the timed
-    # repeats' avg/stddev, the warm-up ("solve 0") time, and the total.
+    # tc.cpp reports per-SOLVE times in the same shape as the Krylov drivers (see
+    # MNMGDatalog/tc.cpp): solve 0 records the task graph, solve 1 is the first
+    # full replay, solves 2.. are steady state. "total time (end-to-end)" is the
+    # MNMGDatalog paper's metric (file IO + H2D + setup + graph build + compute +
+    # D2H) and is printed in ms, unlike the other apps' seconds.
+    avg = _grab(text, r"solves \d+\.\.\d+ \(avg\)\s*:\s*" + _F + r"\s*ms")
+    std = _grab(text, r"solves \d+\.\.\d+ \(stddev\)\s*:\s*" + _F + r"\s*ms")
+    it0 = _grab(text, r"solve 0[^:]*:\s*" + _F + r"\s*ms")
+    if avg is None:
+        # fewer than 3 timed solves: no steady-state window, fall back to the
+        # last solve that was reported.
+        avg = _grab(text, r"solve 1[^:]*:\s*" + _F + r"\s*ms")
+        if avg is None:
+            avg = it0
+        std = 0.0 if avg is not None else None
+    total_ms = _grab(text, r"total time \(end-to-end\)\s*:\s*" + _F + r"\s*ms")
     return {
-        "avg_ms":    _grab(text, r"timed solves \(avg\)\s*:\s*" + _F + r"\s*ms"),
-        "stddev_ms": _grab(text, r"timed solves \(stddev\)\s*:\s*" + _F + r"\s*ms"),
-        "iter0_ms":  _grab(text, r"solve 0 \(warmup\)\s*:\s*" + _F + r"\s*ms"),
-        "elapsed_s": _grab(text, r"total solve time\s*:\s*" + _F),
+        "avg_ms":    avg,
+        "stddev_ms": std,
+        "iter0_ms":  it0,
+        "elapsed_s": (total_ms / 1000.0) if total_ms is not None else None,
     }
 
 

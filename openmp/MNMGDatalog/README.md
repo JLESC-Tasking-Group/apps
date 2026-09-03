@@ -76,10 +76,61 @@ make                                     # CPU tasks (default), for correctness
 make test                                # data_7035.bin (TC=146120, 64 iters)
 ```
 
-Environment: `TC_WRITE=1` writes `<input>_<version>_tc.bin` (off by default so
-sweeps stay clean); `TC_DUMP=<f>` writes a `src dst` text dump; `TC_CSV=<f>` writes
-the reference's 15-column metric row; `TC_WORKERS=<n>` overrides the GPU
-grid-stride worker count (see below).
+Environment: `TC_WARMUP=<n>` untimed warm-up solves before solve 0 (default 1);
+`TC_WORKERS=<n>` overrides the GPU grid-stride worker count (see below);
+`TC_WRITE=1` writes `<input>_<version>_tc.bin` (off by default so sweeps stay
+clean); `TC_DUMP=<f>` writes a `src dst` text dump; `TC_CSV=<f>` writes the
+reference's 15-column metric row.
+
+## Metrics
+
+The measured unit is one full **solve** (one fixpoint, all rounds), not one round:
+rounds do wildly different amounts of work (the frontier grows, then collapses),
+so per-round times are not comparable, whereas every solve does exactly the same
+total work. Solves are reported in the same shape the Krylov drivers use for
+iterations (`krylov/common/driver.cpp`):
+
+```
+MNMGDatalog TC (transitive closure)
+  backend    : GPU (omp target, device-resident buffers)
+  exec mode  : asynchronous (tasks)
+  taskgraph  : on (record once, replay)
+  version    : cudagraph
+  input      : MNMGDatalog-reference/data/data_7035.bin
+  size       : 7035 edges  ->  TC = 146120 tuples in 64 rounds
+  geometry   : 524288 grid-stride workers
+  schedule   : 1 warm-up + 5 timed solves
+  peak memory: 6.12 MB
+Statistics
+  total time (end-to-end)     :     18.346 ms
+    file IO                   :      0.123 ms
+    H2D transfer              :      0.012 ms
+    setup                     :      1.234 ms
+    graph build               :      7.945 ms
+    compute                   :      4.532 ms
+    D2H transfer              :      0.500 ms
+  solve 0 (record)            :     12.345 ms
+  solve 1 (1st replay)        :      4.456 ms
+  solves 2..4 (avg)           :      4.400 ms   (3 solves)
+  solves 2..4 (stddev)        :      0.012 ms
+```
+
+* **solve 0** is where the task graph is *recorded* (and, on its second round, the
+  command graph is built and optimized).
+* **solve 1** is the first solve that is entirely replay.
+* **solves 2..R-1** are steady state; with fewer than 3 timed solves the window
+  degrades gracefully (2 -> solve 1 alone, 1 -> solve 0 alone).
+* The `TC_WARMUP` solves before solve 0 run the same kernels with the taskgraph
+  wrapper **disabled**, so device bring-up (context, module load, kernel JIT,
+  first touch) is paid up front and does not pollute the record cost.
+
+**total time (end-to-end)** is the MNMGDatalog paper's metric and per-phase
+breakdown (`MNMGDatalog-paper`, Table "End-to-end total time (ms)" and Fig. "TC
+per-phase total time breakdown"): `file IO + H2D + setup + graph build + compute +
+D2H`, where *compute* is one steady-state solve plus the one-shot result
+compaction, and *graph build* is the record/build overhead paid once
+(`solve 0 - steady state`). The same numbers go into the 15-column `TC_CSV` row,
+which keeps the reference `tc_benchmark` schema.
 
 ## Device-resident sizes and the loop bound
 
@@ -111,10 +162,10 @@ slots each), so only the set grows with TC.
 
 ## Correctness
 
-Known reference sizes (from the reference README): `data_10` -> TC 18 / 3 iters,
+Known reference sizes (from the reference README): `data_10` -> TC 18 / 3 rounds,
 `data_7035` -> 146120 / 64, `data_23874` -> 481121 / 58. A build with
 `USE_TASKGRAPH=0` and one with `USE_TASKGRAPH=1` must produce the identical TC
-size, iteration count, and (via `TC_DUMP`) tuple set.
+size, round count, and (via `TC_DUMP`) tuple set.
 
 ## Evaluation harness
 

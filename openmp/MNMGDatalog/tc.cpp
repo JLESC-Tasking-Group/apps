@@ -30,6 +30,11 @@
  * blocking (synchronous) schedule. v3_conditional (on-GPU conditional loop) is
  * intentionally NOT ported: CGIR/XKOMP has no conditional-node support yet.
  *
+ * Metrics: the measured unit is one full SOLVE, reported as solve 0 (record) /
+ * solve 1 (1st replay) / solves 2..R-1 (avg, stddev) like the Krylov drivers, plus
+ * the MNMGDatalog paper's end-to-end total and per-phase breakdown (file IO, H2D,
+ * setup, graph build, compute, D2H). See the "Timing model and report" section.
+ *
  * Memory model: the large buffers are device-only (omp_target_alloc) and every
  * target construct reaches them via is_device_ptr(...) -- the direct analog of
  * the reference's cudaMalloc, with no host mirror of the (possibly multi-GB)
@@ -484,14 +489,32 @@ static void k_writeback(TCContext &ctx)
     OMP_TARGET_UPDATE(from(nc[0:1]) NOWAIT DEPEND(in, nc[0]))
 }
 
+/* The loop-invariant per-round kernel sequence -- the body that is recorded once
+ * and replayed. Byte-identical every round: same kernels, same buffers, same
+ * launch geometry; only the device-resident sizes read inside the kernels move. */
+static inline void tc_round(TCContext &ctx)
+{
+    k_reset(ctx);
+    k_expand(ctx);
+    k_promote(ctx);
+    k_set_sizes(ctx);
+    k_writeback(ctx);
+}
+
 /* One full fixpoint solve; returns the number of rounds. MUST be called from
- * inside a single region (see the enclosing `omp parallel/single` in main): the
- * warm-up and every timed repeat share that one region so the per-iteration body
- * (reset -> expand -> promote -> set_sizes) is recorded once (first round of the
- * warm-up) and REPLAYED for every subsequent round of every repeat -- the direct
- * analog of CUDA v2_cudagraph's build-once / replay. Convergence is tested on
- * the pinned-host new_count, refreshed by k_writeback's in-graph async D2H --
- * the same host round-trip the CUDA v2_cudagraph pays, minus the blocking copy.
+ * inside a single region (see the enclosing `omp parallel/single` in main), which
+ * every warm-up and every timed solve shares, so the round body is recorded once
+ * -- on the first round of the first GRAPHED solve -- and REPLAYED for every
+ * later round of every later solve: the direct analog of CUDA v2_cudagraph's
+ * build-once / replay. Convergence is tested on the pinned-host new_count,
+ * refreshed by k_writeback's in-graph async D2H -- the same host round-trip the
+ * CUDA v2_cudagraph pays, minus the blocking copy.
+ *
+ * `graph` selects whether each round is wrapped in TASKGRAPH_BEGIN/END. The
+ * untimed warm-up solves pass false so that they warm the device (context, module
+ * load, kernel JIT, first touch) WITHOUT consuming the recording pass -- timed
+ * solve 0 is then the one that records, exactly as iteration 0 of the Krylov
+ * solvers does. With USE_TASKGRAPH=0 the macros vanish and both paths coincide.
  *
  * The taskwait is required: it is what makes new_count[0] complete before the
  * host reads it. Under USE_TASKGRAPH the region is already effectively blocking
@@ -499,26 +522,29 @@ static void k_writeback(TCContext &ctx)
  * synchronous), so it costs nothing there; but with USE_TASKGRAPH=0 the
  * TASKGRAPH_BEGIN/END macros vanish and the nowait tasks would still be in
  * flight, so without it the loop would read a stale count and stop early. */
-static int tc_run_fixpoint(TCContext &ctx)
+static int tc_run_fixpoint(TCContext &ctx, bool graph)
 {
-    int iterations = 0;
+    int rounds = 0;
     int *nc = ctx.new_count;
     nc[0] = 1;                      /* prime: enter the loop (host copy only) */
-    for (iterations = 0; nc[0] > 0; ++iterations)
+    for (rounds = 0; nc[0] > 0; ++rounds)
     {
-        TASKGRAPH_BEGIN
+        if (graph)
         {
-            k_reset(ctx);
-            k_expand(ctx);
-            k_promote(ctx);
-            k_set_sizes(ctx);
-            k_writeback(ctx);
+            TASKGRAPH_BEGIN
+            {
+                tc_round(ctx);
+            }
+            TASKGRAPH_END
         }
-        TASKGRAPH_END
+        else
+        {
+            tc_round(ctx);
+        }
 
         #pragma omp taskwait
     }
-    return iterations;
+    return rounds;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -553,15 +579,6 @@ static void tc_mean_std(const double *v, int n, double *mean, double *sd)
     double m = 0.0; for (int i = 0; i < n; i++) m += v[i]; m /= n;
     double s = 0.0; for (int i = 0; i < n; i++) s += (v[i] - m) * (v[i] - m);
     *mean = m; *sd = (n > 1) ? std::sqrt(s / (n - 1)) : 0.0;
-}
-
-static double tc_median(double *v, int n)
-{
-    for (int i = 0; i < n; i++)
-        for (int j = i + 1; j < n; j++)
-            if (v[j] < v[i]) { double t = v[i]; v[i] = v[j]; v[j] = t; }
-    if (n == 0) return 0.0;
-    return (n & 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -727,8 +744,65 @@ static void tc_print_csv(const char *csv, int input, int iters, u64 tc, double t
 }
 
 /* ------------------------------------------------------------------------- */
+/* Timing model and report.                                                   */
+/*                                                                            */
+/* The measured unit is one full SOLVE (one fixpoint, all rounds), not one     */
+/* round: rounds do wildly different amounts of work (the frontier grows then  */
+/* collapses), so per-round times are not comparable, whereas every solve does */
+/* exactly the same total work. Solves are then reported the way the Krylov    */
+/* drivers report iterations (krylov/common/driver.cpp):                       */
+/*                                                                            */
+/*   solve 0            the graph is RECORDED here (and, on its second round,  */
+/*                      the command graph is built + optimized)                */
+/*   solve 1            first solve that is entirely replay                    */
+/*   solves 2..R-1      steady state -> avg / stddev                           */
+/*                                                                            */
+/* The untimed warm-up solves before solve 0 run the same kernels WITHOUT the  */
+/* taskgraph wrapper, so device bring-up (context, module load, kernel JIT,    */
+/* first touch) is paid before solve 0 and does not pollute the record cost.   */
+/*                                                                            */
+/* End-to-end "total time" follows the MNMGDatalog paper's per-phase breakdown */
+/* (Fig. "TC per-phase total time breakdown"): file IO + H2D + setup + graph   */
+/* build + compute + D2H, where compute is ONE steady-state solve plus the     */
+/* one-shot result compaction, and graph build is the record/build overhead    */
+/* paid once (solve 0 minus steady state).                                     */
+/* ------------------------------------------------------------------------- */
+typedef struct {
+    double solve0_s;        /* solve 0: record + command-graph build          */
+    double solve1_s;        /* solve 1: first full replay (0 if repeats < 2)  */
+    double steady_s;        /* mean of the steady-state solves                */
+    double steady_sd_s;     /* sample stddev of the steady-state solves       */
+    int    steady_from;     /* index of the first steady-state solve          */
+    int    steady_n;        /* number of steady-state solves                  */
+    double min_s;           /* fastest measured solve                         */
+    double build_s;         /* max(0, solve0 - steady): one-shot record+build */
+} TCTimings;
+
+/* Split the per-solve times into record / first-replay / steady state. With
+ * fewer than 3 solves the steady-state window degrades gracefully (2 solves ->
+ * solve 1 alone; 1 solve -> solve 0 alone) so short runs still report a number. */
+static TCTimings tc_timings(const double *t, int repeats)
+{
+    TCTimings s{};
+    s.solve0_s    = (repeats >= 1) ? t[0] : 0.0;
+    s.solve1_s    = (repeats >= 2) ? t[1] : 0.0;
+    s.steady_from = (repeats >= 3) ? 2 : (repeats >= 2 ? 1 : 0);
+    s.steady_n    = repeats - s.steady_from;
+    tc_mean_std(t + s.steady_from, s.steady_n, &s.steady_s, &s.steady_sd_s);
+
+    s.min_s = t[0];
+    for (int i = 1; i < repeats; i++) if (t[i] < s.min_s) s.min_s = t[i];
+
+    s.build_s = s.solve0_s - s.steady_s;
+    if (s.build_s < 0.0) s.build_s = 0.0;
+    return s;
+}
+
+/* ------------------------------------------------------------------------- */
 /* main. Usage: ./tc.x <data.bin> [capacity_mult] [repeats] [frontier_slots]  */
-/*   Env: TC_WRITE=1 writes <input>_<version>_tc.bin; TC_DUMP=<f> text dump;   */
+/*   Env: TC_WARMUP=<n> untimed warm-up solves before solve 0 (default 1);     */
+/*        TC_WORKERS=<n> grid-stride worker count (GPU);                       */
+/*        TC_WRITE=1 writes <input>_<version>_tc.bin; TC_DUMP=<f> text dump;   */
 /*        TC_CSV=<f> writes the 15-column machine row.                         */
 /* ------------------------------------------------------------------------- */
 int main(int argc, char **argv)
@@ -739,35 +813,36 @@ int main(int argc, char **argv)
     long frontier_slots = (argc >= 5) ? atol(argv[4]) : 0;
     if (repeats < 1) repeats = 1;
 
+    int warmups = 1;
+    const char *wu = getenv("TC_WARMUP");
+    if (wu && wu[0]) warmups = atoi(wu);
+    if (warmups < 0) warmups = 0;
+
     TCContext ctx;
     tc_setup(ctx, input_file, capacity_mult, frontier_slots);
 
-    /* One enclosing parallel/single spans the warm-up AND all timed repeats, so
-     * the per-iteration task graph is recorded once (first warm-up round) and
-     * replayed for every later round of every repeat -- like CUDA v2_cudagraph's
-     * build-once / replay. The warm-up (untimed) absorbs first-launch / JIT /
-     * graph-record cost; each repeat is then a pure replay-driven solve. */
-    int iterations = 0;
-    double warm = 0.0;
-    double *times = (double *)malloc(repeats * sizeof(double));
-    double min_t = 1e300;
+    /* One enclosing parallel/single spans the warm-up AND every timed solve, so
+     * the per-round task graph is recorded once -- on the first round of timed
+     * solve 0 -- and replayed for every later round of every later solve, like
+     * CUDA v2_cudagraph's build-once / replay. The warm-up solves run the same
+     * kernels with the taskgraph wrapper DISABLED, so they absorb first-launch /
+     * module-load / JIT / first-touch cost without consuming the record pass. */
+    int rounds = 0;
+    double *times = (double *)malloc((size_t)repeats * sizeof(double));
 
     #pragma omp parallel
     #pragma omp single
     {
-        // warmup
-        tc_reset_state(ctx);
-        double w0 = omp_get_wtime();
-        iterations = tc_run_fixpoint(ctx);
-        warm = omp_get_wtime() - w0;
+        for (int w = 0; w < warmups; w++) {
+            tc_reset_state(ctx);
+            rounds = tc_run_fixpoint(ctx, /* graph = */ false);
+        }
 
-        // measurements
         for (int r = 0; r < repeats; r++) {
             tc_reset_state(ctx);
             double s0 = omp_get_wtime();
-            iterations = tc_run_fixpoint(ctx);
+            rounds = tc_run_fixpoint(ctx, /* graph = */ true);
             times[r] = omp_get_wtime() - s0;
-            if (times[r] < min_t) min_t = times[r];
         }
     }
     tc_check_overflow(ctx);
@@ -794,11 +869,6 @@ int main(int argc, char **argv)
     double d2h = tc_now() - t0;
     dfree(d_compact); dfree(d_cnt);
 
-    double avg, sd; tc_mean_std(times, repeats, &avg, &sd);
-    double med = tc_median(times, repeats) + compact_s;
-    min_t += compact_s;
-    double compute_ms = avg * 1000.0;
-
     double fileio = ctx.t_fileio;
     if (getenv("TC_WRITE")) {
         double tw = tc_now();
@@ -806,21 +876,65 @@ int main(int argc, char **argv)
         fileio += tc_now() - tw;
     }
 
-    /* Human / harness-parseable stdout. */
-    printf("# MNMGDatalog TC (OpenMP)  version=%s  input=%s  edges=%d  iterations=%d  TC=%llu\n",
-           TC_VERSION, input_file, ctx.input_rows, iterations, tc);
-    printf("solve 0 (warmup)      : %.3f ms\n", warm * 1000.0);
-    printf("timed solves (avg)    : %.3f ms\n", compute_ms);
-    printf("timed solves (stddev) : %.3f ms\n", sd * 1000.0);
-    printf("total solve time      : %.6f s\n", med);
+    /* Per-phase end-to-end accounting, as in the MNMGDatalog paper: one
+     * steady-state solve of compute (plus the one-shot result compaction), the
+     * one-shot record/graph-build overhead, and the surrounding IO phases. */
+    const TCTimings st      = tc_timings(times, repeats);
+    const double compute_s  = st.steady_s + compact_s;
+    const double min_s      = st.min_s    + compact_s;
+    const double total_s    = fileio + ctx.t_h2d + ctx.t_setup
+                            + st.build_s + compute_s + d2h;
+
+    /* ---- Banner + statistics (same shape as the Krylov drivers) ---- */
+    printf("MNMGDatalog TC (transitive closure)\n");
+    printf("  %-11s: %s\n", "backend", USE_TARGET ? "GPU (omp target, device-resident buffers)"
+                                                  : "CPU (omp task, host memory)");
+    printf("  %-11s: %s\n", "exec mode", USE_SYNC ? "synchronous (blocking, no tasks)"
+                                                  : "asynchronous (tasks)");
+    printf("  %-11s: %s\n", "taskgraph", (USE_TASKGRAPH && !USE_SYNC) ? "on (record once, replay)" : "off");
+    printf("  %-11s: %s\n", "version", TC_VERSION);
+    printf("  %-11s: %s\n", "input", input_file);
+    printf("  %-11s: %d edges  ->  TC = %llu tuples in %d rounds\n",
+           "size", ctx.input_rows, tc, rounds);
+#if USE_TARGET
+    printf("  %-11s: %d grid-stride workers\n", "geometry", ctx.n_workers);
+#endif
+    printf("  %-11s: %d warm-up + %d timed solve%s\n",
+           "schedule", warmups, repeats, repeats == 1 ? "" : "s");
+    printf("  %-11s: %.2f MB\n", "peak memory", ctx.peak_mem_mb);
+
+    printf("Statistics\n");
+    printf("  %-27s : %10.3f ms\n", "total time (end-to-end)", total_s * 1000.0);
+    printf("  %-27s : %10.3f ms\n", "  file IO",     fileio       * 1000.0);
+    printf("  %-27s : %10.3f ms\n", "  H2D transfer", ctx.t_h2d   * 1000.0);
+    printf("  %-27s : %10.3f ms\n", "  setup",       ctx.t_setup  * 1000.0);
+    printf("  %-27s : %10.3f ms\n", "  graph build", st.build_s   * 1000.0);
+    printf("  %-27s : %10.3f ms\n", "  compute",     compute_s    * 1000.0);
+    printf("  %-27s : %10.3f ms\n", "  D2H transfer", d2h         * 1000.0);
+
+    {
+        char lbl[64];
+        const int graphed = (USE_TASKGRAPH && !USE_SYNC);
+        snprintf(lbl, sizeof lbl, "solve 0%s", graphed ? " (record)" : "");
+        printf("  %-27s : %10.3f ms\n", lbl, st.solve0_s * 1000.0);
+        if (repeats >= 2) {
+            snprintf(lbl, sizeof lbl, "solve 1%s", graphed ? " (1st replay)" : "");
+            printf("  %-27s : %10.3f ms\n", lbl, st.solve1_s * 1000.0);
+        }
+        if (repeats >= 3) {
+            snprintf(lbl, sizeof lbl, "solves %d..%d (avg)", st.steady_from, repeats - 1);
+            printf("  %-27s : %10.3f ms   (%d solves)\n", lbl, st.steady_s * 1000.0, st.steady_n);
+            snprintf(lbl, sizeof lbl, "solves %d..%d (stddev)", st.steady_from, repeats - 1);
+            printf("  %-27s : %10.3f ms\n", lbl, st.steady_sd_s * 1000.0);
+        }
+    }
     fflush(stdout);
 
     const char *csv = getenv("TC_CSV");
-    if (csv && csv[0]) {
-        double total = fileio + ctx.t_h2d + ctx.t_setup + 0.0 + med + d2h;
-        tc_print_csv(csv, ctx.input_rows, iterations, tc, total, fileio, ctx.t_h2d,
-                     ctx.t_setup, 0.0, med, min_t, d2h, ctx.peak_mem_mb, repeats, input_file);
-    }
+    if (csv && csv[0])
+        tc_print_csv(csv, ctx.input_rows, rounds, tc, total_s, fileio, ctx.t_h2d,
+                     ctx.t_setup, st.build_s, compute_s, min_s, d2h,
+                     ctx.peak_mem_mb, repeats, input_file);
 
     const char *dump = getenv("TC_DUMP");
     if (dump && dump[0]) tc_dump(host, (long long)tc, dump);

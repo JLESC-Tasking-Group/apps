@@ -10,7 +10,13 @@
 #     make USE_SYNC=1               # synchronous blocking baseline
 #
 # Run: ./tc.x <data.bin> [capacity_mult] [repeats] [frontier_slots]
+#   TC_WARMUP=<n>  untimed warm-up solves before the timed solve 0 (default 1)
+#   TC_WORKERS=<n> grid-stride worker count of the GPU fixpoint kernels
 #   TC_WRITE=1 writes <input>_<version>_tc.bin ; TC_CSV=<f> writes the metric row.
+#
+# Reports solve 0 (record) / solve 1 (1st replay) / solves 2..R-1 (avg, stddev)
+# like the Krylov drivers, plus the MNMGDatalog paper's end-to-end total and its
+# per-phase breakdown (file IO, H2D, setup, graph build, compute, D2H).
 # =============================================================================
 include ../common.mk
 
@@ -29,9 +35,10 @@ all: tc
 tc: tc.cpp ../tasking.h ../alloc.h ../alloc.c
 	$(CC) $(CFLAGS) tc.cpp ../alloc.c -o $(program) $(LDFLAGS)
 
-# data_7035.bin -> TC=146120 in 64 iterations (see the reference README).
+# data_7035.bin -> TC=146120 in 64 rounds (see the reference README). 3 timed
+# solves is the minimum that reports record / 1st replay / steady state.
 test: tc
-	./$(program) $(DATA) $(MULT) 1
+	./$(program) $(DATA) $(MULT) 3
 
 run: tc
 	./$(program) $(DATA) $(MULT) $(REPEATS)

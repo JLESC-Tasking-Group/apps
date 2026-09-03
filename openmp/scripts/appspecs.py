@@ -106,18 +106,18 @@ def _parse_lulesh(text):
 
 
 def _parse_mnmg(text):
-    # tc.cpp reports per-SOLVE times in the same shape as the Krylov drivers (see
-    # MNMGDatalog/tc.cpp): solve 0 records the task graph, solve 1 is the first
-    # full replay, solves 2.. are steady state. "total time (end-to-end)" is the
-    # MNMGDatalog paper's metric (file IO + H2D + setup + graph build + compute +
-    # D2H) and is printed in ms, unlike the other apps' seconds.
-    avg = _grab(text, r"solves \d+\.\.\d+ \(avg\)\s*:\s*" + _F + r"\s*ms")
-    std = _grab(text, r"solves \d+\.\.\d+ \(stddev\)\s*:\s*" + _F + r"\s*ms")
-    it0 = _grab(text, r"solve 0[^:]*:\s*" + _F + r"\s*ms")
+    # tc.cpp reports per-ROUND times in the same shape as the Krylov drivers (see
+    # MNMGDatalog/tc.cpp): round 0 records the task graph, round 1 is the first
+    # replay (and where the command graph is built), rounds 2.. are steady state.
+    # "total time (end-to-end)" is the MNMGDatalog paper's metric (file IO + H2D +
+    # setup + compute + D2H) and is printed in ms, unlike the other apps' seconds.
+    avg = _grab(text, r"rounds \d+\.\.\d+ \(avg\)\s*:\s*" + _F + r"\s*ms")
+    std = _grab(text, r"rounds \d+\.\.\d+ \(stddev\)\s*:\s*" + _F + r"\s*ms")
+    it0 = _grab(text, r"round 0[^:]*:\s*" + _F + r"\s*ms")
     if avg is None:
-        # fewer than 3 timed solves: no steady-state window, fall back to the
-        # last solve that was reported.
-        avg = _grab(text, r"solve 1[^:]*:\s*" + _F + r"\s*ms")
+        # fewer than 3 rounds: no steady-state window, fall back to the last
+        # round that was reported.
+        avg = _grab(text, r"round 1[^:]*:\s*" + _F + r"\s*ms")
         if avg is None:
             avg = it0
         std = 0.0 if avg is not None else None
@@ -245,15 +245,19 @@ LLMC = AppSpec(
 # The "size" selects the input MNMGDatalog-reference/data/data_<size>.bin
 # (size = edge count) and the x-axis work is that edge count. capacity_mult sizes
 # the result set (next_pow2(edges * mult); must be >= ~2x TC or the run aborts
-# with an overflow message), and iters = number of timed solve repeats. TC has no
-# task-count knob, so grain / the synchronous 1-task/loop are irrelevant here.
+# with an overflow message).
+# `iters` is NOT a knob here: the fixpoint runs until it converges, so the number
+# of rounds is determined by the dataset (data_7035 -> 64, data_23874 -> 58) and
+# each round is timed individually. Likewise TC has no task-count knob, so grain /
+# the synchronous 1-task/loop are irrelevant. (The untimed warm-up rounds before
+# round 0 are set with the TC_WARMUP env var; the default of 3 is used here.)
 _MNMG_DATA = "MNMGDatalog-reference/data"
 _MNMG_MULT = {7035: 64, 23874: 64}     # verified small graphs (TC 146120 / 481121)
 _MNMG_MULT_DEFAULT = 4096              # generous default; raise via a larger set
 
 def _mnmg_run(variant, size, iters, cfg, grain):
     mult = _MNMG_MULT.get(size, _MNMG_MULT_DEFAULT)
-    return [f"{_MNMG_DATA}/data_{size}.bin", str(mult), str(iters)]
+    return [f"{_MNMG_DATA}/data_{size}.bin", str(mult)]
 
 MNMG = AppSpec(
     name="mnmg",
@@ -265,7 +269,7 @@ MNMG = AppSpec(
     parse=_parse_mnmg,
     work=lambda n: (float(n), "edges"),
     sizes=[7035, 23874],
-    iters=5,
+    iters=0,                           # unused: round count comes from the data
 )
 
 APPS: Dict[str, AppSpec] = {a.name: a for a in (KRYLOV, LULESH, LLMC, MNMG)}

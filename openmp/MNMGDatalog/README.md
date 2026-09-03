@@ -72,23 +72,23 @@ make USE_TARGET=1 USE_TASKGRAPH=1        # GPU, replayed graph (v2_cudagraph)
 make USE_TARGET=1 USE_TASKGRAPH=0        # GPU, host loop      (v1_baseline)
 make                                     # CPU tasks (default), for correctness
 
-./tc.x <data.bin> [capacity_mult] [repeats] [frontier_slots]
-make test                                # data_7035.bin (TC=146120, 64 iters)
+./tc.x <data.bin> [capacity_mult] [frontier_slots]
+make test                                # data_7035.bin (TC=146120, 64 rounds)
 ```
 
-Environment: `TC_WARMUP=<n>` untimed warm-up solves before solve 0 (default 1);
-`TC_WORKERS=<n>` overrides the GPU grid-stride worker count (see below);
-`TC_WRITE=1` writes `<input>_<version>_tc.bin` (off by default so sweeps stay
-clean); `TC_DUMP=<f>` writes a `src dst` text dump; `TC_CSV=<f>` writes the
+The fixpoint runs **once**; the number of rounds is determined by the dataset, not
+by a command-line knob.
+
+Environment: `TC_WARMUP=<n>` untimed, ungraphed warm-up rounds before round 0
+(default 3); `TC_WORKERS=<n>` overrides the GPU grid-stride worker count (see
+below); `TC_WRITE=1` writes `<input>_<version>_tc.bin` (off by default so sweeps
+stay clean); `TC_DUMP=<f>` writes a `src dst` text dump; `TC_CSV=<f>` writes the
 reference's 15-column metric row.
 
 ## Metrics
 
-The measured unit is one full **solve** (one fixpoint, all rounds), not one round:
-rounds do wildly different amounts of work (the frontier grows, then collapses),
-so per-round times are not comparable, whereas every solve does exactly the same
-total work. Solves are reported in the same shape the Krylov drivers use for
-iterations (`krylov/common/driver.cpp`):
+The measured unit is one fixpoint **round**, reported in the same shape the Krylov
+drivers use for iterations (`krylov/common/driver.cpp`):
 
 ```
 MNMGDatalog TC (transitive closure)
@@ -99,38 +99,48 @@ MNMGDatalog TC (transitive closure)
   input      : MNMGDatalog-reference/data/data_7035.bin
   size       : 7035 edges  ->  TC = 146120 tuples in 64 rounds
   geometry   : 524288 grid-stride workers
-  schedule   : 1 warm-up + 5 timed solves
+  warm-up    : 3 untimed rounds (ungraphed)
   peak memory: 6.12 MB
 Statistics
   total time (end-to-end)     :     18.346 ms
     file IO                   :      0.123 ms
     H2D transfer              :      0.012 ms
     setup                     :      1.234 ms
-    graph build               :      7.945 ms
     compute                   :      4.532 ms
     D2H transfer              :      0.500 ms
-  solve 0 (record)            :     12.345 ms
-  solve 1 (1st replay)        :      4.456 ms
-  solves 2..4 (avg)           :      4.400 ms   (3 solves)
-  solves 2..4 (stddev)        :      0.012 ms
+  round 0 (record)            :      0.345 ms
+  round 1 (1st replay)        :      0.120 ms
+  rounds 2..63 (avg)          :      0.065 ms   (62 rounds)
+  rounds 2..63 (stddev)       :      0.031 ms
 ```
 
-* **solve 0** is where the task graph is *recorded* (and, on its second round, the
-  command graph is built and optimized).
-* **solve 1** is the first solve that is entirely replay.
-* **solves 2..R-1** are steady state; with fewer than 3 timed solves the window
-  degrades gracefully (2 -> solve 1 alone, 1 -> solve 0 alone).
-* The `TC_WARMUP` solves before solve 0 run the same kernels with the taskgraph
-  wrapper **disabled**, so device bring-up (context, module load, kernel JIT,
-  first touch) is paid up front and does not pollute the record cost.
+* **round 0** is where the task graph is *recorded* (XKOMP `rc == 1`).
+* **round 1** is the first replay, and where the command graph is built and
+  optimized (XKOMP `rc == 2`, `xkomp/src/xkomp/taskgraph.cc`).
+* **rounds 2..N-1** are steady state; with fewer than 3 rounds the window degrades
+  gracefully (2 -> round 1 alone, 1 -> round 0 alone).
+* The `TC_WARMUP` rounds before round 0 run the same kernels with the taskgraph
+  wrapper **disabled**, so OpenMP team creation and device bring-up (context,
+  module load, kernel JIT, first touch) are paid up front without consuming the
+  record pass.
+
+> **Caveat:** unlike a Krylov iteration, TC rounds do very different amounts of
+> work -- the frontier grows for the first rounds and then collapses. The
+> `rounds 2..N-1` stddev therefore mostly reflects that frontier-size profile, not
+> run-to-run jitter. The useful comparison is round 0 and round 1 against the
+> steady mean, which isolates the record and graph-build overheads.
 
 **total time (end-to-end)** is the MNMGDatalog paper's metric and per-phase
 breakdown (`MNMGDatalog-paper`, Table "End-to-end total time (ms)" and Fig. "TC
-per-phase total time breakdown"): `file IO + H2D + setup + graph build + compute +
-D2H`, where *compute* is one steady-state solve plus the one-shot result
-compaction, and *graph build* is the record/build overhead paid once
-(`solve 0 - steady state`). The same numbers go into the 15-column `TC_CSV` row,
-which keeps the reference `tc_benchmark` schema.
+per-phase total time breakdown"): `file IO + H2D + setup + compute + D2H`, where
+*compute* is the whole measured fixpoint plus the one-shot result compaction.
+Unlike the CUDA reference -- which captures and instantiates the graph in a
+separate, separately-timed `Build` phase (`tc_v2.cu` `tc_build`) -- XKOMP records
+and builds *inside* the loop, so there is no separate build phase to time: that
+cost sits in compute and is visible as rounds 0 and 1. Every printed number is
+measured, none is extrapolated. The same numbers go into the 15-column `TC_CSV`
+row, which keeps the reference `tc_benchmark` schema (`build` = 0, `compute_min` =
+`compute`, `repeats` = 1).
 
 ## Device-resident sizes and the loop bound
 
@@ -171,5 +181,9 @@ size, round count, and (via `TC_DUMP`) tuple set.
 
 Registered as app `mnmg` in `../scripts/appspecs.py`; datasets are `data_<N>.bin`
 where `N` = edge count, so `evaluate.py --apps mnmg --sizes 7035,23874` maps sizes
-to files. `evaluate.py` sweeps the synchronous / no-taskgraph / taskgraph configs
+to files. `--iters` is ignored for `mnmg` (the round count comes from the data;
+use `TC_WARMUP` for the warm-up rounds). `avg_ms`/`stddev_ms` come from the
+steady-state rounds, `iter0_ms` from round 0 (the record round) and `elapsed_s`
+from the end-to-end total. `evaluate.py` sweeps the synchronous / no-taskgraph /
+taskgraph configs
 just like the other apps.

@@ -9,14 +9,16 @@
 #     make USE_TARGET=1             # GPU target offload (default is CPU tasks)
 #     make USE_SYNC=1               # synchronous blocking baseline
 #
-# Run: ./tc.x <data.bin> [capacity_mult] [repeats] [frontier_slots]
-#   TC_WARMUP=<n>  untimed warm-up solves before the timed solve 0 (default 1)
+# Run: ./tc.x <data.bin> [capacity_mult] [frontier_slots]
+#   TC_WARMUP=<n>  untimed, ungraphed warm-up rounds before round 0 (default 3)
 #   TC_WORKERS=<n> grid-stride worker count of the GPU fixpoint kernels
 #   TC_WRITE=1 writes <input>_<version>_tc.bin ; TC_CSV=<f> writes the metric row.
 #
-# Reports solve 0 (record) / solve 1 (1st replay) / solves 2..R-1 (avg, stddev)
-# like the Krylov drivers, plus the MNMGDatalog paper's end-to-end total and its
-# per-phase breakdown (file IO, H2D, setup, graph build, compute, D2H).
+# The fixpoint runs ONCE and each round is timed: round 0 (record) / round 1 (1st
+# replay) / rounds 2..N-1 (avg, stddev), the same shape the Krylov drivers use for
+# iterations, plus the MNMGDatalog paper's end-to-end total and its per-phase
+# breakdown (file IO, H2D, setup, compute, D2H). The round count is determined by
+# the dataset, not by a command-line knob.
 # =============================================================================
 include ../common.mk
 
@@ -26,7 +28,6 @@ CFLAGS += -Wall -Wextra
 DATA_DIR ?= MNMGDatalog-reference/data
 DATA     ?= $(DATA_DIR)/data_7035.bin
 MULT     ?= 64
-REPEATS  ?= 5
 
 program = tc.x
 
@@ -35,13 +36,9 @@ all: tc
 tc: tc.cpp ../tasking.h ../alloc.h ../alloc.c
 	$(CC) $(CFLAGS) tc.cpp ../alloc.c -o $(program) $(LDFLAGS)
 
-# data_7035.bin -> TC=146120 in 64 rounds (see the reference README). 3 timed
-# solves is the minimum that reports record / 1st replay / steady state.
-test: tc
-	./$(program) $(DATA) $(MULT) 3
-
-run: tc
-	./$(program) $(DATA) $(MULT) $(REPEATS)
+# data_7035.bin -> TC=146120 in 64 rounds (see the reference README).
+test run: tc
+	./$(program) $(DATA) $(MULT)
 
 clean:
 	rm -f $(program) *.o

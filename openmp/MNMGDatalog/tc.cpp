@@ -103,7 +103,7 @@ struct Entity { int key; int value; };
 /* Device-callable helpers (hashing + atomics). declare target only on GPU.   */
 /* ------------------------------------------------------------------------- */
 #if USE_TARGET
-# pragma omp declare target
+# pragma omp begin declare target
 #endif
 
 /* Murmur3 finalizer (mirrors get_position in the codebase). */

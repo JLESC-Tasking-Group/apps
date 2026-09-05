@@ -18,6 +18,7 @@
 # LLVM / XKOMP fork). A portable CPU build (USE_TASKGRAPH=0) also works on
 # vanilla clang. Override on the command line with `make CC=clang++`.
 CC = xkcxx -DUSE_XKOMP=1
+#CC=clang++
 
 # ---- Backend / schedule toggles (override on the command line) ------------
 USE_TARGET     ?= 0     # 0: host CPU tasks        1: GPU target offload

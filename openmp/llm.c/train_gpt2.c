@@ -34,8 +34,6 @@ it fast.
 #include "ompss-2_settings.h"
 // defines : dep_init, dep_finish, dep_set_slice_shape, dep_reset, all OmpSs-2 wrapper functions
 #include "ompss-2_wrappers.h"
-// defines TIMERS_INIT, TICK, TOCK, GET_TIME
-#include "timer.h"
 // defines mpi_init mpi_finalize mpi_scatter_inputs mpi_share_gradients mpi_get_adam_buffer_size mpi_update_params_slice mpi_broadcast_parameters
 // mpi_init_ring_communications mpi_loss_reduce mpi_inference_share_gen_token mpi_get_rank_B mpi_get_rank_T mpi_get_world_B mpi_get_world_T mpi_get_rank
 // mpi_get_worldsize mpi_is_comm_initialized
@@ -3389,9 +3387,6 @@ int sample_mult(float *probabilities, int n, float coin) {
 // main training loop
 int main(int argc, char *argv[])
 {
-    TIMERS_INIT(2); // applicaiton, iteration
-    TICK(0);
-
     // build the GPT-2 model from a checkpoint
     setvbuf(stdout, NULL, _IOFBF, 0);
     GPT2 model;
@@ -3474,7 +3469,6 @@ int main(int argc, char *argv[])
 
     // train
     int step = 1;
-    TICK(1); // Iteration runtime clock
     fflush(stdout);
     // #pragma omp taskwait
 
@@ -3523,6 +3517,8 @@ int main(int argc, char *argv[])
 #endif
         for (int taskiter_step = 0; taskiter_step < NB_STEPS; ++taskiter_step)
         {
+            const double t0 = omp_get_wtime();
+
             // Decide between using a compiler that implements the taskgraph construct
             // Can choose between Julian's LLVM implementation or XKOMP's.
             // (OmpSs-2 uses `oss taskiter` on the loop above instead of taskgraph.)
@@ -3560,49 +3556,25 @@ int main(int argc, char *argv[])
 
                 // Update the weights with the computed gradients
                 gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, &step);
-
-                // Calculate metrics and output to the terminal
-                // OMPT_SET_LABEL("metrics");
-#if USE_TARGET
-                // Bring the scalar loss back to the host (only per-iteration D2H),
-                // then print from a host task. Use the host loop counter for
-                // indexing/printing since the step counter lives on the device.
-                #pragma omp target update from(model.mean_loss) nowait \
-                    DEPEND(inout, model.mean_loss)
-                OMP_HOST_TASK(DEPEND(in, model.mean_loss) firstprivate(taskiter_step))
-                {
-                    double time_elapsed_it_s = TOCK(1);
-                    double tokens_per_seconds = BATCH_SIZE * SEQUENCE_SIZE / time_elapsed_it_s;
-                    runtimes[taskiter_step] = time_elapsed_it_s;
-                    tok_s[taskiter_step] = tokens_per_seconds;
-                    if (rank == 0)
-                        fprintf(stderr, "Step %d :\tIteration runtime : %0.1lf ms, \t\t tokens/s : %0.1lf, \t\t tokens/(s.cpus) : %0.2lf, \t\t Loss : %f \t\t MFU : %0.2f "
-                                "%%\n",
-                                taskiter_step + 1, time_elapsed_it_s * 1000, tokens_per_seconds, tokens_per_seconds / mpi_cpu_count, model.mean_loss,
-                                100 * gpt2_estimate_mfu(&model, B * T, time_elapsed_it_s, mpi_cpu_count));
-                    fflush(stdout);
-                    TICK(1);
-                }
-#else
-                OMP_TASK(DEPEND(in, model.mean_loss))
-                {
-                    double time_elapsed_it_s = TOCK(1);
-                    double tokens_per_seconds = BATCH_SIZE * SEQUENCE_SIZE / time_elapsed_it_s;
-                    runtimes[step - 2] = time_elapsed_it_s;
-                    tok_s[step - 2] = tokens_per_seconds;
-                    if (rank == 0)
-                        fprintf(stderr, "Step %d :\tIteration runtime : %0.1lf ms, \t\t tokens/s : %0.1lf, \t\t tokens/(s.cpus) : %0.2lf, \t\t Loss : %f \t\t MFU : %0.2f "
-                                "%%\n",
-                                step - 1, time_elapsed_it_s * 1000, tokens_per_seconds, tokens_per_seconds / mpi_cpu_count, model.mean_loss,
-                                100 * gpt2_estimate_mfu(&model, B * T, time_elapsed_it_s, mpi_cpu_count));
-                    fflush(stdout);
-                    TICK(1);
-                }
-#endif
             }
             # if USE_TASKGRAPH && !USE_OMPSS && USE_XKOMP
             );
             # endif /* USE_TASKGRAPH && !USE_OMPSS && USE_XKOMP */
+
+           // Calculate metrics and output to the terminal
+          const double tf = omp_get_wtime();
+          double time_elapsed_it_s = tf - t0;
+          double tokens_per_seconds = BATCH_SIZE * SEQUENCE_SIZE / time_elapsed_it_s;
+          runtimes[taskiter_step] = time_elapsed_it_s;
+          tok_s[taskiter_step] = tokens_per_seconds;
+          if (rank == 0)
+          {
+              fprintf(stderr, "Step %d :\tIteration runtime : %0.1lf ms, \t\t tokens/s : %0.1lf, \t\t tokens/(s.cpus) : %0.2lf, \t\t Loss : %f \t\t MFU : %0.2f "
+                      "%%\n",
+                      taskiter_step + 1, time_elapsed_it_s * 1000, tokens_per_seconds, tokens_per_seconds / mpi_cpu_count, model.mean_loss,
+                      100 * gpt2_estimate_mfu(&model, B * T, time_elapsed_it_s, mpi_cpu_count));
+              fflush(stdout);
+          }
 
         } /* taskiter loop */
     } /* single, parallel  */
@@ -3679,7 +3651,7 @@ int main(int argc, char *argv[])
     gpt2_free(&model);
     util_free(gen_tokens, B * T * sizeof(int));
 
-    const double application_time = TOCK(0);
+    const double application_time = omp_get_wtime();
     if (rank == 0)
         fprintf(stderr, "Application total runtime : \t\t%0.1f ms\n\n", application_time * 1000);
 

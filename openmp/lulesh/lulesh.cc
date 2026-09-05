@@ -2719,7 +2719,6 @@ OMP_TARGET_ENTER_DATA( \
     }
     opts.iteration_cap -= 1;
     # endif
-
     }
     TASKGRAPH_END
 

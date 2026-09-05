@@ -799,8 +799,22 @@ int main(int argc, char *argv[])
   opts.cost = 1;
   opts.iteration_cap = 0;
   opts.nb  = 32;
+  opts.unroll = 1;
 
   ParseCommandLineOptions(argc, argv, myRank, &opts);
+
+  /* The unrolled cycles form one taskgraph instance, so the cycle count must be
+   * a whole number of instances (there is no epilogue: a shorter last instance
+   * would be a different graph and would not replay). */
+  if (opts.its % opts.unroll != 0) {
+    const Int_t its = (opts.its / opts.unroll) * opts.unroll;
+    if (its == 0) {
+      printf("-u %d exceeds -i %d: nothing to run\n", opts.unroll, opts.its);
+      exit(-1);
+    }
+    printf("-i %d is not a multiple of -u %d: running %d cycles\n", opts.its, opts.unroll, its);
+    opts.its = its;
+  }
 
   if ((myRank == 0) && (opts.quiet == 0)) {
     printf("Running problem size %d^3 per domain until completion\n", opts.nx);
@@ -1284,10 +1298,17 @@ OMP_TARGET_ENTER_DATA( \
 
   double t0, t1, tf;
 
-  /* Per-iteration wall-clock times (ms). Recorded by a depend-synchronized host
-   * task at the end of each iteration: iteration 0 is the taskgraph record, 1
-   * the first replay, 2.. the steady state -- like the krylov / cholesky apps. */
-  double *iter_times = (double *) malloc(sizeof(double) * (opts.its > 0 ? opts.its : 1));
+  /* One taskgraph instance covers `unroll` cycles (see -u), so the loop steps by
+   * that much and there are `ninst` instances. */
+  const Int_t unroll = opts.unroll;
+  const Int_t ninst  = (opts.its > 0) ? (opts.its / unroll) : 0;
+
+  /* Per-cycle wall-clock times (ms), one entry per taskgraph instance and
+   * divided by `unroll` so the unit is always one cycle. Recorded by a
+   * depend-synchronized host task at the end of each instance: instance 0 is the
+   * taskgraph record, 1 the first replay, 2.. the steady state -- like the
+   * krylov / cholesky apps. */
+  double *iter_times = (double *) malloc(sizeof(double) * (ninst > 0 ? ninst : 1));
   double prev_ts = 0.0;
 
   Int_t numThreads = 0;
@@ -1300,10 +1321,19 @@ OMP_TARGET_ENTER_DATA( \
 
     t0 = omp_get_wtime();
     prev_ts = t0;
-  for (Int_t iter = 0; iter < opts.its; ++iter) {
+  for (Int_t inst = 0; inst < ninst; ++inst) {
 
       TASKGRAPH_BEGIN
       {
+      /* `unroll` cycles per taskgraph instance. The construct carries an
+       * implicit taskgroup, so instance i+1 cannot start before i has fully
+       * drained -- which costs exactly the cross-cycle overlap that the plain
+       * task version gets for free (its only taskwait is after the loop). The
+       * cycles unrolled here overlap *inside* the instance, and the barrier is
+       * paid once per `unroll` cycles instead of once per cycle. The body is
+       * unrollable as-is: it does not depend on the cycle index and has no
+       * host-side control flow. */
+      for (Int_t u = 0; u < unroll; ++u) {
 
     //==============================================================================
     // TimeIncrement(*locDom) ;
@@ -2720,24 +2750,26 @@ OMP_TARGET_ENTER_DATA( \
     opts.iteration_cap -= 1;
     # endif
 
+      } /* unroll */
     }
     TASKGRAPH_END
 
-    /* Per-iteration timing + progress print. Created OUTSIDE the taskgraph (so
-     * it is not recorded/replayed) and depend-synchronized on this iteration's
-     * per-step scalars, so it fires after the iteration's last work (TimeIncrement
-     * update + end-of-step reductions) and before the next iteration's
-     * TimeIncrement -- recording the steady-state per-iteration wall time. It
-     * reads the host copies of cycle/time/deltatime kept current by the earlier
-     * `target update from`. */
-    OMP_HOST_TASK(firstprivate(iter, iter_times) shared(prev_ts)
+    /* Per-instance timing + progress print. Created OUTSIDE the taskgraph (so
+     * it is not recorded/replayed) and depend-synchronized on this instance's
+     * per-step scalars, so it fires after the instance's last work (TimeIncrement
+     * update + end-of-step reductions) and before the next instance's
+     * TimeIncrement -- recording the steady-state wall time. It reads the host
+     * copies of cycle/time/deltatime kept current by the earlier `target update
+     * from`. Divided by `unroll` so the reported unit stays one cycle whatever
+     * the unroll factor. */
+    OMP_HOST_TASK(firstprivate(inst, unroll, iter_times) shared(prev_ts)
                   DEPEND(in, cycle[0], time[0], deltatime[0], dtcourant[0], dthydro[0]))
     {
         const double now = omp_get_wtime();
-        iter_times[iter] = (now - prev_ts) * 1000.0;
+        iter_times[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
         prev_ts = now;
         printf("cycle = %d, time = %e, dt=%e, exec = %.3f ms\n",
-               cycle[0], double(time[0]), double(deltatime[0]), iter_times[iter]);
+               cycle[0], double(time[0]), double(deltatime[0]), iter_times[inst]);
     }
   }
   t1 = omp_get_wtime();
@@ -2786,20 +2818,24 @@ OMP_TARGET_ENTER_DATA( \
   printf("FOM/watt             = %10.8g (z/s/J)\n", fom_per_watt);
   printf("TDG creation time    = %10.8g (s)\n", t1 - t0);
 
-  /* Per-iteration timing summary (record / 1st replay / steady mean+stddev),
-   * parseable by scripts/evaluate.py -- same breakdown as the krylov app. */
-  if (opts.its > 0) {
-    const int lo  = (opts.its > 2) ? 2 : (opts.its > 1 ? 1 : 0);  /* first steady iter */
-    const int cnt = opts.its - lo;
+  /* Timing summary (record / 1st replay / steady mean+stddev), parseable by
+   * scripts/evaluate.py -- same breakdown as the krylov app. Times are per
+   * cycle; the record / 1st-replay entries are the first two taskgraph
+   * instances, i.e. cycles [0, unroll) and [unroll, 2*unroll). */
+  if (ninst > 0) {
+    const int lo  = (ninst > 2) ? 2 : (ninst > 1 ? 1 : 0);  /* first steady instance */
+    const int cnt = ninst - lo;
     double mean = 0.0;
-    for (int r = lo; r < opts.its; r++) mean += iter_times[r];
+    for (int r = lo; r < ninst; r++) mean += iter_times[r];
     if (cnt > 0) mean /= cnt;
     double var = 0.0;
-    for (int r = lo; r < opts.its; r++) { double d = iter_times[r] - mean; var += d * d; }
+    for (int r = lo; r < ninst; r++) { double d = iter_times[r] - mean; var += d * d; }
     const double sd = (cnt > 1) ? sqrt(var / (cnt - 1)) : 0.0;
+    if (unroll > 1)
+      printf("taskgraph unroll     : %10d cycles/instance (%d instances)\n", unroll, ninst);
     printf("iteration 0          : %10.3f ms  (record)\n", iter_times[0]);
     printf("iteration 1          : %10.3f ms  (1st replay)\n",
-           (opts.its > 1) ? iter_times[1] : iter_times[0]);
+           (ninst > 1) ? iter_times[1] : iter_times[0]);
     printf("iterations 2.. (avg)    : %10.3f ms\n", mean);
     printf("iterations 2.. (stddev) : %10.3f ms\n", sd);
   }

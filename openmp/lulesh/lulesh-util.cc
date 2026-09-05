@@ -38,6 +38,12 @@ static void PrintCommandLineOptions(char *execname, int myRank)
       printf(" -p              : Print out progress\n");
       printf(" -v              : Output viz file (requires compiling with -DVIZ_MESH\n");
       printf(" -nb             : Number of tasks per loop\n");
+      printf(" -u <unroll>     : Cycles per taskgraph instance (def: 1). The taskgraph\n");
+      printf("                   construct carries an implicit taskgroup, so consecutive\n");
+      printf("                   instances cannot overlap; unrolling <unroll> cycles into\n");
+      printf("                   one instance recovers that overlap inside the graph and\n");
+      printf("                   amortizes the barrier. Must divide -i. No effect without\n");
+      printf("                   the taskgraph (USE_TASKGRAPH=0).\n");
       printf(" -h              : This message\n");
       printf("\n\n");
    }
@@ -89,6 +95,17 @@ void ParseCommandLineOptions(int argc, char *argv[],
             ok = StrToInt(argv[i+1], &(opts->nb));
             if(!ok) {
                ParseError("Parse Error on option -nb integer value required after argument\n", myRank);
+            }
+            i+=2;
+         }
+	 /* -u <cycles per taskgraph instance> */
+         else if(strcmp(argv[i], "-u") == 0) {
+            if (i+1 >= argc) {
+               ParseError("Missing integer argument to -u\n", myRank);
+            }
+            ok = StrToInt(argv[i+1], &(opts->unroll));
+            if(!ok || opts->unroll < 1) {
+               ParseError("Parse Error on option -u positive integer value required after argument\n", myRank);
             }
             i+=2;
          }

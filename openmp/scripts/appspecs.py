@@ -271,6 +271,18 @@ class AppSpec:
     # and #errors on anything but 1 under OmpSs-2 (its taskiter has no epilogue
     # to fold), so the harness pins it instead of failing every build.
     max_unroll: Dict[str, int] = field(default_factory=dict)
+    # Same, per variant: GMRES is a restarted solver, so each restart ends with a
+    # host least-squares solve that the next restart consumes and two restarts
+    # cannot share a graph instance. The app forces unroll to 1 there anyway
+    # (krylov/gmres/gmres.cpp:98); pinning it here keeps the harness from writing
+    # a row labelled u=8 that in fact ran at u=1.
+    variant_max_unroll: Dict[str, int] = field(default_factory=dict)
+    # Inner steps that one `-i` unit buys, per variant. `-i` does not mean the
+    # same thing for every solver: for a restarted method it counts RESTART
+    # CYCLES of `-m` steps each (gmres: RESTARTS=10 cycles of RESTART_M=30), so
+    # the value giving CG 200 iterations would give GMRES 6000. The harness
+    # divides by this, so one --iters stays comparable work across the variants.
+    variant_iters_div: Dict[str, int] = field(default_factory=dict)
     # Presentation metadata for the paper table (plot.py --latex-table): the name
     # and application class to print. Kept next to the app rather than in the
     # plotting script, so one file describes each app completely.
@@ -292,6 +304,31 @@ class AppSpec:
 # -u is the iterations folded into one taskgraph instance. GMRES ignores it (it
 # is a restarted solver: each restart ends with a host least-squares solve whose
 # result the next restart consumes, so two restarts cannot share an instance).
+# Matrix options, per solver. The five solvers do NOT accept the same ones: the
+# driver gates each on the solver's `opt_mask` and rejects the rest outright
+# (krylov/common/driver.cpp:160-172), because a Krylov method constrains its
+# operator. The symmetric methods take a stencil; the methods that tolerate a
+# non-symmetric operator take a convection strength instead.
+#
+#   solver     opt_mask (in <solver>/<solver>.cpp)   accepts
+#   cg         OPT_STENCIL                           -S
+#   cr         OPT_STENCIL                           -S
+#   minres     OPT_STENCIL | OPT_SHIFT               -S -g
+#   bicgstab   OPT_CONV                              -c
+#   gmres      OPT_CONV | OPT_MEM                    -c -m
+#
+# The values below are each solver's own default, passed explicitly so the matrix
+# the run solved is recorded in the `cmd` column rather than implied by whatever
+# the source defaulted to on the day.
+_KRYLOV_MATRIX = {
+    "cg":       ["-S", "27"],   # 27-point stencil, SPD
+    "cr":       ["-S", "27"],
+    "minres":   ["-S", "27"],
+    "bicgstab": ["-c", "1.0"],  # convection 1.0 => non-symmetric
+    "gmres":    ["-c", "1.0"],
+}
+
+
 def _krylov_run(variant, size, iters, cfg, grain, unroll):
     if cfg.grain1:
         t, s = "1", "1"
@@ -300,8 +337,9 @@ def _krylov_run(variant, size, iters, cfg, grain, unroll):
         t = str(grain[1]) if len(grain) > 1 else "1"
     else:
         t, s = "0", "0"
-    return ["-n", str(size), "-i", str(iters), "-t", t, "-s", s, "-S", "27",
-            "-u", str(unroll)]
+    return (["-n", str(size), "-i", str(iters), "-t", t, "-s", s]
+            + _KRYLOV_MATRIX.get(variant, [])
+            + ["-u", str(unroll)])
 
 KRYLOV = AppSpec(
     name="krylov",
@@ -315,6 +353,8 @@ KRYLOV = AppSpec(
     sizes=[32, 48, 64],
     iters=50,
     grain_arity=2,          # "s:t"
+    variant_max_unroll={"gmres": 1},
+    variant_iters_div={"gmres": 30},   # RESTART_M
     pretty="Krylov",
     klass="Iterative solvers",
     panel_x="variant",
@@ -374,7 +414,11 @@ LLMC = AppSpec(
     parse=_parse_llmc,
     work=lambda t: (4.0 * float(t), "tokens (B\u00b7T)"),  # batch default 4
     sizes=[64, 128, 256],
-    iters=10,
+    # Enough training steps that an unrolled sweep still has a steady state: the
+    # apps drop instance 0 (record) and 1 (build + first replay), so u=8 needs
+    # ~10*8 steps before the mean is over more than a couple of samples. NB_STEPS
+    # is compiled in, so this is a build parameter, not just a loop bound.
+    iters=96,
     rebuild_per_size=True,
     llmc_defs=_llmc_defs,
     grain_arity=3,          # "GRAN_TMP:OC_SPLIT:OC_BACK_SPLIT"

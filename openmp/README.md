@@ -85,7 +85,16 @@ costs of the table. `cgstats.csv` / `jitstats.csv` are written automatically.
 Krylov gets a single size on purpose: its panel of the figure puts the five
 solvers on the x axis (`AppSpec.panel_x`), which says more about generality than
 one solver at three sizes, and the section has room for one panel per app.
-This is 156 runs.
+This is 151 runs.
+
+Two per-variant adjustments happen automatically and are visible in the `cmd`
+column: GMRES is a *restarted* solver, so its `-i` counts restart cycles of 30
+inner steps (`-i 7` here $\approx$ the others' 200 iterations) and it is pinned
+to `u=1`, because each restart ends with a host solve the next one consumes.
+The harness also warns when a run would have fewer than five graph instances --
+instances 0 and 1 are the record and the build, so a short run has a
+steady-state mean over two or three samples. A clean dry-run prints no such
+warning.
 
 **2. `taskgraphloop` control** -- same iteration count and epilogue cadence, one
 recorded instance per iteration. The difference against sweep 1 is the gain that

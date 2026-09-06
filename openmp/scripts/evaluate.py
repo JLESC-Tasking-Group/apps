@@ -109,10 +109,22 @@ def parse_env(items, ap):
     return env
 
 
-def effective_unroll(app, backend, unroll):
-    """Clamp an unroll to what the app supports on this backend (see AppSpec)."""
-    cap = app.max_unroll.get(backend)
-    return min(unroll, cap) if cap else unroll
+def effective_unroll(app, backend, variant, unroll):
+    """Clamp an unroll to what this (backend, variant) supports (see AppSpec)."""
+    caps = [c for c in (app.max_unroll.get(backend),
+                        app.variant_max_unroll.get(variant)) if c]
+    return min([unroll] + caps)
+
+
+def variant_iters(app, variant, iters):
+    """Scale an iteration count to what one `-i` unit buys for this variant.
+
+    See AppSpec.variant_iters_div: a restarted solver's `-i` counts cycles of
+    several inner steps, so the same --iters must be divided to mean the same
+    amount of work. Never returns 0 -- a sweep that asks for few iterations
+    should run one unit, not none."""
+    div = app.variant_iters_div.get(variant)
+    return max(1, int(round(iters / float(div)))) if (div and iters) else iters
 
 
 def effective_iters(iters, unroll):
@@ -324,12 +336,13 @@ def main():
                 cfg_unrolls = unrolls if cfg.taskgraph else [1]
                 # Clamp to what the app accepts here, then de-duplicate: on a
                 # backend capped at 1, `--unroll 1,2,4` must run once, not thrice.
-                cfg_unrolls = ordered_unique(effective_unroll(app, args.target, u)
-                                             for u in cfg_unrolls)
+                cfg_unrolls = ordered_unique(
+                    effective_unroll(app, args.target, variant, u) for u in cfg_unrolls)
                 # product() materializes its arguments, so the one-shot zip is safe
                 for unroll, (size, grain) in itertools.product(cfg_unrolls,
                                                                zip(sizes, grains)):
-                    eff_iters = effective_iters(iters, unroll)
+                    eff_iters = effective_iters(variant_iters(app, variant, iters),
+                                                unroll)
                     ok = do_build(app, variant, cfg, size, eff_iters, grain, unroll)
                     work, work_label = app.work(size)
                     vtag = f"-{variant}" if variant else ""
@@ -367,6 +380,18 @@ def main():
                     # Last, so a sweep can override anything above -- notably the
                     # CGIR_JIT_CACHE* knobs whose regimes are the point of --env.
                     env.update(extra_env)
+
+                    # The apps drop instance 0 (record) and 1 (build + first
+                    # replay) from the steady-state window, so a run with fewer
+                    # than three instances has no steady state at all and a few
+                    # more has a mean of two or three samples. Say so rather than
+                    # let a stddev over 2 points into the paper.
+                    ninst = (eff_iters // unroll) if (eff_iters and unroll) else 0
+                    if cfg.taskgraph and 0 < ninst < 5:
+                        print(f"      -> only {ninst} instances "
+                              f"({eff_iters} iters / u{unroll}): "
+                              f"{max(ninst - 2, 0)} steady-state samples",
+                              file=sys.stderr)
 
                     pretty = " ".join(argv)
                     utag = f" u={unroll}" if unroll != 1 else ""

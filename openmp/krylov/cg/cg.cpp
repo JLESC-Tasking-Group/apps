@@ -48,6 +48,7 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
                      const KrylovParams *prm, KrylovStats *st)
 {
     const int     max_iter  = prm->iters;
+    const int     unroll    = prm->unroll;   /* iterations per taskgraph instance (-u) */
     const int     T1        = prm->T1;
     const int     T2        = prm->T2;
     const int     print_dbg = prm->print_dbg;
@@ -104,48 +105,52 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
         /* Reference timestamp for the first iteration's execution time. */
         double prev_ts = omp_get_wtime();
 
-        for (int it = 0; it < max_iter; it++) {
-            /* Host time spent creating (recording, then replaying) the tasks of
-             * this iteration = "time to spawn all tasks". */
-            const double spawn0 = print_dbg ? omp_get_wtime() : 0.0;
-
-            /* Every iteration spawns the identical task pattern on the identical
-             * buffers -> recorded once, replayed thereafter. */
-            TASKGRAPH_BEGIN
-            {
-                task_spmv(row_ptr, col_idx, val, nnz, p, Ap, &tl);        /* Ap  = A*p       */
-                task_dot_spmv(&tl, p, Ap, part1, pAp);                    /* pAp = <p,Ap>    */
-                task_scalar_div(gamma, pAp, alpha);                       /* alpha = g/pAp   */
-                task_axpy(&tl, alpha, (real_t) +1.0, p, x);               /* x  += alpha*p   */
-                task_axpy_spmv(&tl, alpha, (real_t) -1.0, Ap, r);         /* r  -= alpha*Ap  */
-                task_vmul(&tl, inv, r, z);                                /* z   = M^-1 r    */
-                task_dot(&tl, r, z, part2, g_new);                        /* g_new = <r,z>   */
-                task_scalar_div(g_new, gamma, beta);                      /* beta = gn/g     */
-                task_xpby(&tl, z, beta, p);                               /* p = z + beta*p  */
-                task_scalar_copy(g_new, gamma);                           /* gamma = g_new   */
-            }
-            TASKGRAPH_END
-
-            /* Per-iteration timing (always) + optional residual print (-p). A
+        /* Every iteration spawns the identical task pattern on the identical
+         * buffers -> recorded once, replayed thereafter. `unroll` (-u) iterations
+         * are folded into one recorded instance so they overlap with each other:
+         * a taskgraph instance carries an implicit taskgroup, and without the
+         * unrolling that barrier costs exactly the cross-iteration overlap that
+         * the plain-task configuration gets for free. */
+        TASKGRAPH_LOOP(unroll,
+                       [&] (size_t done) { return done < (size_t) max_iter; },
+                       [&] (size_t inst, size_t done)
+        {
+            (void) done;
+            /* Per-instance timing (always) + optional residual print (-p). A
              * depend-synchronized host task (no taskwait): it runs after the
-             * iteration's last task (gamma) and records this iteration's wall
-             * time into st->iter_ms[it]. With -p it also reads back the residual
-             * scalar (async D2H) and prints it. */
-            const double spawn_ms = print_dbg ? (omp_get_wtime() - spawn0) * 1000.0 : 0.0;
+             * instance's last task (gamma) and records the wall time into
+             * st->iter_ms[inst], divided by `unroll` so the unit stays one
+             * iteration. With -p it also reads back the residual scalar (async
+             * D2H) and prints it. Spawned rather than run inline so that the
+             * configurations without a taskgraph barrier keep pipelining. */
             if (print_dbg) {
                 OMP_TARGET_UPDATE(from(g_new[0:1]) NOWAIT DEPEND(inout, g_new[0]))
             }
-            OMP_HOST_TASK(DEFAULT_NONE firstprivate(it, spawn_ms, g_new, gamma, print_dbg, st)
+            OMP_HOST_TASK(DEFAULT_NONE firstprivate(inst, unroll, g_new, gamma, print_dbg, st)
                           shared(prev_ts) DEPEND(in, g_new[0], gamma[0]))
             {
                 const double now = omp_get_wtime();
-                st->iter_ms[it] = (now - prev_ts) * 1000.0;
+                st->iter_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
                 prev_ts = now;
                 if (print_dbg)
-                    printf("  iter %4d   residual = %.6e   spawn = %8.3f ms   exec = %8.3f ms\n",
-                           it, sqrt((double) g_new[0]), spawn_ms, st->iter_ms[it]);
+                    printf("  instance %4zu   residual = %.6e   exec = %8.3f ms/iter\n",
+                           inst, sqrt((double) g_new[0]), st->iter_ms[inst]);
             }
+        })
+        {
+            task_spmv(row_ptr, col_idx, val, nnz, p, Ap, &tl);        /* Ap  = A*p       */
+            task_dot_spmv(&tl, p, Ap, part1, pAp);                    /* pAp = <p,Ap>    */
+            task_scalar_div(gamma, pAp, alpha);                       /* alpha = g/pAp   */
+            task_axpy(&tl, alpha, (real_t) +1.0, p, x);               /* x  += alpha*p   */
+            task_axpy_spmv(&tl, alpha, (real_t) -1.0, Ap, r);         /* r  -= alpha*Ap  */
+            task_vmul(&tl, inv, r, z);                                /* z   = M^-1 r    */
+            task_dot(&tl, r, z, part2, g_new);                        /* g_new = <r,z>   */
+            task_scalar_div(g_new, gamma, beta);                      /* beta = gn/g     */
+            task_xpby(&tl, z, beta, p);                               /* p = z + beta*p  */
+            task_scalar_copy(g_new, gamma);                           /* gamma = g_new   */
         }
+        TASKGRAPH_LOOP_END
+
         /* One-time end-of-solve synchronization before reading/freeing buffers. */
         #pragma omp taskwait
     }

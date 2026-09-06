@@ -22,6 +22,8 @@ CC = xkcxx -DUSE_XKOMP=1
 # ---- Backend / schedule toggles (override on the command line) ------------
 USE_TARGET     ?= 0     # 0: host CPU tasks        1: GPU target offload
 USE_TASKGRAPH  ?= 1     # 1: record/replay graph   0: plain tasks/target
+USE_TASKGRAPHLOOP ?= 1  # 1: unroll -u iterations into ONE graph instance (taskgraphloop)
+                        # 0: one graph instance per iteration (the A/B baseline)
 USE_SYNC       ?= 0     # 0: asynchronous tasks     1: synchronous blocking
 USE_REPLAYABLE ?= 0     # mark task-generating constructs replayable(1)
 USE_OMPSS      ?= 0     # 1: emit OmpSs-2 (#pragma oss) host tasks instead of omp
@@ -36,6 +38,7 @@ CFLAGS += -O3
 CFLAGS += -fopenmp-task-jit-abi=packed        # XKOMP JIT (none|pointers|packed)
 CFLAGS += -DUSE_TARGET=$(USE_TARGET)
 CFLAGS += -DUSE_TASKGRAPH=$(USE_TASKGRAPH)
+CFLAGS += -DUSE_TASKGRAPHLOOP=$(USE_TASKGRAPHLOOP)
 CFLAGS += -DUSE_SYNC=$(USE_SYNC)
 CFLAGS += -DUSE_REPLAYABLE=$(USE_REPLAYABLE)
 CFLAGS += -DUSE_OMPSS=$(USE_OMPSS)

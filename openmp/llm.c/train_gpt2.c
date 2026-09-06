@@ -62,6 +62,26 @@ enum Datasets { TINYSHAKESPEARE = 0, TINYSTORIES, DATASETS_MAX_INT };
     #define NB_STEPS 8
 #endif
 
+/* Steps folded into ONE taskgraph instance. The taskgraph construct carries an
+ * implicit taskgroup, so consecutive instances cannot overlap; unrolling
+ * recovers that overlap inside the graph and amortizes the barrier. Must divide
+ * NB_STEPS. Compile-time because llm.c takes no runtime arguments. Inert without
+ * the taskgraph. */
+#ifndef UNROLL
+    #define UNROLL 1
+#endif
+
+#if (NB_STEPS % UNROLL) != 0
+    #error "UNROLL must divide NB_STEPS: a shorter last taskgraph instance is a different graph and would not replay"
+#endif
+
+#if USE_OMPSS && (UNROLL != 1)
+    #error "UNROLL applies only to the OpenMP taskgraph: OmpSs-2 uses `oss taskiter`, which has no per-iteration barrier to amortize"
+#endif
+
+/* Number of taskgraph instances, i.e. of timed groups. */
+#define NB_INSTANCES (NB_STEPS / UNROLL)
+
 #ifndef SEQUENCE_SIZE
     #define SEQUENCE_SIZE 64
 #endif
@@ -3398,8 +3418,10 @@ int main(int argc, char *argv[])
     DataLoader train_loader, val_loader;
     Tokenizer tokenizer;
     MPIWorker worker;
-    double runtimes[NB_STEPS] = {0.};
-    double tok_s[NB_STEPS] = {0.};
+    /* One entry per taskgraph instance; the recorded values are per STEP (the
+     * instance time divided by UNROLL), so the unit is the same at any UNROLL. */
+    double runtimes[NB_INSTANCES] = {0.};
+    double tok_s[NB_INSTANCES] = {0.};
     unsigned int cpu_count = GET_NUM_CPUS();
     unsigned int mpi_cpu_count;
 
@@ -3513,98 +3535,92 @@ int main(int argc, char *argv[])
         // loss: How much an guess was wrong
         // gradient: For every weight, how much to change it to make loss smaller
 
-        // OmpSs-2 has no `taskgraph`; `taskiter` applied to the step loop records
-        // the per-iteration task graph once and replays it across iterations
-        // (the OmpSs equivalent of OpenMP's taskgraph, see train_gpt2_ompss.c).
-#if USE_TASKGRAPH && USE_OMPSS
-        # pragma oss taskiter label("taskiter_create")                                             \
-            shared(model, train_loader, worker, dep_handler, runtimes, tok_s, mpi_cpu_count, B, T, step) \
-            firstprivate(rank)
+        // ONE training step: the recorded body. It takes no step index on
+        // purpose -- it runs only on the taskgraph's record pass, so anything it
+        // captured would be frozen into the graph and replayed verbatim. The step
+        // counter it does need lives on the device and is incremented by a task
+        // inside gpt2_update, so consecutive unrolled steps order themselves.
+        auto llmc_step = [&] (void)
+        {
+            // dataloader
+            // grabs the next chunk of training data (inputs, targets)
+            // OMPT_SET_LABEL("Dataloader");
+            // Always a host task: it reads the tokens file into host memory.
+            // In the target backend gpt2_forward then stages them H2D.
+            OMP_HOST_TASK(                                                       \
+                DEPEND_MULTI(out, (i=0:B*T:GRAN_TMP), train_loader.targets[i : GRAN_TMP]) \
+                DEPEND_MULTI(out, (i=0:B*T:GRAN_TMP), train_loader.inputs[i : GRAN_TMP])  \
+                shared(train_loader, worker))
+            {
+                dataloader_next_scattered_batch(&train_loader, worker);
+            }
+
+            // Have the model make a guess and assign loss
+            gpt2_forward(&model, worker, train_loader.inputs, train_loader.targets, mpi_get_rank_B(worker), mpi_get_rank_T(worker), dep_handler);
+
+            // erase the last step's gradients. We will use this to write the new gradient
+            gpt2_zero_grad(&model);
+
+            // Compute the gradients
+            gpt2_backward(&model, dep_handler);
+
+            // Update the weights with the computed gradients
+            gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, &step);
+        };
+
+        // Metrics for one taskgraph instance (`nstep` steps), reported per step.
+        // Created OUTSIDE the recorded region -- an index baked into a recorded
+        // task would be replayed unchanged and every instance would overwrite the
+        // same slots. Spawned as a task rather than run inline so the
+        // configurations without a taskgraph barrier keep pipelining.
+        auto llmc_metrics = [&] (size_t inst, int nstep)
+        {
+            // OMPT_SET_LABEL("metrics");
+#if USE_TARGET
+            // Bring the scalar loss back to the host (only per-instance D2H),
+            // then print from a host task.
+            #pragma omp target update from(model.mean_loss) nowait \
+                DEPEND(inout, model.mean_loss)
 #endif
+            OMP_HOST_TASK(DEPEND(in, model.mean_loss) firstprivate(inst, nstep))
+            {
+                double time_elapsed_it_s = TOCK(1) / (double) nstep;
+                double tokens_per_seconds = BATCH_SIZE * SEQUENCE_SIZE / time_elapsed_it_s;
+                runtimes[inst] = time_elapsed_it_s;
+                tok_s[inst] = tokens_per_seconds;
+                if (rank == 0)
+                    fprintf(stderr, "Step %zu :\tIteration runtime : %0.1lf ms, \t\t tokens/s : %0.1lf, \t\t tokens/(s.cpus) : %0.2lf, \t\t Loss : %f \t\t MFU : %0.2f "
+                            "%%\n",
+                            (inst + 1) * (size_t) nstep, time_elapsed_it_s * 1000, tokens_per_seconds, tokens_per_seconds / mpi_cpu_count, model.mean_loss,
+                            100 * gpt2_estimate_mfu(&model, B * T, time_elapsed_it_s, mpi_cpu_count));
+                fflush(stdout);
+                TICK(1);
+            }
+        };
+
+#if USE_TASKGRAPH && USE_OMPSS
+        // OmpSs-2 has no `taskgraph`; `taskiter` applied to the step loop records
+        // the per-iteration task graph once and replays it across iterations (the
+        // OmpSs equivalent of OpenMP's taskgraph, see train_gpt2_ompss.c). It has
+        // no per-iteration barrier, so there is nothing to amortize and UNROLL
+        // does not apply here.
+        # pragma oss taskiter label("taskiter_create")                                             \
+            shared(model, train_loader, worker, dep_handler, runtimes, tok_s, mpi_cpu_count, B, T, step, llmc_step, llmc_metrics) \
+            firstprivate(rank)
         for (int taskiter_step = 0; taskiter_step < NB_STEPS; ++taskiter_step)
         {
-            // Decide between using a compiler that implements the taskgraph construct
-            // Can choose between Julian's LLVM implementation or XKOMP's.
-            // (OmpSs-2 uses `oss taskiter` on the loop above instead of taskgraph.)
-            #if USE_TASKGRAPH && !USE_OMPSS
-            # if USE_XKOMP
-            constexpr xkomp_taskgraph_id_t    gid   = 0;
-            constexpr xkomp_taskgraph_flags_t flags = XKOMP_TASKGRAPH_FLAG_NONE;
-            pragma_omp_taskgraph(gid, flags, [&] (void)
-            # else /* USE_XKOMP */
-            #  pragma omp taskgraph graph_id(0)
-            # endif /* USE_XKOMP */
-            #endif /* USE_TASKGRAPH && !USE_OMPSS */
-            {
-                // dataloader
-                // grabs the next chunk of training data (inputs, targets)
-                // OMPT_SET_LABEL("Dataloader");
-                // Always a host task: it reads the tokens file into host memory.
-                // In the target backend gpt2_forward then stages them H2D.
-                OMP_HOST_TASK(                                                       \
-                    DEPEND_MULTI(out, (i=0:B*T:GRAN_TMP), train_loader.targets[i : GRAN_TMP]) \
-                    DEPEND_MULTI(out, (i=0:B*T:GRAN_TMP), train_loader.inputs[i : GRAN_TMP])  \
-                    shared(train_loader, worker))
-                {
-                    dataloader_next_scattered_batch(&train_loader, worker);
-                }
-
-                // Have the model make a guess and assign loss
-                gpt2_forward(&model, worker, train_loader.inputs, train_loader.targets, mpi_get_rank_B(worker), mpi_get_rank_T(worker), dep_handler);
-
-                // erase the last step's gradients. We will use this to write the new gradient
-                gpt2_zero_grad(&model);
-
-                // Compute the gradients
-                gpt2_backward(&model, dep_handler);
-
-                // Update the weights with the computed gradients
-                gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, &step);
-
-                // Calculate metrics and output to the terminal
-                // OMPT_SET_LABEL("metrics");
-#if USE_TARGET
-                // Bring the scalar loss back to the host (only per-iteration D2H),
-                // then print from a host task. Use the host loop counter for
-                // indexing/printing since the step counter lives on the device.
-                #pragma omp target update from(model.mean_loss) nowait \
-                    DEPEND(inout, model.mean_loss)
-                OMP_HOST_TASK(DEPEND(in, model.mean_loss) firstprivate(taskiter_step))
-                {
-                    double time_elapsed_it_s = TOCK(1);
-                    double tokens_per_seconds = BATCH_SIZE * SEQUENCE_SIZE / time_elapsed_it_s;
-                    runtimes[taskiter_step] = time_elapsed_it_s;
-                    tok_s[taskiter_step] = tokens_per_seconds;
-                    if (rank == 0)
-                        fprintf(stderr, "Step %d :\tIteration runtime : %0.1lf ms, \t\t tokens/s : %0.1lf, \t\t tokens/(s.cpus) : %0.2lf, \t\t Loss : %f \t\t MFU : %0.2f "
-                                "%%\n",
-                                taskiter_step + 1, time_elapsed_it_s * 1000, tokens_per_seconds, tokens_per_seconds / mpi_cpu_count, model.mean_loss,
-                                100 * gpt2_estimate_mfu(&model, B * T, time_elapsed_it_s, mpi_cpu_count));
-                    fflush(stdout);
-                    TICK(1);
-                }
+            llmc_step();
+            llmc_metrics((size_t) taskiter_step, 1);
+        }
 #else
-                OMP_TASK(DEPEND(in, model.mean_loss))
-                {
-                    double time_elapsed_it_s = TOCK(1);
-                    double tokens_per_seconds = BATCH_SIZE * SEQUENCE_SIZE / time_elapsed_it_s;
-                    runtimes[step - 2] = time_elapsed_it_s;
-                    tok_s[step - 2] = tokens_per_seconds;
-                    if (rank == 0)
-                        fprintf(stderr, "Step %d :\tIteration runtime : %0.1lf ms, \t\t tokens/s : %0.1lf, \t\t tokens/(s.cpus) : %0.2lf, \t\t Loss : %f \t\t MFU : %0.2f "
-                                "%%\n",
-                                step - 1, time_elapsed_it_s * 1000, tokens_per_seconds, tokens_per_seconds / mpi_cpu_count, model.mean_loss,
-                                100 * gpt2_estimate_mfu(&model, B * T, time_elapsed_it_s, mpi_cpu_count));
-                    fflush(stdout);
-                    TICK(1);
-                }
+        TASKGRAPH_LOOP(UNROLL,
+                       [&] (size_t done) { return done < (size_t) NB_STEPS; },
+                       [&] (size_t inst, size_t done) { (void) done; llmc_metrics(inst, UNROLL); })
+        {
+            llmc_step();
+        }
+        TASKGRAPH_LOOP_END
 #endif
-            }
-            # if USE_TASKGRAPH && !USE_OMPSS && USE_XKOMP
-            );
-            # endif /* USE_TASKGRAPH && !USE_OMPSS && USE_XKOMP */
-
-        } /* taskiter loop */
     } /* single, parallel  */
     // The parallel region's implicit barrier guarantees all target tasks have
     // completed here. Under OmpSs-2 there is no such region, so wait explicitly.
@@ -3631,16 +3647,18 @@ int main(int argc, char *argv[])
     printf("Took %f s\n", total_time);
 
     // Calculate the metrics
-    int average_mask_offset = 2; // Warmup iterations for metrics average calculation
-    if (NB_STEPS >= average_mask_offset)
+    // Instance 0 records the graph and instance 1 is the first replay, so the
+    // steady state starts at instance 2 (as in the krylov / lulesh drivers).
+    int average_mask_offset = (NB_INSTANCES > 2) ? 2 : 0;
+    if (NB_INSTANCES > average_mask_offset)
     {
         double average_runtime_s = 0.;
         double average_tok_s = 0.;
         double mpi_average_tok_s;
         double mpi_average_runtime_s;
-        for (int i = average_mask_offset; i < NB_STEPS; i++) {
-            average_runtime_s += runtimes[i] / (NB_STEPS - average_mask_offset);
-            average_tok_s += tok_s[i] / (NB_STEPS - average_mask_offset);
+        for (int i = average_mask_offset; i < NB_INSTANCES; i++) {
+            average_runtime_s += runtimes[i] / (NB_INSTANCES - average_mask_offset);
+            average_tok_s += tok_s[i] / (NB_INSTANCES - average_mask_offset);
         }
 
         mpi_average_runtime_s = average_runtime_s;

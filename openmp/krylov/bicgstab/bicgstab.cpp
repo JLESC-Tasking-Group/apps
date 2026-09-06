@@ -43,6 +43,7 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
                            const KrylovParams *prm, KrylovStats *st)
 {
     const int     max_iter  = prm->iters;
+    const int     unroll    = prm->unroll;   /* iterations per taskgraph instance (-u) */
     const int     T1        = prm->T1;
     const int     T2        = prm->T2;
     const int     print_dbg = prm->print_dbg;
@@ -111,60 +112,64 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
 
         double prev_ts = omp_get_wtime();
 
-        for (int it = 0; it < max_iter; it++) {
-            const double spawn0 = print_dbg ? omp_get_wtime() : 0.0;
-
-            TASKGRAPH_BEGIN
-            {
-                task_scalar_copy(next_rho, rho);                          /* rho = next_rho    */
-                task_spmv(row_ptr, col_idx, val, nnz, p, q, &tl);        /* q = A p           */
-                task_vmul_spmv(&tl, inv, q, v);                          /* v = M q           */
-                task_dot(&tl, c, v, part_cv, cv);                        /* <c,v>             */
-                task_scalar_div(rho, cv, alpha);                         /* alpha = rho/<c,v> */
-                task_copy(&tl, r, s);                                    /* s = r            */
-                task_axpy(&tl, alpha, (real_t) -1.0, v, s);              /* s -= alpha*v     */
-                task_axpy(&tl, alpha, (real_t) +1.0, p, x);              /* x += alpha*p     */
-                task_spmv(row_ptr, col_idx, val, nnz, s, d, &tl);       /* d = A s          */
-                task_vmul_spmv(&tl, inv, d, t);                         /* t = M d          */
-                task_dot(&tl, t, s, part_ts, ts);                       /* <t,s>            */
-                task_dot(&tl, t, t, part_tt, tt);                       /* <t,t>            */
-                task_scalar_div(ts, tt, omega);                         /* omega = <t,s>/<t,t> */
-                task_axpy(&tl, omega, (real_t) +1.0, s, x);             /* x += omega*s     */
-                task_copy(&tl, s, r);                                   /* r = s            */
-                task_axpy(&tl, omega, (real_t) -1.0, t, r);             /* r -= omega*t     */
-                task_dot(&tl, c, r, part_nr, next_rho);                 /* next_rho = <c,r> */
-                task_dot(&tl, r, r, part_rr, rr);                       /* <r,r> (residual) */
-                /* beta = (next_rho/rho) * (alpha/omega) -- a compound scalar task. */
-                OMP_TARGET_TASK(DEFAULT_NONE
-                                DEPEND(in, next_rho[0], rho[0], alpha[0], omega[0]) DEPEND(out, beta[0])
-                                MAP(present: next_rho[0:1], rho[0:1], alpha[0:1], omega[0:1], beta[0:1])
-                                SHARED(next_rho, rho, alpha, omega, beta))
-                {
-                    beta[0] = (next_rho[0] / rho[0]) * (alpha[0] / omega[0]);
-                }
-                task_axpy(&tl, omega, (real_t) -1.0, v, p);             /* p -= omega*v     */
-                task_xpby(&tl, r, beta, p);                             /* p = r + beta*p   */
-            }
-            TASKGRAPH_END
-
-            /* Per-iteration timing (always) + optional residual print (-p).
+        /* Identical task pattern on identical buffers every iteration, so the
+         * instance is recorded once and replayed. `unroll` (-u) iterations per
+         * instance, so consecutive iterations overlap inside the graph instead of
+         * being separated by its implicit taskgroup. */
+        TASKGRAPH_LOOP(unroll,
+                       [&] (size_t done) { return done < (size_t) max_iter; },
+                       [&] (size_t inst, size_t done)
+        {
+            (void) done;
+            /* Per-instance timing (always) + optional residual print (-p).
              * Depend-synchronized host task (no taskwait), anchored on rr =
-             * <r,r> = ||b - A x||_2^2. */
-            const double spawn_ms = print_dbg ? (omp_get_wtime() - spawn0) * 1000.0 : 0.0;
+             * <r,r> = ||b - A x||_2^2; divided by `unroll` to stay per-iteration. */
             if (print_dbg) {
                 OMP_TARGET_UPDATE(from(rr[0:1]) NOWAIT DEPEND(inout, rr[0]))
             }
-            OMP_HOST_TASK(DEFAULT_NONE firstprivate(it, spawn_ms, rr, print_dbg, st)
+            OMP_HOST_TASK(DEFAULT_NONE firstprivate(inst, unroll, rr, print_dbg, st)
                           shared(prev_ts) DEPEND(in, rr[0]))
             {
                 const double now = omp_get_wtime();
-                st->iter_ms[it] = (now - prev_ts) * 1000.0;
+                st->iter_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
                 prev_ts = now;
                 if (print_dbg)
-                    printf("  iter %4d   residual = %.6e   spawn = %8.3f ms   exec = %8.3f ms\n",
-                           it, sqrt(fabs((double) rr[0])), spawn_ms, st->iter_ms[it]);
+                    printf("  instance %4zu   residual = %.6e   exec = %8.3f ms/iter\n",
+                           inst, sqrt(fabs((double) rr[0])), st->iter_ms[inst]);
             }
+        })
+        {
+            task_scalar_copy(next_rho, rho);                          /* rho = next_rho    */
+            task_spmv(row_ptr, col_idx, val, nnz, p, q, &tl);        /* q = A p           */
+            task_vmul_spmv(&tl, inv, q, v);                          /* v = M q           */
+            task_dot(&tl, c, v, part_cv, cv);                        /* <c,v>             */
+            task_scalar_div(rho, cv, alpha);                         /* alpha = rho/<c,v> */
+            task_copy(&tl, r, s);                                    /* s = r            */
+            task_axpy(&tl, alpha, (real_t) -1.0, v, s);              /* s -= alpha*v     */
+            task_axpy(&tl, alpha, (real_t) +1.0, p, x);              /* x += alpha*p     */
+            task_spmv(row_ptr, col_idx, val, nnz, s, d, &tl);       /* d = A s          */
+            task_vmul_spmv(&tl, inv, d, t);                         /* t = M d          */
+            task_dot(&tl, t, s, part_ts, ts);                       /* <t,s>            */
+            task_dot(&tl, t, t, part_tt, tt);                       /* <t,t>            */
+            task_scalar_div(ts, tt, omega);                         /* omega = <t,s>/<t,t> */
+            task_axpy(&tl, omega, (real_t) +1.0, s, x);             /* x += omega*s     */
+            task_copy(&tl, s, r);                                   /* r = s            */
+            task_axpy(&tl, omega, (real_t) -1.0, t, r);             /* r -= omega*t     */
+            task_dot(&tl, c, r, part_nr, next_rho);                 /* next_rho = <c,r> */
+            task_dot(&tl, r, r, part_rr, rr);                       /* <r,r> (residual) */
+            /* beta = (next_rho/rho) * (alpha/omega) -- a compound scalar task. */
+            OMP_TARGET_TASK(DEFAULT_NONE
+                            DEPEND(in, next_rho[0], rho[0], alpha[0], omega[0]) DEPEND(out, beta[0])
+                            MAP(present: next_rho[0:1], rho[0:1], alpha[0:1], omega[0:1], beta[0:1])
+                            SHARED(next_rho, rho, alpha, omega, beta))
+            {
+                beta[0] = (next_rho[0] / rho[0]) * (alpha[0] / omega[0]);
+            }
+            task_axpy(&tl, omega, (real_t) -1.0, v, p);             /* p -= omega*v     */
+            task_xpby(&tl, r, beta, p);                             /* p = r + beta*p   */
         }
+        TASKGRAPH_LOOP_END
+
         #pragma omp taskwait
     }
 

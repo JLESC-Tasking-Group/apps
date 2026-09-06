@@ -28,6 +28,10 @@ figure, so a configuration looks the same in every figure -- including figures
 that omit some of the other passes. Configurations are styled once for the whole
 input file, so all figures of a single run are mutually consistent; see
 assign_styles() and --style-salt.
+
+A run's `unroll` (iterations folded into ONE taskgraph instance) becomes a ` u<N>`
+suffix on the configuration label when it is >1, so an unroll sweep plots as extra
+series next to the configuration it unrolls; see load_runs().
 """
 
 import argparse
@@ -105,9 +109,24 @@ def geomean(xs):
 
 
 def load_runs(path):
-    """All rows (including failed ones, so coverage can be reported)."""
+    """All rows (including failed ones, so coverage can be reported).
+
+    The unroll -- iterations folded into ONE taskgraph instance -- is folded into
+    the configuration label here, at the single point where runs.csv is read, so
+    every consumer downstream (grouping, styling, the speedup tables, the figures)
+    treats `taskgraph:none u4` as its own series without further plumbing. u=1 is
+    left unsuffixed: it is the un-unrolled behaviour and the label older CSVs
+    (which have no `unroll` column at all) already carry."""
     with open(path, newline="") as fh:
-        return list(csv.DictReader(fh))
+        rows = list(csv.DictReader(fh))
+    for r in rows:
+        try:
+            u = int(r.get("unroll") or 1)
+        except ValueError:
+            u = 1
+        if u > 1:
+            r["config"] = f"{r['config']} u{u}"
+    return rows
 
 
 def ordered_unique(seq):
@@ -123,6 +142,9 @@ def ordered_unique(seq):
 # (color, hatch) is derived from its *name* -- never from its position in the
 # figure -- otherwise a plot that omits a pass restyles every series after it.
 # --------------------------------------------------------------------------- #
+_UNROLL_SUFFIX = re.compile(r"\s+u(\d+)$")
+
+
 def canon_config(label):
     """Style key for a configuration label: equal pass sets -> equal key.
 
@@ -131,7 +153,20 @@ def canon_config(label):
     empty opt list is `taskgraph:none`. Only the *key* is canonicalized; the
     legend keeps the CSV label verbatim, so the incremental "+ one pass" reading
     order of a cumulative sweep survives.
+
+    A trailing ` u<N>` (the unroll, appended by load_runs) is held aside and
+    re-attached after canonicalization, so it stays a distinct series instead of
+    being mistaken for a CGIR pass name.
     """
+    label = label.strip()
+    m = _UNROLL_SUFFIX.search(label)
+    unroll = ""
+    if m:
+        unroll, label = " u" + m.group(1), label[:m.start()]
+    return _canon_passes(label) + unroll
+
+
+def _canon_passes(label):
     head, _, opt = label.partition(":")
     head = head.strip()
     if head != "taskgraph":

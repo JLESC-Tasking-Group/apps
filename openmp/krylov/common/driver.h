@@ -32,16 +32,19 @@ typedef struct {
     double      conv;      /* convection strength (convection-diffusion)        */
     double      sigma;     /* diagonal shift (MINRES indefinite test)           */
     int         print_dbg; /* -p : per-iteration residual trace                 */
+    int         unroll;    /* -u : iterations per taskgraph instance (>= 1)     */
     const char *mtx;       /* -M : Matrix Market file to import (NULL = generate)*/
 } KrylovParams;
 
 /* ---- timing-only statistics (ala Krylov.jl) ----
- * iter_ms[k] is the wall time of iteration/restart k, recorded by the solver's
- * always-on per-iteration timing task (anchored on that iteration's residual
- * scalar, i.e. the cadence at which consecutive residuals become available --
- * one iteration in steady state). */
+ * iter_ms[k] is the wall time of taskgraph instance k -- a group of `unroll`
+ * iterations (see -u) -- divided by `unroll`, so the unit is always ONE
+ * iteration whatever the unrolling. With -u 1 (the default) an instance is one
+ * iteration and this is the classic per-iteration time. Recorded by the solver's
+ * always-on timing task (anchored on that instance's residual scalar, i.e. the
+ * cadence at which consecutive residuals become available). */
 typedef struct {
-    int     niter;     /* number of timed iterations / restarts                */
+    int     niter;     /* number of timed instances (iterations / unroll)      */
     double  total_s;   /* wall time of the whole solve loop (t1 - t0)          */
     double *iter_ms;   /* [niter] per-iteration wall time in milliseconds      */
 } KrylovStats;

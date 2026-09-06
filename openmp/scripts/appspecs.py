@@ -21,6 +21,16 @@ The synchronous / no-taskgraph / taskgraph split is a *compile-time* choice
 (USE_SYNC / USE_TASKGRAPH), so evaluate.py rebuilds per configuration; the CGIR
 pass within a taskgraph build is a *run-time* choice (OMP_TASKGRAPH_OPT).
 The GPU vs CPU backend (USE_TARGET) is orthogonal and chosen once (--target).
+
+Unrolling
+---------
+A taskgraph instance carries an implicit taskgroup, so consecutive instances
+cannot overlap. `unroll` (evaluate.py --unroll) folds that many iterations into
+ONE recorded instance, recovering the cross-iteration overlap inside the graph
+and paying the barrier once per `unroll` iterations. It is a run argument for
+krylov / lulesh / mnmg and a compile-time macro (UNROLL) for llm.c, hence part of
+that app's build key. It only does anything under USE_TASKGRAPH, so evaluate.py
+sweeps it for the taskgraph configurations only.
 """
 
 import math
@@ -44,6 +54,14 @@ class Config:
     build: Dict[str, str]      # make variables, e.g. {"USE_SYNC": "1", ...}
     opt: Optional[str]         # OMP_TASKGRAPH_OPT value (None if no taskgraph)
     grain1: bool = False       # run with one task/kernel per loop (sync baseline)
+
+    @property
+    def taskgraph(self) -> bool:
+        """Whether this configuration records a taskgraph -- i.e. whether it has
+        the per-instance barrier that --unroll exists to amortize. Elsewhere the
+        unroll is inert by construction (the apps group iterations identically in
+        every configuration), so sweeping it there would only burn machine time."""
+        return self.build.get("USE_TASKGRAPH") == "1"
 
 
 def default_configs(opts: List[str]) -> List[Config]:
@@ -131,10 +149,15 @@ def _parse_mnmg(text):
 
 
 def _parse_llmc(text):
-    # llm.c prints one "Iteration runtime : X ms" per step (to stderr); compute
-    # the avg/stddev over the steady steps (drop step 0 = warmup/first build).
+    # llm.c prints one "Iteration runtime : X ms" per taskgraph INSTANCE (to
+    # stderr), already divided by UNROLL, so the unit is per step at any unroll.
+    # Instance 0 records the graph and instance 1 builds the command graph and
+    # runs the first replay, so the steady window starts at 2 -- as in the krylov
+    # / lulesh / mnmg parsers, and as in llm.c's own printed average. This matters
+    # once unrolling makes the instances few: at NB_STEPS=12, UNROLL=4 there are
+    # only three, and keeping instance 1 would report the build cost as steady.
     runs = [float(x) for x in re.findall(r"Iteration runtime\s*:\s*" + _F + r"\s*ms", text)]
-    steady = runs[1:] if len(runs) > 1 else runs
+    steady = runs[2:] if len(runs) > 2 else runs[-1:]
     avg, std = _mean_std(steady)
     return {
         "avg_ms":    avg,
@@ -154,13 +177,13 @@ class AppSpec:
     variants: List[str]                  # [""] when a single binary
     make_target: Callable[[str], str]    # variant -> make target
     binary: Callable[[str], str]         # variant -> ./binary (run cwd = directory)
-    run_args: Callable                   # (variant, size, iters, cfg) -> [args]
+    run_args: Callable                   # (variant, size, iters, cfg, grain, unroll) -> [args]
     parse: Callable[[str], dict]         # stdout+stderr -> metrics dict
     work: Callable[[int], tuple]         # size -> (value, label) for the top axis
     sizes: List[int]
     iters: int
     rebuild_per_size: bool = False       # llm.c: size is a compile-time macro
-    llmc_defs: Optional[Callable] = None # (size, iters, batch) -> LLMC_DEFS string
+    llmc_defs: Optional[Callable] = None # (size, iters, batch, grain, unroll) -> LLMC_DEFS
     batch: int = 4                       # llm.c BATCH_SIZE (for tokens = B*T)
     # Number of granularity knobs this app takes, i.e. how many ':'-separated
     # components one --grain entry may hold (0 = the app has no knob). Used by
@@ -173,7 +196,11 @@ class AppSpec:
 # is -s = SpMV sub-tasks per block, the second is -t = tasks per vector op). A
 # single-component entry sets -s and leaves -t at 1. None -> the app default
 # (-t 0 -s 0 = auto, i.e. omp threads). Sync is always 1/loop (-t 1 -s 1).
-def _krylov_run(variant, size, iters, cfg, grain):
+#
+# -u is the iterations folded into one taskgraph instance. GMRES ignores it (it
+# is a restarted solver: each restart ends with a host least-squares solve whose
+# result the next restart consumes, so two restarts cannot share an instance).
+def _krylov_run(variant, size, iters, cfg, grain, unroll):
     if cfg.grain1:
         t, s = "1", "1"
     elif grain:
@@ -181,7 +208,8 @@ def _krylov_run(variant, size, iters, cfg, grain):
         t = str(grain[1]) if len(grain) > 1 else "1"
     else:
         t, s = "0", "0"
-    return ["-n", str(size), "-i", str(iters), "-t", t, "-s", s, "-S", "27"]
+    return ["-n", str(size), "-i", str(iters), "-t", t, "-s", s, "-S", "27",
+            "-u", str(unroll)]
 
 KRYLOV = AppSpec(
     name="krylov",
@@ -200,9 +228,10 @@ KRYLOV = AppSpec(
 # ---- lulesh: mesh side s, zones = s^3; -nb = tasks per loop ---------------------
 # grain is THIS size's entry, a single component "nb" -> -nb (tasks per loop).
 # None -> the app default (-nb 32). The synchronous config is always 1 (-nb 1).
-def _lulesh_run(variant, size, iters, cfg, grain):
+def _lulesh_run(variant, size, iters, cfg, grain, unroll):
     nb = "1" if cfg.grain1 else (str(grain[0]) if grain else "32")
-    return ["-i", str(iters), "-s", str(size), "-r", "11", "-b", "1", "-c", "1", "-nb", nb]
+    return ["-i", str(iters), "-s", str(size), "-r", "11", "-b", "1", "-c", "1",
+            "-nb", nb, "-u", str(unroll)]
 
 LULESH = AppSpec(
     name="lulesh",
@@ -224,11 +253,16 @@ LULESH = AppSpec(
 # arguments. None -> the source defaults.
 _LLMC_GRAIN_MACROS = ["GRAN_TMP", "OC_SPLIT", "OC_BACK_SPLIT"]
 
-def _llmc_run(variant, size, iters, cfg, grain):
-    return []  # no runtime args; size/steps/grain are compiled in
+def _llmc_run(variant, size, iters, cfg, grain, unroll):
+    return []  # no runtime args; size/steps/grain/unroll are compiled in
 
-def _llmc_defs(size, iters, batch, grain):
-    defs = f"-DSEQUENCE_SIZE={size} -DNB_STEPS={iters} -DBATCH_SIZE={batch}"
+# llm.c takes no arguments, so the unroll is the compile-time macro UNROLL and
+# thus part of the build key. It must divide NB_STEPS (the source rejects a
+# shorter trailing instance: it is a different graph and would not replay);
+# evaluate.py rounds the requested iteration count up to a multiple.
+def _llmc_defs(size, iters, batch, grain, unroll):
+    defs = (f"-DSEQUENCE_SIZE={size} -DNB_STEPS={iters} -DBATCH_SIZE={batch}"
+            f" -DUNROLL={unroll}")
     for name, val in zip(_LLMC_GRAIN_MACROS, grain or []):
         defs += f" -D{name}={val}"
     return defs
@@ -263,9 +297,11 @@ _MNMG_DATA = "MNMGDatalog-reference/data"
 _MNMG_MULT = {7035: 64, 23874: 64}     # verified small graphs (TC 146120 / 481121)
 _MNMG_MULT_DEFAULT = 4096              # generous default; raise via a larger set
 
-def _mnmg_run(variant, size, iters, cfg, grain):
+# -u also gates the convergence test, which is then only evaluated every `unroll`
+# rounds: the fixpoint may run up to unroll-1 extra (empty, harmless) rounds.
+def _mnmg_run(variant, size, iters, cfg, grain, unroll):
     mult = _MNMG_MULT.get(size, _MNMG_MULT_DEFAULT)
-    return [f"{_MNMG_DATA}/data_{size}.bin", str(mult)]
+    return [f"{_MNMG_DATA}/data_{size}.bin", str(mult), "-u", str(unroll)]
 
 MNMG = AppSpec(
     name="mnmg",

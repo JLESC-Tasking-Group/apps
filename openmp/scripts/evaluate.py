@@ -32,6 +32,8 @@ LD_LIBRARY_PATH). Use --dry-run to inspect the plan first.
 import argparse
 import csv
 import datetime
+import itertools
+import math
 import os
 import re
 import socket
@@ -53,7 +55,7 @@ DEFAULT_ENV = {
 CSV_FIELDS = [
     "run_id", "timestamp", "machine",
     "app", "variant", "config", "opt", "build_vars", "backend",
-    "size", "work", "work_label", "iters", "grain",
+    "size", "work", "work_label", "iters", "unroll", "grain",
     "avg_ms", "stddev_ms", "iter0_ms", "elapsed_s", "fom", "flops", "gflops",
     "residual", "error",
     "returncode", "status", "cmd",
@@ -64,16 +66,30 @@ def sanitize(s):
     return re.sub(r"[^A-Za-z0-9._-]+", "-", str(s)).strip("-")
 
 
-def build_cmd(app, variant, cfg, size, iters, backend_vars, grain):
+def build_cmd(app, variant, cfg, size, iters, backend_vars, grain, unroll):
     variables = dict(cfg.build)
     variables.update(backend_vars)
     argv = ["make", "-C", app.directory, "clean", app.make_target(variant)]
     argv += [f"{k}={v}" for k, v in variables.items()]
     if app.rebuild_per_size and app.llmc_defs:
-        # grain is a compile-time macro (GRAN_TMP) for llm.c; on sync it is 1/loop.
+        # grain (GRAN_TMP) and unroll (UNROLL) are compile-time macros for llm.c;
+        # on sync the grain is 1/loop.
         g = None if cfg.grain1 else grain
-        argv.append("LLMC_DEFS=" + app.llmc_defs(size, iters, app.batch, g))
+        argv.append("LLMC_DEFS=" + app.llmc_defs(size, iters, app.batch, g, unroll))
     return argv
+
+
+def effective_iters(iters, unroll):
+    """Round an iteration count up to a whole number of taskgraph instances.
+
+    A trailing partial instance is a *different* graph -- it would record instead
+    of replay -- so the apps refuse or truncate it. Rounding up here keeps the
+    instance count exact and identical across configurations, at the price of at
+    most unroll-1 extra iterations; the reported time is per iteration, so the
+    metric is unaffected. The rounded value is what lands in the `iters` column."""
+    if unroll <= 1 or iters <= 0:
+        return iters
+    return int(math.ceil(iters / float(unroll))) * unroll
 
 
 def main():
@@ -96,6 +112,20 @@ def main():
                     "-> -s/-t, lulesh 'nb' -> -nb, llm.c 'GRAN_TMP:OC_SPLIT:OC_BACK_SPLIT' "
                     "(compile-time); mnmg has none. Applies to the async configs only (sync is "
                     "always 1 task/loop). Unset -> each app's default granularity.")
+    ap.add_argument("--unroll", default="", help="iterations folded into ONE taskgraph "
+                    "instance -- a sweep dimension: a global comma list (e.g. '1,2,4,8') "
+                    "and/or per-app 'app=list' items separated by ';' (e.g. "
+                    "'1,2,4;llm.c=1,2'). A taskgraph instance carries an implicit taskgroup, "
+                    "so instances cannot overlap; unrolling recovers that overlap inside the "
+                    "graph. Swept for the taskgraph configurations only -- elsewhere it is "
+                    "inert by construction, so synchronous / no-taskgraph run once, at the "
+                    "first value. Iteration counts are rounded up to a whole number of "
+                    "instances. Default: 1 (one iteration per instance).")
+    ap.add_argument("--no-taskgraphloop", action="store_true",
+                    help="build with USE_TASKGRAPHLOOP=0: the apps then record one instance "
+                    "PER ITERATION instead of one per --unroll group, keeping the iteration "
+                    "count and the epilogue cadence identical. This is the A/B baseline the "
+                    "taskgraphloop construct is measured against.")
     ap.add_argument("--opts", default="", help="semicolon-separated CGIR opt combos, each "
                     "a comma/space list of passes (e.g. 'reduce-node,transitive-reduction;batch'); "
                     "each combo -> one taskgraph:<opt> config. Default from appspecs.")
@@ -123,7 +153,8 @@ def main():
         print("\nconfigurations:")
         for c in default_configs(opts):
             print(f"  {c.label:34s} build={c.build} opt={c.opt!r}"
-                  f"{' grain1' if c.grain1 else ''}")
+                  f"{' grain1' if c.grain1 else ''}"
+                  f"{'' if c.taskgraph else ' (no unroll sweep)'}")
         return 0
 
     selected = [a.strip() for a in args.apps.split(",") if a.strip()] or list(APPS)
@@ -139,12 +170,22 @@ def main():
     for a in iters_by_app:
         if a not in APPS:
             ap.error(f"unknown app '{a}' in --iters (known: {', '.join(APPS)})")
+    unroll_default, unroll_by_app = _parse_sizes(args.unroll)   # same list syntax
+    for a in unroll_by_app:
+        if a not in APPS:
+            ap.error(f"unknown app '{a}' in --unroll (known: {', '.join(APPS)})")
+    for name, lst in [("--unroll", unroll_default)] + list(unroll_by_app.items()):
+        for u in lst or []:
+            if u < 1:
+                ap.error(f"--unroll: '{u}' is not a positive iteration count")
     grain_default, grain_by_app = _parse_grain(args.grain)   # per-app list of per-size entries
     for a in grain_by_app:
         if a not in APPS:
             ap.error(f"unknown app '{a}' in --grain (known: {', '.join(APPS)})")
     configs = default_configs(_parse_opts(args.opts))
     backend_vars = {"USE_TARGET": "1" if args.target == "gpu" else "0"}
+    if args.no_taskgraphloop:
+        backend_vars["USE_TASKGRAPHLOOP"] = "0"
 
     outdir = Path(args.outdir)
     runs_csv = Path(args.out) if args.out else outdir / "runs.csv"
@@ -168,14 +209,17 @@ def main():
     n_ok = n_fail = 0
     fail_by_app = {}   # app_name -> failed run count
 
-    def do_build(app, variant, cfg, size, iters, grain):
+    def do_build(app, variant, cfg, size, iters, grain, unroll):
         key = (app.name, variant, cfg.label, args.target)
         if app.rebuild_per_size:
-            # grain (GRAN_TMP/...) is compile-time for llm.c; tuple() to stay hashable
-            key = key + (size, tuple(grain) if grain else None)
+            # size, grain (GRAN_TMP/...) and unroll (UNROLL) are all compile-time
+            # for llm.c, so each combination is its own binary; tuple() to stay
+            # hashable. iters (NB_STEPS) is compiled in too, but it is a pure
+            # function of (size, unroll) here, so it needs no key of its own.
+            key = key + (size, tuple(grain) if grain else None, unroll)
         if key in built:
             return built[key]
-        cmd = build_cmd(app, variant, cfg, size, iters, backend_vars, grain)
+        cmd = build_cmd(app, variant, cfg, size, iters, backend_vars, grain, unroll)
         print("[build] " + " ".join(cmd), file=sys.stderr)
         if args.dry_run or args.skip_build:
             built[key] = True
@@ -201,16 +245,27 @@ def main():
         # One grain entry per size (None -> the app's own default granularity).
         grains = _grain_for_sizes(app, grain_by_app.get(app_name) or grain_default,
                                   sizes, app_name in grain_by_app, ap)
+        unrolls = unroll_by_app.get(app_name) or unroll_default or [1]
 
         for variant in variants:
             for cfg in configs:
-                for size, grain in zip(sizes, grains):
-                    ok = do_build(app, variant, cfg, size, iters, grain)
+                # Only a taskgraph has the per-instance barrier that unrolling
+                # amortizes; everywhere else the apps group iterations identically
+                # whatever the unroll, so one pass at the first value is the whole
+                # story (and the reference the taskgraph rows are compared to).
+                cfg_unrolls = unrolls if cfg.taskgraph else unrolls[:1]
+                # product() materializes its arguments, so the one-shot zip is safe
+                for unroll, (size, grain) in itertools.product(cfg_unrolls,
+                                                               zip(sizes, grains)):
+                    eff_iters = effective_iters(iters, unroll)
+                    ok = do_build(app, variant, cfg, size, eff_iters, grain, unroll)
                     work, work_label = app.work(size)
                     vtag = f"-{variant}" if variant else ""
                     disp = f"{app_name}/{variant}" if variant else app_name
-                    run_id = sanitize(f"{app_name}{vtag}-{args.target}-{cfg.label}-n{size}-{ts_run}")
-                    argv = [app.binary(variant)] + list(app.run_args(variant, size, iters, cfg, grain))
+                    run_id = sanitize(f"{app_name}{vtag}-{args.target}-{cfg.label}"
+                                      f"-n{size}-u{unroll}-{ts_run}")
+                    argv = [app.binary(variant)] + list(
+                        app.run_args(variant, size, eff_iters, cfg, grain, unroll))
                     workdir = APPS_OPENMP / app.directory
 
                     env = dict(os.environ)
@@ -231,7 +286,8 @@ def main():
                         env["CGIR_JIT_STATS_CSV"] = str(jit_csv)
 
                     pretty = " ".join(argv)
-                    print(f"[run ] {cfg.label:34s} {disp} n={size} : {pretty}",
+                    utag = f" u={unroll}" if unroll != 1 else ""
+                    print(f"[run ] {cfg.label:34s} {disp} n={size}{utag} : {pretty}",
                           file=sys.stderr)
 
                     row = {k: "" for k in CSV_FIELDS}
@@ -243,7 +299,8 @@ def main():
                         "build_vars": " ".join(f"{k}={v}" for k, v in
                                                {**cfg.build, **backend_vars}.items()),
                         "backend": args.target, "size": size,
-                        "work": work, "work_label": work_label, "iters": iters,
+                        "work": work, "work_label": work_label, "iters": eff_iters,
+                        "unroll": unroll,
                         "grain": (":".join(map(str, grain)) if grain else ""),
                         "cmd": pretty,
                     })

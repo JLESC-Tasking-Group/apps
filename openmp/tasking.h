@@ -12,7 +12,9 @@
  *                    (mutually exclusive with USE_TARGET).
  *
  * USE_TASKGRAPH wraps the (loop-invariant) per-iteration task region with
- * TASKGRAPH_BEGIN/END so it is recorded once and replayed on later iterations.
+ * TASKGRAPH_LOOP so it is recorded once and replayed on later iterations.
+ * USE_TASKGRAPHLOOP then chooses how many iterations one recorded instance
+ * covers: the loop's `unroll` (default) or exactly one, the A/B baseline.
  *
  * USE_SYNC switches from the asynchronous task schedule to a *synchronous* one:
  * each kernel runs to completion before the next (classic blocking "omp target"
@@ -34,8 +36,12 @@
  *   DEPEND / DEPEND_MULTI          dependency clauses (vanish under USE_SYNC)
  *   MAP                            map() clauses (GPU only)
  *   ATOMIC                         "#pragma omp/oss atomic"
+ *   TASKWAIT                       "#pragma omp/oss taskwait", as _Pragma so it
+ *                                  is usable inside a macro argument
  *   OMP_TARGET_ENTER_DATA / _EXIT_DATA / _UPDATE   device data management
- *   TASKGRAPH_BEGIN / _END         record/replay wrapper (OpenMP / XKOMP)
+ *   TASKGRAPH_LOOP / _LOOP_END     record/replay an iterative loop, `unroll`
+ *                                  iterations per recorded instance
+ *   TASKGRAPH_BEGIN / _END         record/replay ONE region (no loop)
  */
 #ifndef OPENMP_TASKING_H
 #define OPENMP_TASKING_H
@@ -48,6 +54,11 @@
 
 #ifndef USE_TASKGRAPH       /* 1: record/replay the per-iteration task graph */
 # define USE_TASKGRAPH 0
+#endif
+
+#ifndef USE_TASKGRAPHLOOP   /* 1: TASKGRAPH_LOOP unrolls N iterations into one
+                             * graph instance; 0: one instance per iteration */
+# define USE_TASKGRAPHLOOP 1
 #endif
 
 #ifndef USE_SYNC            /* 0: asynchronous tasks   1: synchronous blocking */
@@ -74,6 +85,8 @@
 #if USE_OMPSS && USE_TARGET
 # error "USE_OMPSS=1 is incompatible with USE_TARGET=1: OmpSs-2 does not support OpenMP target (GPU) tasks. Set USE_TARGET=0 for the OmpSs-2 host backend."
 #endif
+
+#include <stddef.h>     /* size_t, used by the TASKGRAPH_LOOP dispatch below */
 
 #if USE_XKOMP
 # include <xkomp/xkomp.h>
@@ -199,6 +212,20 @@
 # define NOWAIT nowait
 #endif
 
+/* `taskwait` written with _Pragma rather than as a #pragma directive, so it may
+ * appear inside a MACRO ARGUMENT -- which the epilogue of TASKGRAPH_LOOP is. A
+ * `#pragma` there is not portable (C++ [cpp.pragma]: the behaviour of a directive
+ * within macro arguments is undefined) and clang diagnoses it; _Pragma is an
+ * operator and is well defined. In synchronous mode there are no tasks to wait
+ * for -- each kernel has already completed -- so it vanishes. */
+#if USE_SYNC
+# define TASKWAIT
+#elif USE_OMPSS
+# define TASKWAIT TG_PRAGMA(oss taskwait)
+#else
+# define TASKWAIT TG_PRAGMA(omp taskwait)
+#endif
+
 /* ---- Dependency-clause abstraction ----
  *   OpenMP (USE_OMPSS == 0):
  *     DEPEND(in, a[x:y], b)           -> depend(in: a[x:y], b)
@@ -280,22 +307,119 @@
  *     TASKGRAPH_END
  *
  * With USE_TASKGRAPH the region is recorded on the first encounter and replayed
- * afterwards. Two backends are supported: LLVM's "#pragma omp taskgraph" and
- * XKOMP's function/lambda form. Without USE_TASKGRAPH (or under USE_SYNC /
- * USE_OMPSS, which use their own schedules) the macros vanish and the tasks are
- * simply created every iteration.
+ * afterwards. Without USE_TASKGRAPH (or under USE_SYNC / USE_OMPSS, which use
+ * their own schedules) the macros vanish and the tasks are simply created every
+ * iteration.
+ *
+ * Prefer TASKGRAPH_LOOP below: this wrapper records ONE iteration per instance,
+ * and a taskgraph instance carries an implicit taskgroup, so consecutive
+ * iterations cannot overlap. That is the very cost TASKGRAPH_LOOP's `unroll`
+ * exists to amortize. No app in this tree uses TASKGRAPH_BEGIN any more; it is
+ * kept for the case of a single, non-iterated recorded region.
  * ------------------------------------------------------------------------- */
 #if USE_TASKGRAPH && !USE_SYNC && !USE_OMPSS
-# if USE_XKOMP
-#  define TASKGRAPH_BEGIN pragma_omp_taskgraph(0, XKOMP_TASKGRAPH_FLAG_NONE, [&] (void)
-#  define TASKGRAPH_END   );
-# else
-#  define TASKGRAPH_BEGIN TG_XPRAGMA(omp taskgraph graph_id(0))
-#  define TASKGRAPH_END
-# endif
+# define TASKGRAPH_BEGIN pragma_omp_taskgraph(0, XKOMP_TASKGRAPH_FLAG_NONE, [&] (void)
+# define TASKGRAPH_END   );
 #else
 # define TASKGRAPH_BEGIN
 # define TASKGRAPH_END
 #endif
+
+/* ----------------------------------------------------------------------------
+ * An iterative loop whose body is recorded once and replayed:
+ *
+ *     TASKGRAPH_LOOP(unroll, cond, epilogue)
+ *     {
+ *         ... ONE iteration: spawn the (loop-invariant) tasks ...
+ *     }
+ *     TASKGRAPH_LOOP_END
+ *
+ *   unroll   : iterations folded into one recorded graph instance. A taskgraph
+ *              instance carries an implicit taskgroup, so instance i+1 cannot
+ *              start before i has drained; unrolling recovers the cross-iteration
+ *              overlap *inside* the instance and pays the barrier once per
+ *              `unroll` iterations. Ignored unless USE_TASKGRAPH && USE_TASKGRAPHLOOP.
+ *   cond     : bool(size_t done) -- loop condition, evaluated on the host between
+ *              instances with the number of iterations already issued. Fixed trip
+ *              count: [&](size_t d){ return d < (size_t) n; }. A convergence test
+ *              may read device results written back by the previous instance (the
+ *              instance boundary is a barrier), but is only evaluated every
+ *              `unroll` iterations, so the loop may overshoot.
+ *   epilogue : void(size_t inst, size_t done) -- host code after each instance,
+ *              OUTSIDE the recorded region: per-iteration timing, progress
+ *              prints, convergence bookkeeping. Spawn a task here rather than
+ *              blocking, or the no-taskgraph configuration loses its pipelining.
+ *
+ * The body takes no iteration index on purpose: it runs only on the record pass,
+ * so anything it captures is frozen into the graph and replayed verbatim. An
+ * index baked into a recorded task would be wrong from the second instance on.
+ * Iteration-varying state belongs in the data the graph reads/writes (a
+ * device-side counter, a 1-element buffer chained through `depend`).
+ *
+ * Every configuration keeps the loop; only who owns it changes:
+ *   taskgraph + taskgraphloop : one instance per `unroll` iterations
+ *   taskgraph only            : one instance per iteration (the A/B baseline)
+ *   otherwise                 : a plain loop, tasks re-created every iteration
+ * ------------------------------------------------------------------------- */
+/* Both taskgraph wrappers above and below are XKOMP's lambda form. LLVM's
+ * `#pragma omp taskgraph` cannot serve here: a directive cannot be applied to a
+ * region from inside a function template, and it has no taskgraphloop form at
+ * all. Every taskgraph build in this tree already goes through xkcxx (see
+ * common.mk, which hardcodes -DUSE_XKOMP=1), so this only catches a hand-rolled
+ * build with the wrong toggles. */
+#if USE_TASKGRAPH && !USE_SYNC && !USE_OMPSS && !USE_XKOMP
+# error "USE_TASKGRAPH=1 requires USE_XKOMP=1: the taskgraph wrappers use XKOMP's lambda API, and LLVM's `#pragma omp taskgraph` has no taskgraphloop form. Build with xkcxx -DUSE_XKOMP=1."
+#endif
+
+/* Variadic so that commas inside the `cond` / `epilogue` lambda bodies (which
+ * braces do not shield from the preprocessor) cannot split the argument list. */
+#define TASKGRAPH_LOOP(...) tasking_taskgraph_loop(__VA_ARGS__, [&] (void)
+#define TASKGRAPH_LOOP_END );
+
+/* Dispatch for TASKGRAPH_LOOP. Every configuration groups `unroll` iterations
+ * per "instance" and calls the epilogue once per group, so the iteration count,
+ * the task order and the epilogue cadence are identical everywhere -- only who
+ * records the group changes. That is what makes -u inert (rather than merely
+ * harmless) in the configurations without a taskgraph, and what lets an app size
+ * its per-instance arrays the same way whatever it is built with. */
+template <typename Cond, typename Epilogue, typename Body>
+static inline size_t
+tasking_taskgraph_loop(size_t unroll, Cond cond, Epilogue epilogue, Body body)
+{
+    if (unroll == 0)
+        unroll = 1;
+
+#if USE_TASKGRAPH && !USE_SYNC && !USE_OMPSS && USE_TASKGRAPHLOOP
+    /* the whole group is one recorded instance */
+    return pragma_omp_taskgraphloop(0, XKOMP_TASKGRAPH_FLAG_NONE, unroll,
+                                    cond, epilogue, body);
+#else
+    size_t done = 0, inst = 0;
+    while (cond(done))
+    {
+        for (size_t u = 0 ; u < unroll ; ++u)
+        {
+# if USE_TASKGRAPH && !USE_SYNC && !USE_OMPSS
+            /* USE_TASKGRAPHLOOP=0: one recorded instance per iteration, i.e. the
+             * behaviour this construct exists to be compared against. Inlined
+             * rather than routed through pragma_omp_taskgraph, whose
+             * std::function parameter would type-erase (and possibly heap
+             * allocate) the body on every iteration -- inside the measured
+             * region, and only on this side of the A/B. */
+            xkomp_taskgraph_t * tg = xkomp_taskgraph_begin(0, XKOMP_TASKGRAPH_FLAG_NONE);
+            if (tg->rc == 1)
+                body();
+            xkomp_taskgraph_end(tg);
+# else
+            /* no graph: the tasks are simply re-created every iteration */
+            body();
+# endif
+        }
+        done += unroll;
+        epilogue(inst++, done);
+    }
+    return done;
+#endif
+}
 
 #endif /* OPENMP_TASKING_H */

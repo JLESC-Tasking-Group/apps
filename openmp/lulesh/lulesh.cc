@@ -1321,19 +1321,34 @@ OMP_TARGET_ENTER_DATA( \
 
     t0 = omp_get_wtime();
     prev_ts = t0;
-  for (Int_t inst = 0; inst < ninst; ++inst) {
-
-      TASKGRAPH_BEGIN
-      {
-      /* `unroll` cycles per taskgraph instance. The construct carries an
-       * implicit taskgroup, so instance i+1 cannot start before i has fully
-       * drained -- which costs exactly the cross-cycle overlap that the plain
-       * task version gets for free (its only taskwait is after the loop). The
-       * cycles unrolled here overlap *inside* the instance, and the barrier is
-       * paid once per `unroll` cycles instead of once per cycle. The body is
-       * unrollable as-is: it does not depend on the cycle index and has no
-       * host-side control flow. */
-      for (Int_t u = 0; u < unroll; ++u) {
+  /* `unroll` cycles per taskgraph instance (-u). The body is unrollable as-is:
+   * it does not depend on the cycle index and has no host-side control flow --
+   * the per-cycle state (time, cycle, deltatime) lives in 1-element buffers
+   * chained through `depend` and incremented on the device, so consecutive
+   * unrolled cycles order themselves. */
+  TASKGRAPH_LOOP(unroll,
+                 [&] (size_t done) { return done < (size_t) opts.its; },
+                 [&] (size_t inst, size_t done)
+  {
+    (void) done;
+    /* Per-instance timing + progress print. Run OUTSIDE the recorded region and
+     * spawned as a depend-synchronized task so it fires after the instance's
+     * last work (TimeIncrement update + end-of-step reductions) and before the
+     * next instance's TimeIncrement -- and so that it does not serialize the
+     * configurations that have no taskgraph barrier. It reads the host copies of
+     * cycle/time/deltatime kept current by the earlier `target update from`.
+     * Divided by `unroll` so the reported unit stays one cycle at any -u. */
+    OMP_HOST_TASK(firstprivate(inst, unroll, iter_times) shared(prev_ts)
+                  DEPEND(in, cycle[0], time[0], deltatime[0], dtcourant[0], dthydro[0]))
+    {
+        const double now = omp_get_wtime();
+        iter_times[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
+        prev_ts = now;
+        printf("cycle = %d, time = %e, dt=%e, exec = %.3f ms\n",
+               cycle[0], double(time[0]), double(deltatime[0]), iter_times[inst]);
+    }
+  })
+  {
 
     //==============================================================================
     // TimeIncrement(*locDom) ;
@@ -2750,28 +2765,9 @@ OMP_TARGET_ENTER_DATA( \
     opts.iteration_cap -= 1;
     # endif
 
-      } /* unroll */
-    }
-    TASKGRAPH_END
-
-    /* Per-instance timing + progress print. Created OUTSIDE the taskgraph (so
-     * it is not recorded/replayed) and depend-synchronized on this instance's
-     * per-step scalars, so it fires after the instance's last work (TimeIncrement
-     * update + end-of-step reductions) and before the next instance's
-     * TimeIncrement -- recording the steady-state wall time. It reads the host
-     * copies of cycle/time/deltatime kept current by the earlier `target update
-     * from`. Divided by `unroll` so the reported unit stays one cycle whatever
-     * the unroll factor. */
-    OMP_HOST_TASK(firstprivate(inst, unroll, iter_times) shared(prev_ts)
-                  DEPEND(in, cycle[0], time[0], deltatime[0], dtcourant[0], dthydro[0]))
-    {
-        const double now = omp_get_wtime();
-        iter_times[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
-        prev_ts = now;
-        printf("cycle = %d, time = %e, dt=%e, exec = %.3f ms\n",
-               cycle[0], double(time[0]), double(deltatime[0]), iter_times[inst]);
-    }
   }
+  TASKGRAPH_LOOP_END
+
   t1 = omp_get_wtime();
   # pragma omp taskwait
   tf = omp_get_wtime();

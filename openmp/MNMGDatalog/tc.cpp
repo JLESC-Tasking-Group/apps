@@ -548,29 +548,41 @@ static void tc_warmup(TCContext &ctx, int nrounds)
  * host reads it (and what bounds each round's time). Under USE_TASKGRAPH the
  * region is already effectively blocking (xkomp_taskgraph_end does an implicit
  * taskwait while recording, and replay is synchronous), so it costs nothing
- * there; but with USE_TASKGRAPH=0 the TASKGRAPH_BEGIN/END macros vanish and the
- * nowait tasks would still be in flight, so without it the loop would read a
- * stale count and stop early. */
-static int tc_run_fixpoint(TCContext &ctx, TCTimes *times)
+ * there; but with USE_TASKGRAPH=0 the taskgraph macros vanish and the nowait
+ * tasks would still be in flight, so without it the loop would read a stale
+ * count and stop early.
+ *
+ * `unroll` (-u) folds that many rounds into one recorded instance, so they
+ * overlap inside the graph rather than being separated by its implicit
+ * taskgroup. The convergence test is then only evaluated every `unroll` rounds,
+ * so the fixpoint OVERSHOOTS by up to unroll-1 rounds. That is semantically
+ * harmless -- a converged round has an empty frontier, so expand/promote copy
+ * nothing -- but it is wasted work and it inflates the reported round count,
+ * which is why the count returned here is the number of rounds actually
+ * executed. */
+static int tc_run_fixpoint(TCContext &ctx, TCTimes *times, int unroll)
 {
-    int rounds = 0;
     int *nc = ctx.new_count;
     nc[0] = 1;                      /* prime: enter the loop (host copy only) */
-    for (rounds = 0; nc[0] > 0; ++rounds)
+
+    double r0 = omp_get_wtime();
+
+    const size_t rounds = TASKGRAPH_LOOP(unroll,
+        [&] (size_t done) { (void) done; return nc[0] > 0; },
+        [&] (size_t inst, size_t done)
     {
-        const double r0 = omp_get_wtime();
-
-        TASKGRAPH_BEGIN
-        {
-            tc_round(ctx);
-        }
-        TASKGRAPH_END
-
-        #pragma omp taskwait
-
-        tc_times_push(times, omp_get_wtime() - r0);
+        (void) inst; (void) done;
+        TASKWAIT
+        const double now = omp_get_wtime();
+        tc_times_push(times, (now - r0) / (double) unroll);
+        r0 = now;
+    })
+    {
+        tc_round(ctx);
     }
-    return rounds;
+    TASKGRAPH_LOOP_END
+
+    return (int) rounds;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -822,17 +834,34 @@ static TCTimings tc_timings(const double *t, int n)
 }
 
 /* ------------------------------------------------------------------------- */
-/* main. Usage: ./tc.x <data.bin> [capacity_mult] [frontier_slots]            */
+/* main. Usage: ./tc.x <data.bin> [capacity_mult] [frontier_slots] [-u <n>]    */
+/*   -u <n> : rounds per taskgraph instance (default 1). The taskgraph carries  */
+/*            an implicit taskgroup, so consecutive instances cannot overlap;   */
+/*            unrolling recovers that overlap inside the graph. The convergence  */
+/*            test then only runs every n rounds, so the fixpoint may overshoot. */
 /*   Env: TC_WARMUP=<n> untimed warm-up rounds before round 0 (default 3);     */
+/*        TC_UNROLL=<n> same as -u;                                            */
 /*        TC_WORKERS=<n> grid-stride worker count (GPU);                       */
 /*        TC_WRITE=1 writes <input>_<version>_tc.bin; TC_DUMP=<f> text dump;   */
 /*        TC_CSV=<f> writes the 15-column machine row.                         */
 /* ------------------------------------------------------------------------- */
 int main(int argc, char **argv)
 {
-    const char *input_file = (argc >= 2) ? argv[1] : "MNMGDatalog-reference/data/data_10.bin";
-    long capacity_mult  = (argc >= 3) ? atol(argv[2]) : 64;
-    long frontier_slots = (argc >= 4) ? atol(argv[3]) : 0;
+    /* positional args, skipping any flags */
+    const char *pos[3] = { NULL, NULL, NULL };
+    int npos = 0, unroll = 1;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-u") && i + 1 < argc) unroll = atoi(argv[++i]);
+        else if (npos < 3)                          pos[npos++] = argv[i];
+    }
+
+    const char *input_file = pos[0] ? pos[0] : "MNMGDatalog-reference/data/data_10.bin";
+    long capacity_mult  = pos[1] ? atol(pos[1]) : 64;
+    long frontier_slots = pos[2] ? atol(pos[2]) : 0;
+
+    const char *ur = getenv("TC_UNROLL");
+    if (ur && ur[0]) unroll = atoi(ur);
+    if (unroll < 1) unroll = 1;
 
     int warmups = 3;
     const char *wu = getenv("TC_WARMUP");
@@ -860,7 +889,7 @@ int main(int argc, char **argv)
 
         tc_reset_state(ctx);
         double f0 = omp_get_wtime();
-        rounds = tc_run_fixpoint(ctx, &times);
+        rounds = tc_run_fixpoint(ctx, &times, unroll);
         fixpoint_s = omp_get_wtime() - f0;
     }
     tc_check_overflow(ctx);
@@ -913,6 +942,10 @@ int main(int argc, char **argv)
     printf("  %-11s: %s\n", "input", input_file);
     printf("  %-11s: %d edges  ->  TC = %llu tuples in %d rounds\n",
            "size", ctx.input_rows, tc, rounds);
+    if (unroll > 1)
+        printf("  %-11s: %d rounds per taskgraph instance (%d instances; the "
+               "fixpoint may overshoot by up to %d rounds)\n",
+               "unroll", unroll, rounds / unroll, unroll - 1);
 #if USE_TARGET
     printf("  %-11s: %d grid-stride workers\n", "geometry", ctx.n_workers);
 #endif

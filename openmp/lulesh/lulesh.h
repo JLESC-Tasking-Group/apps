@@ -645,6 +645,7 @@ struct cmdLineOpts {
    Int_t balance; // -b
    Int_t iteration_cap; // -z
    Int_t nb;  // -nb
+   Int_t unroll; // -u
 };
 
 

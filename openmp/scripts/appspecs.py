@@ -162,18 +162,23 @@ class AppSpec:
     rebuild_per_size: bool = False       # llm.c: size is a compile-time macro
     llmc_defs: Optional[Callable] = None # (size, iters, batch) -> LLMC_DEFS string
     batch: int = 4                       # llm.c BATCH_SIZE (for tokens = B*T)
+    # Number of granularity knobs this app takes, i.e. how many ':'-separated
+    # components one --grain entry may hold (0 = the app has no knob). Used by
+    # evaluate.py to reject malformed / stale grain specs.
+    grain_arity: int = 0
 
 
 # ---- krylov: grid n, matrix N=n^3, work ~ n^3; -t/-s = task counts (0=threads) --
-# grain is a positional list [T1, T2]: T1 -> -t (tasks per vector op), T2 -> -s
-# (SpMV sub-tasks per block, default 1 so every loop has T1 tasks). None -> the
-# app default (-t 0 -s 0 = auto, i.e. omp threads). Sync is always 1/loop (-t 1 -s 1).
+# grain is THIS size's entry, written "s:t" (alphabetical, so the first component
+# is -s = SpMV sub-tasks per block, the second is -t = tasks per vector op). A
+# single-component entry sets -s and leaves -t at 1. None -> the app default
+# (-t 0 -s 0 = auto, i.e. omp threads). Sync is always 1/loop (-t 1 -s 1).
 def _krylov_run(variant, size, iters, cfg, grain):
     if cfg.grain1:
         t, s = "1", "1"
     elif grain:
-        t = str(grain[0])
-        s = str(grain[1]) if len(grain) > 1 else "1"
+        s = str(grain[0])
+        t = str(grain[1]) if len(grain) > 1 else "1"
     else:
         t, s = "0", "0"
     return ["-n", str(size), "-i", str(iters), "-t", t, "-s", s, "-S", "27"]
@@ -189,11 +194,12 @@ KRYLOV = AppSpec(
     work=lambda n: (float(n) ** 3, "n\u00b3 (\u221d FLOPs)"),
     sizes=[32, 48, 64],
     iters=50,
+    grain_arity=2,          # "s:t"
 )
 
 # ---- lulesh: mesh side s, zones = s^3; -nb = tasks per loop ---------------------
-# grain is a positional list [nb]: nb -> -nb (tasks per loop). None -> the app
-# default (-nb 32). The synchronous config is always 1 task/loop (-nb 1).
+# grain is THIS size's entry, a single component "nb" -> -nb (tasks per loop).
+# None -> the app default (-nb 32). The synchronous config is always 1 (-nb 1).
 def _lulesh_run(variant, size, iters, cfg, grain):
     nb = "1" if cfg.grain1 else (str(grain[0]) if grain else "32")
     return ["-i", str(iters), "-s", str(size), "-r", "11", "-b", "1", "-c", "1", "-nb", nb]
@@ -209,12 +215,13 @@ LULESH = AppSpec(
     work=lambda s: (float(s) ** 3, "zones (s\u00b3)"),
     sizes=[16, 32, 48, 64],
     iters=30,
+    grain_arity=1,          # "nb"
 )
 
 # ---- llm.c: SEQUENCE_SIZE T is a compile-time macro -> rebuild per size ---------
-# grain is a positional list mapping to the compile-time granularity macros
-# [GRAN_TMP, OC_SPLIT, OC_BACK_SPLIT] (extras ignored); injected at build time
-# rather than as run arguments. None -> the source defaults.
+# grain is THIS size's entry, written "GRAN_TMP:OC_SPLIT:OC_BACK_SPLIT" (a shorter
+# entry sets only the leading macros); injected at build time rather than as run
+# arguments. None -> the source defaults.
 _LLMC_GRAIN_MACROS = ["GRAN_TMP", "OC_SPLIT", "OC_BACK_SPLIT"]
 
 def _llmc_run(variant, size, iters, cfg, grain):
@@ -239,6 +246,7 @@ LLMC = AppSpec(
     iters=10,
     rebuild_per_size=True,
     llmc_defs=_llmc_defs,
+    grain_arity=3,          # "GRAN_TMP:OC_SPLIT:OC_BACK_SPLIT"
 )
 
 # ---- mnmg: Datalog transitive closure; dataset data_<N>.bin, N = #edges --------

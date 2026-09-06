@@ -88,12 +88,14 @@ def main():
     ap.add_argument("--iters", default="", help="iterations: a global value (e.g. '200') "
                     "and/or per-app 'app=N' items separated by ';' (e.g. 'krylov=200;lulesh=30'). "
                     "A per-app value overrides the global one, which overrides each app's default.")
-    ap.add_argument("--grain", default="", help="tasks-per-loop granularity: a per-app "
-                    "comma-separated list, items ';'-separated (e.g. 'krylov=8,2;lulesh=64'); a "
-                    "bare list is the global default. Interpreted positionally per app: krylov "
-                    "[T1,T2] -> -t/-s, lulesh [nb] -> -nb, llm.c [GRAN_TMP,OC_SPLIT,OC_BACK_SPLIT] "
-                    "(compile-time). Applies to the async configs only (sync is always 1 task/loop). "
-                    "Unset -> each app's default granularity.")
+    ap.add_argument("--grain", default="", help="tasks-per-loop granularity, ONE entry per "
+                    "problem size: per-app 'app=<e1>,<e2>,...' items separated by ';' (e.g. "
+                    "'lulesh=1,8,16;krylov=4:4,8:2,2:8'); a bare list is the global default. "
+                    "Entries pair positionally with --sizes; a single entry is applied to every "
+                    "size. Each entry is a ':'-separated list of that app's knobs: krylov 's:t' "
+                    "-> -s/-t, lulesh 'nb' -> -nb, llm.c 'GRAN_TMP:OC_SPLIT:OC_BACK_SPLIT' "
+                    "(compile-time); mnmg has none. Applies to the async configs only (sync is "
+                    "always 1 task/loop). Unset -> each app's default granularity.")
     ap.add_argument("--opts", default="", help="semicolon-separated CGIR opt combos, each "
                     "a comma/space list of passes (e.g. 'reduce-node,transitive-reduction;batch'); "
                     "each combo -> one taskgraph:<opt> config. Default from appspecs.")
@@ -137,7 +139,7 @@ def main():
     for a in iters_by_app:
         if a not in APPS:
             ap.error(f"unknown app '{a}' in --iters (known: {', '.join(APPS)})")
-    grain_default, grain_by_app = _parse_sizes(args.grain)   # per-app list of ints
+    grain_default, grain_by_app = _parse_grain(args.grain)   # per-app list of per-size entries
     for a in grain_by_app:
         if a not in APPS:
             ap.error(f"unknown app '{a}' in --grain (known: {', '.join(APPS)})")
@@ -196,11 +198,13 @@ def main():
             variants = [v for v in app.variants if not variant_filter or v in variant_filter]
         sizes = size_by_app.get(app_name) or size_default or app.sizes
         iters = iters_by_app.get(app_name) or iters_default or app.iters
-        grain = grain_by_app.get(app_name) or grain_default   # None -> app default
+        # One grain entry per size (None -> the app's own default granularity).
+        grains = _grain_for_sizes(app, grain_by_app.get(app_name) or grain_default,
+                                  sizes, app_name in grain_by_app, ap)
 
         for variant in variants:
             for cfg in configs:
-                for size in sizes:
+                for size, grain in zip(sizes, grains):
                     ok = do_build(app, variant, cfg, size, iters, grain)
                     work, work_label = app.work(size)
                     vtag = f"-{variant}" if variant else ""
@@ -240,7 +244,7 @@ def main():
                                                {**cfg.build, **backend_vars}.items()),
                         "backend": args.target, "size": size,
                         "work": work, "work_label": work_label, "iters": iters,
-                        "grain": (",".join(map(str, grain)) if grain else ""),
+                        "grain": (":".join(map(str, grain)) if grain else ""),
                         "cmd": pretty,
                     })
 
@@ -318,8 +322,78 @@ def _parse_sizes(arg):
     return default, by_app
 
 
+def _parse_grain(arg):
+    """Parse --grain into (global_default_or_None, {app: [entry, ...]}).
+
+    Items are ';'-separated; an item 'app=<spec>' sets that app's grain, a bare
+    item sets the global default. A <spec> is a ','-separated list holding ONE
+    entry per problem size, and each entry is a ':'-separated list of that app's
+    granularity knobs. E.g. 'lulesh=1,8,16;krylov=4:4,8:2,2:8' gives lulesh
+    -nb 1/8/16 and krylov (-s 4 -t 4)/(-s 8 -t 2)/(-s 2 -t 8) for their
+    respective 1st/2nd/3rd --sizes. Empty -> (None, {})."""
+    def entries(spec):
+        return [[int(v) for v in e.split(":") if v.strip()]
+                for e in spec.split(",") if e.strip()]
+
+    default, by_app = None, {}
+    for chunk in arg.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "=" in chunk:
+            app, _, spec = chunk.partition("=")
+            by_app[app.strip()] = entries(spec)
+        else:
+            default = entries(chunk)
+    return default, by_app
+
+
+def _grain_for_sizes(app, entries, sizes, explicit, ap):
+    """Align a parsed grain spec with `sizes`, returning one entry per size.
+
+    `entries` is None (unset -> the app's own default), a single entry (applied
+    to every size) or exactly one entry per size. `explicit` says whether the
+    spec came from an 'app=' item rather than the global default, so that a
+    global default can be silently ignored for apps that have no knob."""
+    if not entries:
+        return [None] * len(sizes)
+
+    if app.grain_arity == 0:
+        if explicit:
+            ap.error(f"--grain: app '{app.name}' has no granularity knob")
+        return [None] * len(sizes)
+
+    # Over-long entries are an error when the app was named explicitly (the user
+    # meant that app, so the arity is wrong), but merely trimmed when they come
+    # from the bare global default, which must stay usable across apps whose
+    # knob counts differ (e.g. --grain "3:5" over krylov 's:t' and lulesh 'nb').
+    for e in entries:
+        if len(e) > app.grain_arity and explicit:
+            ap.error(f"--grain for '{app.name}': entry '{':'.join(map(str, e))}' has "
+                     f"{len(e)} components but the app takes at most {app.grain_arity}")
+    entries = [e[:app.grain_arity] for e in entries]
+
+    # Stale flat syntax: 'krylov=4,4' used to mean one list [4,4] for every size;
+    # it now reads as two single-knob entries. Reject it rather than silently
+    # running a different granularity than intended.
+    if (app.grain_arity >= 2 and len(sizes) > 1 and len(entries) == len(sizes)
+            and all(len(e) == 1 for e in entries)):
+        ap.error(f"--grain for '{app.name}': ambiguous spec "
+                 f"'{','.join(str(e[0]) for e in entries)}' -- entries are now per SIZE and "
+                 f"their knobs are ':'-separated. Write e.g. '4:4,8:2' for one entry per size, "
+                 f"or a single entry like '4:4' to apply it to all sizes.")
+
+    if len(entries) == 1:
+        return [entries[0]] * len(sizes)
+    if len(entries) != len(sizes):
+        ap.error(f"--grain for '{app.name}': {len(entries)} entries but {len(sizes)} sizes "
+                 f"({','.join(map(str, sizes))}) -- give one entry per size, or a single "
+                 f"entry to apply to all")
+    return entries
+
+
 def _parse_ints(arg):
-    """Parse a --iters/--grain style spec into (global_default_or_None, {app: int}),
+    """Parse an --iters style spec into (global_default_or_None, {app: int}),
     like _parse_sizes but with a single int per entry. E.g. 'krylov=200;lulesh=30'
     or '200'."""
     default, by_app = None, {}

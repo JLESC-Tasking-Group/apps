@@ -67,7 +67,11 @@ PASS_ORDER = ["copy-fuse", "reduce-node", "transitive-reduction",
 CG_METRICS = ["nodes", "edges", "empty", "command", "graph", "prog",
               "copy1d", "copy2d", "batch"]
 
-OK_STATUS = ("ok", "", None)
+# Statuses whose numbers are usable. `ok_crashed_at_exit` is a run that printed
+# its complete result and then died on the way out (a teardown bug in the app):
+# the measurement is there and throwing it away would lose data, so it is kept
+# and reported. `wrong_answer` is deliberately absent -- see report_answers().
+OK_STATUS = ("ok", "ok_crashed_at_exit", "", None)
 
 # Publication style: >=10pt fonts everywhere (default leading is ~1.2x -> >=12pt),
 # and hatch patterns + black edges so grouped bars stay distinguishable when the
@@ -297,6 +301,77 @@ def report_coverage(rows):
                   f"(all failed/empty; check --sizes and the build).", file=sys.stderr)
 
     return [r for r in rows if r.get("status") in OK_STATUS]
+
+def report_answers(rows, reference):
+    """Drop every run that did not compute the same thing as the reference.
+
+    An optimization pass may only make a program faster, never make it compute
+    something else -- so a configuration whose answer differs from the reference
+    configuration's is not a data point, it is a bug report. This exists because
+    it did happen: prog-fuse used to collapse two `omp target` launches into one
+    without checking the dependence, which removed the device-wide barrier
+    between them and moved Krylov CG's residual from 4e-15 to 2.6e-03 while
+    reporting a healthy speedup. Nothing in the harness noticed.
+
+    Comparison is against the reference configuration of the SAME (app, variant,
+    size, backend) rather than against a fixed threshold, because "did the solver
+    converge" is a property of the problem while "did the passes change the
+    result" is the property under test. An app that fails to converge in every
+    configuration is reported separately and kept.
+
+    Returns the rows that agree. Also honours a run's own verdict, if it has one.
+    """
+    try:
+        from appspecs import APPS
+    except ImportError:
+        APPS = {}
+
+    def key(r):
+        return (r["app"], r.get("variant", ""), r.get("size", ""), r.get("backend", ""))
+
+    refs = {}
+    for r in rows:
+        if canon_pipeline(r["config"]) == canon_pipeline(reference):
+            v = fnum(r.get("answer"))
+            if v is not None:
+                refs[key(r)] = v
+
+    kept, rejected, unchecked = [], [], 0
+    for r in rows:
+        verdict = str(r.get("verdict", "")).strip().lower()
+        if verdict in ("fail", "failed"):
+            rejected.append((r, f"the app's own verdict is '{verdict}'"))
+            continue
+
+        got = fnum(r.get("answer"))
+        want = refs.get(key(r))
+        if got is None or want is None:
+            unchecked += 1
+            kept.append(r)
+            continue
+
+        rtol = getattr(APPS.get(r["app"]), "answer_rtol", 1e-6)
+        scale = max(abs(want), abs(got))
+        if abs(got - want) <= rtol * scale or (scale == 0.0 and got == want):
+            kept.append(r)
+        else:
+            rejected.append((r, f"answer {got:.6g} != {want:.6g} "
+                                f"(reference '{reference}', rtol {rtol:g})"))
+
+    print("answer check (every configuration must reproduce the reference's result):",
+          file=sys.stderr)
+    if not refs:
+        print(f"  WARNING: no '{reference}' run carries an answer -- nothing was "
+              f"checked. The speedups below are unverified.", file=sys.stderr)
+    print(f"  {len(kept)} verified/unchecked, {len(rejected)} rejected"
+          f"{f', {unchecked} had no answer to compare' if unchecked else ''}",
+          file=sys.stderr)
+    for r, whys in rejected:
+        name = f"{r['app']}/{r['variant']}" if r.get("variant") else r["app"]
+        print(f"  REJECTED {name} n={r.get('size','?')} u={r.get('unroll','?')} "
+              f"[{r['config']}]: {whys}", file=sys.stderr)
+    return kept
+
 
 def report_speedups(rows, reference):
     """Print (to stdout) the average speedup of every configuration against the
@@ -644,7 +719,7 @@ def load_external(path):
     """Read the hand-written reference implementations, which no sweep produces.
 
     These are the CUDA baselines that ship with two of the apps (MNMGDatalog's
-    v2_cudagraph in tc.cu, llm.c's train_gpt2.cu). They are not configurations of
+    v2_cudagraph in tc.cu). They are not configurations of
     our stack -- different source, different toolchain -- so they are not in
     runs.csv and are supplied as their own small file:
 
@@ -1085,6 +1160,13 @@ def main():
                     "style assignment (repeatable). Figures of one runs.csv are always "
                     "mutually consistent; point every invocation at the same superset "
                     "file to keep figures plotted from *different* files consistent too")
+    ap.add_argument("--answer-reference", default="synchronous",
+                    help="configuration whose computed answer every other one must "
+                    "reproduce (default: synchronous, the simplest schedule)")
+    ap.add_argument("--no-answer-check", action="store_true",
+                    help="do not drop runs whose answer disagrees with the reference. "
+                    "Only for inspecting a known-broken sweep -- results produced with "
+                    "this flag are unverified")
     ap.add_argument("--paper", action="store_true",
                     help="also render the paper figure (paper-speedup.<fmt>): one panel "
                     "per app, speedup over --baseline, the pipeline as bars and the "
@@ -1095,7 +1177,7 @@ def main():
     ap.add_argument("--panel-size", type=int, default=0,
                     help="problem size at which an app whose panel varies the variant "
                     "(krylov) is compared; default: its largest size")
-    ap.add_argument("--apps", default="krylov,lulesh,llm.c,mnmg",
+    ap.add_argument("--apps", default="krylov,lulesh,mnmg",
                     help="comma list fixing the panel order of the paper figure")
     ap.add_argument("--external", default="",
                     help="CSV of hand-written reference implementations to overlay "
@@ -1139,6 +1221,13 @@ def main():
     rows = report_coverage(allrows)
     if not any(r.get("avg_ms", "") != "" for r in rows):
         ap.error("no plottable rows (see the coverage report above)")
+
+    # Before anything is plotted or tabulated: a run that computed the wrong
+    # answer is not a slower or faster data point, it is not a data point.
+    if not args.no_answer_check:
+        rows = report_answers(rows, args.answer_reference)
+        if not rows:
+            ap.error("every run was rejected by the answer check")
 
     if args.reference:
         report_speedups(rows, args.reference)

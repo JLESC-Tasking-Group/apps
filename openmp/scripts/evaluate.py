@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 evaluate.py - shared evaluation sweep for the apps/openmp taskgraph apps
-(krylov, lulesh, llm.c). For each app x variant x configuration x problem size it
+(krylov, lulesh, mnmg). For each app x variant x configuration x problem size it
 builds the right binary, runs it, parses the per-iteration timing, and appends a
 row to results/runs.csv. Alongside (auto, unless --no-stats), for taskgraph
 configs CGIR writes two side files that join runs.csv on run_id == tag:
@@ -44,7 +44,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from appspecs import APPS, BACKENDS, DEFAULT_OPTS, default_configs  # noqa: E402
+from appspecs import (APPS, BACKENDS, CGIR_PASSES, DEFAULT_OPTS,  # noqa: E402
+                       default_configs)
 
 APPS_OPENMP = Path(__file__).resolve().parent.parent
 
@@ -59,7 +60,7 @@ CSV_FIELDS = [
     "app", "variant", "config", "opt", "build_vars", "backend", "env",
     "size", "work", "work_label", "iters", "unroll", "grain",
     "avg_ms", "stddev_ms", "iter0_ms", "iter1_ms", "elapsed_s", "fom", "flops", "gflops",
-    "residual", "error",
+    "residual", "error", "answer", "verdict",
     "returncode", "status", "cmd",
 ]
 
@@ -83,11 +84,11 @@ def build_cmd(app, variant, cfg, size, iters, backend_vars, grain, unroll):
     variables.update(backend_vars)
     argv = ["make", "-C", app.directory, "clean", app.make_target(variant)]
     argv += [f"{k}={v}" for k, v in variables.items()]
-    if app.rebuild_per_size and app.llmc_defs:
-        # grain (GRAN_TMP) and unroll (UNROLL) are compile-time macros for llm.c;
-        # on sync the grain is 1/loop.
+    if app.rebuild_per_size and app.build_defs:
+        # An app whose problem size is a compile-time macro contributes extra
+        # make variables here; on sync the grain is 1/loop.
         g = None if cfg.grain1 else grain
-        argv.append("LLMC_DEFS=" + app.llmc_defs(size, iters, app.batch, g, unroll))
+        argv += app.build_defs(size, iters, g, unroll)
     return argv
 
 
@@ -157,13 +158,13 @@ def main():
                     "'lulesh=1,8,16;krylov=4:4,8:2,2:8'); a bare list is the global default. "
                     "Entries pair positionally with --sizes; a single entry is applied to every "
                     "size. Each entry is a ':'-separated list of that app's knobs: krylov 's:t' "
-                    "-> -s/-t, lulesh 'nb' -> -nb, llm.c 'GRAN_TMP:OC_SPLIT:OC_BACK_SPLIT' "
-                    "(compile-time); mnmg has none. Applies to the async configs only (sync is "
+                    "-> -s/-t, lulesh 'nb' -> -nb; mnmg has none. "
+                    "Applies to the async configs only (sync is "
                     "always 1 task/loop). Unset -> each app's default granularity.")
     ap.add_argument("--unroll", default="", help="iterations folded into ONE taskgraph "
                     "instance -- a sweep dimension: a global comma list (e.g. '1,2,4,8') "
                     "and/or per-app 'app=list' items separated by ';' (e.g. "
-                    "'1,2,4;llm.c=1,2'). A taskgraph instance carries an implicit taskgroup, "
+                    "'1,2,4;lulesh=1,8'). A taskgraph instance carries an implicit taskgroup, "
                     "so instances cannot overlap; unrolling recovers that overlap inside the "
                     "graph. Swept for the taskgraph configurations only -- elsewhere it is "
                     "inert by construction, so synchronous / no-taskgraph run once, at the "
@@ -213,7 +214,7 @@ def main():
         for name, b in sorted(BACKENDS.items()):
             print(f"  {name:8s} build={b.build} passes via {b.opt_env}"
                   f"{' env=' + str(b.env) if b.env else ''}")
-        opts = _parse_opts(args.opts)
+        opts = _parse_opts(args.opts, ap)
         print("\nconfigurations:")
         for c in default_configs(opts):
             print(f"  {c.label:34s} build={c.build} opt={c.opt!r}"
@@ -246,7 +247,7 @@ def main():
     for a in grain_by_app:
         if a not in APPS:
             ap.error(f"unknown app '{a}' in --grain (known: {', '.join(APPS)})")
-    configs = default_configs(_parse_opts(args.opts))
+    configs = default_configs(_parse_opts(args.opts, ap))
     backend = BACKENDS[args.target]
     backend_vars = dict(backend.build)
     if args.no_taskgraphloop:
@@ -292,8 +293,8 @@ def main():
         key = (app.name, variant, cfg.label, args.target)
         if app.rebuild_per_size:
             # size, grain (GRAN_TMP/...) and unroll (UNROLL) are all compile-time
-            # for llm.c, so each combination is its own binary; tuple() to stay
-            # hashable. iters (NB_STEPS) is compiled in too, but it is a pure
+            # for such an app, so each combination is its own binary; tuple()
+            # to stay hashable. iters is compiled in too, but it is a pure
             # function of (size, unroll) here, so it needs no key of its own.
             key = key + (size, tuple(grain) if grain else None, unroll)
         if key in built:
@@ -430,15 +431,49 @@ def main():
                                            text=True, timeout=(args.timeout or None))
                         row["returncode"] = p.returncode
                         row["status"] = "ok" if p.returncode == 0 else "run_fail"
+                        metrics = app.parse(p.stdout)
+                        for k, v in metrics.items():
+                            if v is not None:
+                                row[k] = v
+
                         if p.returncode == 0:
-                            for k, v in app.parse(p.stdout).items():
-                                if v is not None:
-                                    row[k] = v
                             n_ok += 1
+                        elif metrics.get("avg_ms") is not None:
+                            # The run produced its complete result and then died,
+                            # typically in teardown. Keeping the numbers but
+                            # flagging the row beats throwing away a measurement
+                            # that is there -- and beats pretending it is clean.
+                            row["status"] = "ok_crashed_at_exit"
+                            n_ok += 1
+                            print(f"      -> completed, then exited with "
+                                  f"{p.returncode}: kept as ok_crashed_at_exit",
+                                  file=sys.stderr)
                         else:
                             n_fail += 1
                             fail_by_app[app_name] = fail_by_app.get(app_name, 0) + 1
                             sys.stderr.write(p.stdout[-2000:] + "\n")
+
+                        # The app's own verdict is authoritative and immediate: a
+                        # run that says it computed the wrong thing must never be
+                        # reported as a data point, however fast it was.
+                        if str(row.get("verdict", "")).lower() in ("fail", "failed"):
+                            row["status"] = "wrong_answer"
+                            print(f"      -> WRONG ANSWER: {app_name} reported "
+                                  f"verdict '{row['verdict']}'", file=sys.stderr)
+
+                        # One line per run in the log, carrying what the run
+                        # computed and not only how fast. A sweep whose log shows
+                        # only timings cannot be audited afterwards -- which is
+                        # exactly the position a silently-corrupted campaign
+                        # leaves you in.
+                        summary = [f"{row['status']}"]
+                        if row.get("avg_ms") != "":
+                            summary.append(f"avg={row['avg_ms']} ms")
+                        if row.get("verdict") != "":
+                            summary.append(f"verdict={row['verdict']}")
+                        if row.get("answer") != "":
+                            summary.append(f"answer={row['answer']}")
+                        print("      -> " + "  ".join(summary), file=sys.stderr)
                     except subprocess.TimeoutExpired:
                         row["status"] = "timeout"
                         row["returncode"] = -1
@@ -490,10 +525,32 @@ def _check_csv_header(path, ap):
              f"{path}.bak`) and rerun, or pass --out to write elsewhere.")
 
 
-def _parse_opts(arg):
+def _parse_opts(arg, ap=None):
+    """Split --opts into pipelines and reject any unknown pass name.
+
+    Rejecting is the whole point: a runtime that meets a name it does not know
+    warns and carries on, so a typo silently measures a different pipeline than
+    the one the results are labelled with. Better to refuse to start.
+
+    Whitespace inside a pipeline is a separator like a comma (both runtimes
+    tokenize on ", \t"), so a value that picked up a stray newline -- e.g. from a
+    shell line continuation inside single quotes -- is normalized here rather
+    than turned into a bogus pass name."""
     if not arg:
         return list(DEFAULT_OPTS)
-    return [o.strip() for o in re.split(r"[;]", arg) if o.strip()]
+    out = []
+    for chunk in arg.split(";"):
+        passes = [p for p in re.split(r"[,\s]+", chunk.strip()) if p]
+        if not passes:
+            continue
+        unknown = [p for p in passes if p not in CGIR_PASSES and p != "none"]
+        if unknown and ap is not None:
+            ap.error(f"--opts: unknown CGIR pass(es) {unknown} in '{chunk.strip()}'. "
+                     f"Known passes: {', '.join(sorted(CGIR_PASSES))}, none. "
+                     f"(A runtime would warn and ignore them, silently running a "
+                     f"different pipeline than the one your results claim.)")
+        out.append(",".join(passes))
+    return out
 
 
 def _parse_sizes(arg):

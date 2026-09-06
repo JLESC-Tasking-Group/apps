@@ -347,7 +347,8 @@
  * With USE_TASKGRAPH the region is recorded on the first encounter and replayed
  * afterwards. Without USE_TASKGRAPH (or under USE_SYNC / USE_OMPSS, which use
  * their own schedules) the macros vanish and the tasks are simply created every
- * iteration.
+ * iteration. USE_OMPSS records through TASKGRAPH_LOOP's `oss taskiter` instead:
+ * taskiter annotates a loop, so it has no single-region form.
  *
  * Prefer TASKGRAPH_LOOP below: this wrapper records ONE iteration per instance,
  * and a taskgraph instance carries an implicit taskgroup, so consecutive
@@ -397,6 +398,8 @@
  * Every configuration keeps the loop; only who owns it changes:
  *   taskgraph + taskgraphloop : one instance per `unroll` iterations
  *   taskgraph only            : one instance per iteration (the A/B baseline)
+ *   OmpSs-2 (USE_OMPSS)       : `oss taskiter` over the loop; `unroll` is inert
+ *                               (a taskiter has no per-instance barrier)
  *   otherwise                 : a plain loop, tasks re-created every iteration
  * ------------------------------------------------------------------------- */
 /* Both taskgraph wrappers above and below are XKOMP's lambda form. LLVM's
@@ -432,7 +435,34 @@ tasking_taskgraph_loop(size_t unroll, Cond cond, Epilogue epilogue, Body body)
     if (unroll == 0)
         unroll = 1;
 
-#if USE_TASKGRAPH && !USE_SYNC && !USE_OMPSS && USE_TASKGRAPHLOOP
+#if USE_TASKGRAPH && USE_OMPSS && !USE_SYNC
+    /* OmpSs-2 has no `taskgraph`. `taskiter` is its equivalent: applied to a loop,
+     * it records the per-iteration task graph once and replays it, which is what
+     * NODES hands to CGIR (see NODES/src/dependencies/discrete/taskiter).
+     *
+     * `unroll` keeps the same meaning it has on the OpenMP side -- iterations per
+     * recorded instance -- so one --unroll value drives both backends and the two
+     * are comparable. Here it is the taskiter's trip count: the graph is recorded
+     * on the first of the `unroll` iterations and replayed for the rest. u=1
+     * therefore records every iteration, which is the same A/B baseline
+     * USE_TASKGRAPHLOOP=0 gives on the OpenMP side.
+     *
+     * `cond` stays a host predicate evaluated between instances, as everywhere
+     * else, which is what lets a data-dependent convergence test (mnmg) work: it
+     * simply gets one taskiter per group. */
+    {
+        size_t done = 0, inst = 0;
+        while (cond(done))
+        {
+            # pragma oss taskiter
+            for (size_t u = 0 ; u < unroll ; ++u)
+                body();
+            done += unroll;
+            epilogue(inst++, done);
+        }
+        return done;
+    }
+#elif USE_TASKGRAPH && !USE_SYNC && !USE_OMPSS && USE_TASKGRAPHLOOP
     /* the whole group is one recorded instance */
     return pragma_omp_taskgraphloop(0, XKOMP_TASKGRAPH_FLAG_NONE, unroll,
                                     cond, epilogue, body);

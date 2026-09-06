@@ -7,11 +7,21 @@ by compile-time toggles shared through `common.mk`.
 
 | App                              | CPU tasks | GPU target | OmpSs-2 | synchronous | taskgraph | in harness |
 | -------------------------------- | :-------: | :--------: | :-----: | :---------: | :-------: | :--------: |
-| Krylov (cg/cr/bicgstab/minres/gmres) | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ |
-| LULESH                           | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ |
-| llm.c                            | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| MNMG (Datalog TC)                | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ |
+| Krylov (cg/cr/bicgstab/minres/gmres) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| LULESH                           | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| MNMG (Datalog TC)                | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Cholesky                         | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ |
+| llm.c                            | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+
+llm.c is **not** in the harness. Its OpenMP-target port is a transliteration of
+the reference implementation -- a scalar triple-loop matmul, fp32, no tensor
+cores, 860 kernels per training step of which 92 run on a single thread block --
+so it reaches ~0.4 % of a GH200's fp32 peak and every configuration takes the
+same time. The passes target launch overhead and inter-kernel memory traffic;
+neither is where its time goes, so it measures the port rather than the runtime.
+(Its self-reported "MFU" is also misleading: `train_gpt2.c` divides by a
+dual-socket Sapphire Rapids FP64 peak, not the GPU's.) It is kept as a
+standalone benchmark: `make -C llm.c`.
 
 Cholesky is kept as a standalone tasks/target benchmark but is **not** a
 record/replay taskgraph example (its tiled DAG changes shape every step), so it
@@ -27,14 +37,14 @@ make krylov          # just the krylov solvers   (make lulesh / make llmc)
 make USE_TARGET=1    # GPU target offload for all apps
 make USE_SYNC=1      # synchronous blocking baseline
 make USE_TASKGRAPH=0 # plain tasks/target, no record/replay
-make USE_OMPSS=1 OMPSS_CC=<ompss-2 clang++>   # OmpSs-2 / NODES host tasks (llm.c)
+make USE_OMPSS=1 OMPSS_CC=<ompss-2 clang++>   # OmpSs-2 / NODES host tasks
 make clean
 ```
 
 The backend/schedule toggles (`USE_TARGET`, `USE_TASKGRAPH`, `USE_SYNC`,
 `USE_REPLAYABLE`, `USE_OMPSS`) live in `common.mk` and propagate to the per-app
 Makefiles, which remain usable directly (e.g. `make -C lulesh run`,
-`make -C llm.c test`). `USE_OMPSS=1` also switches the compiler to `$(OMPSS_CC)`
+`make -C krylov`). `USE_OMPSS=1` also switches the compiler to `$(OMPSS_CC)`
 and the flags to `-fompss-2=libnodes`; it is mutually exclusive with
 `USE_TARGET=1`.
 
@@ -66,26 +76,33 @@ Two artifacts, five sweeps. `$OPTS` is the incremental pipeline (the default of
 `appspecs.py`, spelled out here so a sweep is self-describing):
 
 ```sh
-OPTS='reduce-node,transitive-reduction;\
-reduce-node,transitive-reduction,jit;\
-reduce-node,transitive-reduction,jit,prog-fuse;\
-reduce-node,transitive-reduction,jit,prog-fuse,sequence,batch'
+OPTS='reduce-node,transitive-reduction'
+OPTS="$OPTS;reduce-node,transitive-reduction,jit"
+OPTS="$OPTS;reduce-node,transitive-reduction,jit,prog-fuse"
+OPTS="$OPTS;reduce-node,transitive-reduction,jit,prog-fuse,sequence,batch"
 ```
+
+Note the absence of `\` line continuations: inside single quotes a backslash is
+literal, so `'a;\<newline>b'` puts a backslash and a newline *into the value*.
+That once cost a whole overnight sweep -- both runtimes warned about the unknown
+pass and carried on, so `reduce-node` never ran in three of the four pipelines
+while the CSV said it had. `evaluate.py` now validates every pass name against
+CGIR's list and refuses to start, and both runtimes now treat an unknown name as
+fatal, so the same mistake fails loudly instead.
 
 **1. End-to-end, GPU (GH200)** -- the figure, and the graph statistics and pass
 costs of the table. `cgstats.csv` / `jitstats.csv` are written automatically.
 
 ```sh
-./scripts/evaluate.py --target gpu --apps krylov,lulesh,llm.c,mnmg \
+./scripts/evaluate.py --target gpu --apps krylov,lulesh,mnmg \
     --opts "$OPTS" --unroll 1,8 \
-    --sizes 'krylov=64;lulesh=16,60,100;llm.c=64,128,256;mnmg=7035,23874' \
+    --sizes 'krylov=64;lulesh=16,60,100;mnmg=7035,23874' \
     --iters 'krylov=200;lulesh=104'
 ```
 
 Krylov gets a single size on purpose: its panel of the figure puts the five
 solvers on the x axis (`AppSpec.panel_x`), which says more about generality than
 one solver at three sizes, and the section has room for one panel per app.
-This is 151 runs.
 
 Two per-variant adjustments happen automatically and are visible in the `cmd`
 column: GMRES is a *restarted* solver, so its `-i` counts restart cycles of 30
@@ -125,8 +142,13 @@ passes the same pass names through `NODES_TASKITER_CGIR_OPT`.
 
 ```sh
 export OMPSS_CC=<ompss-2 clang++>
-./scripts/evaluate.py --target ompss --apps llm.c --opts "$OPTS"
+./scripts/evaluate.py --target ompss --apps krylov --variants cg \
+    --opts "$OPTS" --unroll 1,8 --sizes 'krylov=64' --iters 'krylov=200'
 ```
+
+On this backend `tasking.h` records through `#pragma oss taskiter`, and `--unroll`
+keeps its meaning -- iterations per recorded instance -- so the same value is
+comparable across the two runtimes.
 
 **5. Hand-written references** -- built and run by hand (different sources and
 toolchains, so not part of the sweep), then written into a small CSV that the
@@ -134,11 +156,10 @@ figure overlays:
 
 ```sh
 make -C MNMGDatalog/MNMGDatalog-reference tc_benchmark   # v1_baseline, v2_cudagraph
-make -C llm.c train_gpt2cu
 cat > results/external.csv <<'EOF'
 app,variant,size,label,avg_ms
 mnmg,,7035,CUDA graph (hand-written),<measured>
-llm.c,,256,llm.c CUDA,<measured>
+mnmg,,23874,CUDA graph (hand-written),<measured>
 EOF
 ```
 
@@ -151,3 +172,13 @@ EOF
 
 The baseline of both the figure and the break-even column is `no-taskgraph`
 (`--baseline`), so the two artifacts always tell the same story.
+
+**The answer check runs first, and is not optional.** Every configuration must
+reproduce the answer of the `--answer-reference` configuration (default
+`synchronous`) for the same problem: the relative residual for Krylov, the
+transitive-closure size for MNMG, LULESH's own `Verification` line plus its
+`TotalAbsDiff`. A run that disagrees is dropped and named, because a speedup from
+a run that computed something else is not a speedup. This exists because it
+happened: `prog-fuse` used to merge two `omp target` launches without checking
+the dependence between them, which removed the device-wide barrier and moved CG's
+residual from 4e-15 to 2.6e-03 while reporting a healthy speedup.

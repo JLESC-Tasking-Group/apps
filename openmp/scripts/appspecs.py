@@ -29,8 +29,7 @@ A taskgraph instance carries an implicit taskgroup, so consecutive instances
 cannot overlap. `unroll` (evaluate.py --unroll) folds that many iterations into
 ONE recorded instance, recovering the cross-iteration overlap inside the graph
 and paying the barrier once per `unroll` iterations. It is a run argument for
-krylov / lulesh / mnmg and a compile-time macro (UNROLL) for llm.c, hence part of
-that app's build key. It only does anything under USE_TASKGRAPH, so evaluate.py
+krylov / lulesh / mnmg. It only does anything under USE_TASKGRAPH, so evaluate.py
 sweeps it for the taskgraph configurations only.
 """
 
@@ -71,6 +70,21 @@ DEFAULT_OPTS = [
 # Short legend label for each pipeline, keyed by the LAST pass added. Keeps the
 # figures readable: the full pass list is still written to runs.csv, and the
 # `opt` column remains the ground truth.
+# Every pass name CGIR accepts, mirroring CGIR_FORALL_COMMAND_GRAPH_PASS in
+# cgir/include/cgir/command-graph-pass.hpp. The harness validates --opts against
+# this list and refuses to launch on an unknown name.
+#
+# It has to: both runtimes warn-and-ignore an unrecognised pass, so a typo does
+# not fail, it silently runs a DIFFERENT pipeline than the one the results are
+# labelled with. That is not hypothetical -- a recipe written with shell line
+# continuations inside single quotes produced the token "\<newline>reduce-node",
+# which neither runtime split on, so `reduce-node` never ran in three of the four
+# pipelines of a whole overnight sweep and the CSV said otherwise.
+CGIR_PASSES = frozenset([
+    "copy-fuse", "reduce-node", "transitive-reduction",
+    "prog-fuse", "jit", "sequence", "batch",
+])
+
 OPT_LABELS = {
     "reduce-node,transitive-reduction":                             "+reduce",
     "reduce-node,transitive-reduction,jit":                          "+jit",
@@ -183,6 +197,11 @@ def _parse_instances(text):
     }
 
 
+# The "answer" of a run: a number the app computes from its final state, which
+# every configuration of the same problem must reproduce. It is what makes the
+# optimization passes falsifiable -- a speedup from a run that computed something
+# else is not a speedup. `verdict` is the app's own pass/fail line, when it has
+# one. plot.py's report_answers() enforces both.
 def _parse_krylov(text):
     m = _parse_instances(text)
     m.update({
@@ -192,14 +211,27 @@ def _parse_krylov(text):
         "residual":  _grab(text, r"relative residual\s*:\s*" + _F),
         "error":     _grab(text, r"relative error\s*:\s*" + _F),
     })
+    # Compared ACROSS configurations, not against a fixed threshold: a solver may
+    # legitimately fail to converge on a given matrix (and then every
+    # configuration says so, which is a property of the problem), but no
+    # optimization pass may change the number it converged to.
+    m["answer"] = m["residual"]
     return m
 
 
 def _parse_lulesh(text):
     m = _parse_instances(text)
     m.update({
-        "elapsed_s": _grab(text, r"Elapsed time\s*=\s*" + _F),
-        "fom":       _grab(text, r"FOM\s*=\s*" + _F + r"\s*\(z/s\)"),
+        # The app prints ":Elapsed time (s)  :  12.34" and ":FOM (z/s)  : 1.2e6",
+        # i.e. colon-separated -- not "FOM = x". Matching on '=' silently left
+        # both columns empty for every LULESH run ever recorded.
+        "elapsed_s": _grab(text, r"Elapsed time[^:\n]*:\s*" + _F),
+        "fom":       _grab(text, r"FOM[^:\n]*:\s*" + _F),
+        # LULESH's own verdict. NOTE it is only a symmetry check over plane 0 of
+        # the energy array (TotalRelDiff < 1e-9), so it catches an asymmetric
+        # corruption but not a uniform one; `answer` below covers the rest.
+        "verdict":   _grab(text, r"Verification[^:\n]*:\s*(\w+)", cast=str),
+        "answer":    _grab(text, r"TotalAbsDiff\s*:\s*" + _F),
     })
     return m
 
@@ -217,27 +249,172 @@ def _parse_mnmg(text):
         m["stddev_ms"] = 0.0 if m["avg_ms"] is not None else None
     total_ms = _grab(text, r"total time \(end-to-end\)\s*:\s*" + _F + r"\s*ms")
     m["elapsed_s"] = (total_ms / 1000.0) if total_ms is not None else None
+    # The size of the transitive closure: an exact integer every configuration
+    # must agree on.
+    m["answer"] = _grab(text, r"TC\s*=\s*" + _F + r"\s*tuples")
     return m
 
 
-def _parse_llmc(text):
-    # llm.c prints one "Iteration runtime : X ms" per taskgraph INSTANCE (to
-    # stderr), already divided by UNROLL, so the unit is per step at any unroll.
-    # Instance 0 records the graph and instance 1 builds the command graph and
-    # runs the first replay, so the steady window starts at 2 -- as in the krylov
-    # / lulesh / mnmg parsers, and as in llm.c's own printed average. This matters
-    # once unrolling makes the instances few: at NB_STEPS=12, UNROLL=4 there are
-    # only three, and keeping instance 1 would report the build cost as steady.
-    runs = [float(x) for x in re.findall(r"Iteration runtime\s*:\s*" + _F + r"\s*ms", text)]
-    steady = runs[2:] if len(runs) > 2 else runs[-1:]
-    avg, std = _mean_std(steady)
+# --------------------------------------------------------------------------- #
+# Backends. A backend fixes the tasking runtime and the device the work runs on;
+# it is orthogonal to the configuration (which fixes the schedule and the CGIR
+# pass set) and is chosen once per sweep with --target.
+#
+# `opt_env` is the environment variable through which that runtime takes its CGIR
+# pass list. XKOMP and NODES accept the SAME pass names (both call
+# cgir::command_graph_pass_set_from_str), which is what lets one --opts string
+# drive an OpenMP and an OmpSs-2 sweep and makes the two comparable.
+#
+# `env` is applied to every run of the backend. NODES only reaches the CGIR path
+# when taskiter.opt.use_cgir is on, and that option is a NODES config variable,
+# not an environment variable, hence the NODES_CONFIG_OVERRIDE. (Its list
+# separator is ',', so no comma-valued option may be set through it -- which is
+# exactly why the pass list has an env var of its own.)
+# --------------------------------------------------------------------------- #
+@dataclass
+class Backend:
+    label: str                  # value of the `backend` column in runs.csv
+    build: Dict[str, str]       # make variables
+    opt_env: str                # env var carrying the CGIR pass list
+    env: Dict[str, str] = field(default_factory=dict)
+
+
+BACKENDS: Dict[str, Backend] = {
+    "cpu":   Backend("cpu",   {"USE_TARGET": "0", "USE_OMPSS": "0"}, "OMP_TASKGRAPH_OPT"),
+    "gpu":   Backend("gpu",   {"USE_TARGET": "1", "USE_OMPSS": "0"}, "OMP_TASKGRAPH_OPT"),
+    "ompss": Backend("ompss", {"USE_TARGET": "0", "USE_OMPSS": "1"}, "NODES_TASKITER_CGIR_OPT",
+                     {"NODES_CONFIG_OVERRIDE": "taskiter.opt.use_cgir=true"}),
+}
+
+
+@dataclass
+class Config:
+    label: str                 # legend label, e.g. "taskgraph:reduce-node,transitive-reduction"
+    build: Dict[str, str]      # make variables, e.g. {"USE_SYNC": "1", ...}
+    opt: Optional[str]         # CGIR pass list (None if no taskgraph)
+    grain1: bool = False       # run with one task/kernel per loop (sync baseline)
+
+    @property
+    def taskgraph(self) -> bool:
+        """Whether this configuration records a taskgraph -- i.e. whether it has
+        the per-instance barrier that --unroll exists to amortize. Elsewhere the
+        unroll is inert by construction (the apps group iterations identically in
+        every configuration), so sweeping it there would only burn machine time."""
+        return self.build.get("USE_TASKGRAPH") == "1"
+
+
+def default_configs(opts: List[str]) -> List[Config]:
+    cfgs = [
+        Config("synchronous",    {"USE_SYNC": "1", "USE_TASKGRAPH": "0"}, None, grain1=True),
+        Config("no-taskgraph",   {"USE_SYNC": "0", "USE_TASKGRAPH": "0"}, None),
+        Config("taskgraph:none", {"USE_SYNC": "0", "USE_TASKGRAPH": "1"}, ""),
+    ]
+    for o in opts:
+        cfgs.append(Config(f"taskgraph:{o}", {"USE_SYNC": "0", "USE_TASKGRAPH": "1"}, o))
+    return cfgs
+
+
+# --------------------------------------------------------------------------- #
+# Metric parsing helpers.
+# --------------------------------------------------------------------------- #
+_F = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
+
+
+def _grab(text, pattern, cast=float):
+    m = re.search(pattern, text)
+    if not m:
+        return None
+    try:
+        return cast(m.group(1))
+    except (ValueError, IndexError):
+        return None
+
+
+def _mean_std(xs):
+    xs = [x for x in xs if x is not None]
+    if not xs:
+        return (None, None)
+    m = sum(xs) / len(xs)
+    s = math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) if len(xs) > 1 else 0.0
+    return (m, s)
+
+
+# All three C/C++ apps print the same four timing lines, in the same words, so
+# one parser serves them. They are per taskgraph INSTANCE -- a group of `unroll`
+# iterations -- and always in ms per iteration, and they map onto the runtime's
+# own phases: instance 0 records the graph (XKOMP rc == 1), instance 1 builds and
+# optimizes the command graph and runs the first replay (rc == 2), instances 2..
+# are steady replays.
+#
+# `instance` vs `instances` disambiguates the singular lines from the plural ones
+# without a lookahead: "instances 2..31" can never match "instance 1", because
+# the 's' sits where the space would be. [^:\n] rather than [^:] so a line that
+# is absent cannot reach forward to a colon several lines below.
+def _parse_instances(text):
     return {
-        "avg_ms":    avg,
-        "stddev_ms": std,
-        "iter0_ms":  runs[0] if len(runs) > 0 else None,   # record
-        "iter1_ms":  runs[1] if len(runs) > 1 else None,   # build + 1st replay
-        "elapsed_s": _grab(text, r"Took\s+" + _F + r"\s*s"),
+        "iter0_ms":  _grab(text, r"instance 0[^:\n]*:\s*" + _F + r"\s*ms"),
+        "iter1_ms":  _grab(text, r"instance 1[^:\n]*:\s*" + _F + r"\s*ms"),
+        "avg_ms":    _grab(text, r"instances \d+\.\.\d+[^:\n]*\(avg\)[^:\n]*:\s*" + _F + r"\s*ms"),
+        "stddev_ms": _grab(text, r"instances \d+\.\.\d+[^:\n]*\(stddev\)[^:\n]*:\s*" + _F + r"\s*ms"),
     }
+
+
+# The "answer" of a run: a number the app computes from its final state, which
+# every configuration of the same problem must reproduce. It is what makes the
+# optimization passes falsifiable -- a speedup from a run that computed something
+# else is not a speedup. `verdict` is the app's own pass/fail line, when it has
+# one. plot.py's report_answers() enforces both.
+def _parse_krylov(text):
+    m = _parse_instances(text)
+    m.update({
+        "elapsed_s": _grab(text, r"total solve time\s*:\s*" + _F),
+        "flops":     _grab(text, r"theoretical flops\s*:\s*" + _F),
+        "gflops":    _grab(text, r"performance\s*:\s*" + _F),
+        "residual":  _grab(text, r"relative residual\s*:\s*" + _F),
+        "error":     _grab(text, r"relative error\s*:\s*" + _F),
+    })
+    # Compared ACROSS configurations, not against a fixed threshold: a solver may
+    # legitimately fail to converge on a given matrix (and then every
+    # configuration says so, which is a property of the problem), but no
+    # optimization pass may change the number it converged to.
+    m["answer"] = m["residual"]
+    return m
+
+
+def _parse_lulesh(text):
+    m = _parse_instances(text)
+    m.update({
+        # The app prints ":Elapsed time (s)  :  12.34" and ":FOM (z/s)  : 1.2e6",
+        # i.e. colon-separated -- not "FOM = x". Matching on '=' silently left
+        # both columns empty for every LULESH run ever recorded.
+        "elapsed_s": _grab(text, r"Elapsed time[^:\n]*:\s*" + _F),
+        "fom":       _grab(text, r"FOM[^:\n]*:\s*" + _F),
+        # LULESH's own verdict. NOTE it is only a symmetry check over plane 0 of
+        # the energy array (TotalRelDiff < 1e-9), so it catches an asymmetric
+        # corruption but not a uniform one; `answer` below covers the rest.
+        "verdict":   _grab(text, r"Verification[^:\n]*:\s*(\w+)", cast=str),
+        "answer":    _grab(text, r"TotalAbsDiff\s*:\s*" + _F),
+    })
+    return m
+
+
+def _parse_mnmg(text):
+    # Same four instance lines as krylov / lulesh; here they are ms per fixpoint
+    # ROUND. The extra work is the fallback: the round count is data-dependent
+    # (the fixpoint runs to convergence), so a small graph -- or a large -u --
+    # can leave fewer than three instances and no steady-state window at all.
+    # "total time (end-to-end)" is the MNMGDatalog paper's metric (file IO + H2D +
+    # setup + compute + D2H) and is printed in ms, unlike the other apps' seconds.
+    m = _parse_instances(text)
+    if m["avg_ms"] is None:
+        m["avg_ms"] = m["iter1_ms"] if m["iter1_ms"] is not None else m["iter0_ms"]
+        m["stddev_ms"] = 0.0 if m["avg_ms"] is not None else None
+    total_ms = _grab(text, r"total time \(end-to-end\)\s*:\s*" + _F + r"\s*ms")
+    m["elapsed_s"] = (total_ms / 1000.0) if total_ms is not None else None
+    # The size of the transitive closure: an exact integer every configuration
+    # must agree on.
+    m["answer"] = _grab(text, r"TC\s*=\s*" + _F + r"\s*tuples")
+    return m
 
 
 # --------------------------------------------------------------------------- #
@@ -255,21 +432,19 @@ class AppSpec:
     work: Callable[[int], tuple]         # size -> (value, label) for the top axis
     sizes: List[int]
     iters: int
-    rebuild_per_size: bool = False       # llm.c: size is a compile-time macro
-    llmc_defs: Optional[Callable] = None # (size, iters, batch, grain, unroll) -> LLMC_DEFS
-    batch: int = 4                       # llm.c BATCH_SIZE (for tokens = B*T)
+    # Whether the problem size is a compile-time macro, so each size needs its
+    # own binary. No app currently sets it; kept because it is a property of an
+    # app, not of the harness, and the next one may need it.
+    rebuild_per_size: bool = False
+    build_defs: Optional[Callable] = None  # (size, iters, grain, unroll) -> extra make vars
     # Number of granularity knobs this app takes, i.e. how many ':'-separated
     # components one --grain entry may hold (0 = the app has no knob). Used by
     # evaluate.py to reject malformed / stale grain specs.
     grain_arity: int = 0
-    # Backends the app has a port for. Only llm.c has an OmpSs-2 source path
-    # (a `#pragma oss taskiter` over the training loop), so an --target ompss
-    # sweep silently skips the others rather than building binaries whose task
-    # constructs vanish.
+    # Backends the app has a port for, so an --target sweep skips an app that
+    # has none rather than building a binary whose task constructs vanish.
     backends: List[str] = field(default_factory=lambda: ["cpu", "gpu"])
-    # Unroll values the app accepts on a given backend. llm.c compiles UNROLL in
-    # and #errors on anything but 1 under OmpSs-2 (its taskiter has no epilogue
-    # to fold), so the harness pins it instead of failing every build.
+    # Unroll cap per backend, for an app that cannot fold iterations there.
     max_unroll: Dict[str, int] = field(default_factory=dict)
     # Same, per variant: GMRES is a restarted solver, so each restart ends with a
     # host least-squares solve that the next restart consumes and two restarts
@@ -293,6 +468,13 @@ class AppSpec:
     # "variant": five solvers at one size say more about generality than one
     # solver at three sizes, and the paper has room for exactly one panel each.
     panel_x: str = "size"
+    # Relative tolerance on the `answer` across configurations of one problem.
+    # Not zero: a fused kernel may reassociate floating-point arithmetic, which
+    # perturbs the last bits. It must stay far below the corruption it exists to
+    # catch -- prog-fuse dropping a device barrier moved CG's residual from
+    # 4e-15 to 2.6e-03, eleven orders of magnitude clear of this. mnmg's answer
+    # is an exact tuple count, so it gets 0.
+    answer_rtol: float = 1e-6
 
 
 # ---- krylov: grid n, matrix N=n^3, work ~ n^3; -t/-s = task counts (0=threads) --
@@ -354,6 +536,7 @@ KRYLOV = AppSpec(
     iters=50,
     grain_arity=2,          # "s:t"
     variant_max_unroll={"gmres": 1},
+    backends=["cpu", "gpu", "ompss"],
     variant_iters_div={"gmres": 30},   # RESTART_M
     pretty="Krylov",
     klass="Iterative solvers",
@@ -382,50 +565,7 @@ LULESH = AppSpec(
     grain_arity=1,          # "nb"
     pretty="LULESH",
     klass="PDE time stepping",
-)
-
-# ---- llm.c: SEQUENCE_SIZE T is a compile-time macro -> rebuild per size ---------
-# grain is THIS size's entry, written "GRAN_TMP:OC_SPLIT:OC_BACK_SPLIT" (a shorter
-# entry sets only the leading macros); injected at build time rather than as run
-# arguments. None -> the source defaults.
-_LLMC_GRAIN_MACROS = ["GRAN_TMP", "OC_SPLIT", "OC_BACK_SPLIT"]
-
-def _llmc_run(variant, size, iters, cfg, grain, unroll):
-    return []  # no runtime args; size/steps/grain/unroll are compiled in
-
-# llm.c takes no arguments, so the unroll is the compile-time macro UNROLL and
-# thus part of the build key. It must divide NB_STEPS (the source rejects a
-# shorter trailing instance: it is a different graph and would not replay);
-# evaluate.py rounds the requested iteration count up to a multiple.
-def _llmc_defs(size, iters, batch, grain, unroll):
-    defs = (f"-DSEQUENCE_SIZE={size} -DNB_STEPS={iters} -DBATCH_SIZE={batch}"
-            f" -DUNROLL={unroll}")
-    for name, val in zip(_LLMC_GRAIN_MACROS, grain or []):
-        defs += f" -D{name}={val}"
-    return defs
-
-LLMC = AppSpec(
-    name="llm.c",
-    directory="llm.c",
-    variants=[""],
-    make_target=lambda v: "train_gpt2",
-    binary=lambda v: "./train_gpt2",
-    run_args=_llmc_run,
-    parse=_parse_llmc,
-    work=lambda t: (4.0 * float(t), "tokens (B\u00b7T)"),  # batch default 4
-    sizes=[64, 128, 256],
-    # Enough training steps that an unrolled sweep still has a steady state: the
-    # apps drop instance 0 (record) and 1 (build + first replay), so u=8 needs
-    # ~10*8 steps before the mean is over more than a couple of samples. NB_STEPS
-    # is compiled in, so this is a build parameter, not just a loop bound.
-    iters=96,
-    rebuild_per_size=True,
-    llmc_defs=_llmc_defs,
-    grain_arity=3,          # "GRAN_TMP:OC_SPLIT:OC_BACK_SPLIT"
     backends=["cpu", "gpu", "ompss"],
-    max_unroll={"ompss": 1},
-    pretty="llm.c",
-    klass="AI/ML training",
 )
 
 # ---- mnmg: Datalog transitive closure; dataset data_<N>.bin, N = #edges --------
@@ -461,6 +601,8 @@ MNMG = AppSpec(
     iters=0,                           # unused: round count comes from the data
     pretty="MNMG",
     klass="Graph analytics",
+    backends=["cpu", "gpu", "ompss"],
+    answer_rtol=0.0,                   # an exact tuple count
 )
 
-APPS: Dict[str, AppSpec] = {a.name: a for a in (KRYLOV, LULESH, LLMC, MNMG)}
+APPS: Dict[str, AppSpec] = {a.name: a for a in (KRYLOV, LULESH, MNMG)}

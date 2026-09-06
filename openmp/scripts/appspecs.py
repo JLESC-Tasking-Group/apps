@@ -19,8 +19,9 @@ user-supplied CGIR optimization combo:
 
 The synchronous / no-taskgraph / taskgraph split is a *compile-time* choice
 (USE_SYNC / USE_TASKGRAPH), so evaluate.py rebuilds per configuration; the CGIR
-pass within a taskgraph build is a *run-time* choice (OMP_TASKGRAPH_OPT).
-The GPU vs CPU backend (USE_TARGET) is orthogonal and chosen once (--target).
+pass within a taskgraph build is a *run-time* choice (OMP_TASKGRAPH_OPT for
+XKOMP, NODES_TASKITER_CGIR_OPT for NODES). The backend is orthogonal and chosen
+once (--target cpu | gpu | ompss); see BACKENDS below.
 
 Unrolling
 ---------
@@ -39,20 +40,82 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
 # CGIR optimization combos compared on top of the references (each -> one
-# taskgraph:<opt> configuration). Names are XKOMP OMP_TASKGRAPH_OPT passes
-# (comma or space separated): copy-normalize copy-fuse reduce-node transitive-reduction
-# jit prog-fuse sequence batch.
+# taskgraph:<opt> configuration). Names are CGIR pass names, comma or space
+# separated: copy-fuse reduce-node transitive-reduction prog-fuse jit sequence
+# batch. They are passed to XKOMP as OMP_TASKGRAPH_OPT and to NODES as
+# NODES_TASKITER_CGIR_OPT (the same string drives both runtimes).
+#
+# The default is the INCREMENTAL pipeline of the paper: each combo adds one of
+# the passes of the paper's pass table to the previous one, in the order the
+# library applies them. That order is what makes the resulting bars readable as
+# "what does this pass add on top of the ones before it".
+#
+#   +reduce     the two graph-reduction passes (control-node elimination and
+#               transitive reduction)
+#   +jit        recompiling each task body at -O3 in the runtime, WITHOUT fusing
+#               -- isolated on purpose, so the fusion bar below cannot be
+#               credited with a gain that is only recompilation
+#   +prog-fuse  fusing serial chains of programs before compiling them
+#   +packing    the sequence/batch packing passes (host super-tasks and vendor
+#               command graphs)
+#
+# copy-fuse is deliberately absent: the pass exists in the library but is out of
+# the paper's scope, and a configuration nobody reports is machine time wasted.
 DEFAULT_OPTS = [
     "reduce-node,transitive-reduction",
-    "reduce-node,transitive-reduction,batch",
+    "reduce-node,transitive-reduction,jit",
+    "reduce-node,transitive-reduction,jit,prog-fuse",
+    "reduce-node,transitive-reduction,jit,prog-fuse,sequence,batch",
 ]
+
+# Short legend label for each pipeline, keyed by the LAST pass added. Keeps the
+# figures readable: the full pass list is still written to runs.csv, and the
+# `opt` column remains the ground truth.
+OPT_LABELS = {
+    "reduce-node,transitive-reduction":                             "+reduce",
+    "reduce-node,transitive-reduction,jit":                          "+jit",
+    "reduce-node,transitive-reduction,jit,prog-fuse":                "+prog-fuse",
+    "reduce-node,transitive-reduction,jit,prog-fuse,sequence,batch": "+packing",
+}
+
+
+# --------------------------------------------------------------------------- #
+# Backends. A backend fixes the tasking runtime and the device the work runs on;
+# it is orthogonal to the configuration (which fixes the schedule and the CGIR
+# pass set) and is chosen once per sweep with --target.
+#
+# `opt_env` is the environment variable through which that runtime takes its CGIR
+# pass list. XKOMP and NODES accept the SAME pass names (both call
+# cgir::command_graph_pass_set_from_str), which is what lets one --opts string
+# drive an OpenMP and an OmpSs-2 sweep and makes the two comparable.
+#
+# `env` is applied to every run of the backend. NODES only reaches the CGIR path
+# when taskiter.opt.use_cgir is on, and that option is a NODES config variable,
+# not an environment variable, hence the NODES_CONFIG_OVERRIDE. (Its list
+# separator is ',', so no comma-valued option may be set through it -- which is
+# exactly why the pass list has an env var of its own.)
+# --------------------------------------------------------------------------- #
+@dataclass
+class Backend:
+    label: str                  # value of the `backend` column in runs.csv
+    build: Dict[str, str]       # make variables
+    opt_env: str                # env var carrying the CGIR pass list
+    env: Dict[str, str] = field(default_factory=dict)
+
+
+BACKENDS: Dict[str, Backend] = {
+    "cpu":   Backend("cpu",   {"USE_TARGET": "0", "USE_OMPSS": "0"}, "OMP_TASKGRAPH_OPT"),
+    "gpu":   Backend("gpu",   {"USE_TARGET": "1", "USE_OMPSS": "0"}, "OMP_TASKGRAPH_OPT"),
+    "ompss": Backend("ompss", {"USE_TARGET": "0", "USE_OMPSS": "1"}, "NODES_TASKITER_CGIR_OPT",
+                     {"NODES_CONFIG_OVERRIDE": "taskiter.opt.use_cgir=true"}),
+}
 
 
 @dataclass
 class Config:
     label: str                 # legend label, e.g. "taskgraph:reduce-node,transitive-reduction"
     build: Dict[str, str]      # make variables, e.g. {"USE_SYNC": "1", ...}
-    opt: Optional[str]         # OMP_TASKGRAPH_OPT value (None if no taskgraph)
+    opt: Optional[str]         # CGIR pass list (None if no taskgraph)
     grain1: bool = False       # run with one task/kernel per loop (sync baseline)
 
     @property
@@ -199,6 +262,25 @@ class AppSpec:
     # components one --grain entry may hold (0 = the app has no knob). Used by
     # evaluate.py to reject malformed / stale grain specs.
     grain_arity: int = 0
+    # Backends the app has a port for. Only llm.c has an OmpSs-2 source path
+    # (a `#pragma oss taskiter` over the training loop), so an --target ompss
+    # sweep silently skips the others rather than building binaries whose task
+    # constructs vanish.
+    backends: List[str] = field(default_factory=lambda: ["cpu", "gpu"])
+    # Unroll values the app accepts on a given backend. llm.c compiles UNROLL in
+    # and #errors on anything but 1 under OmpSs-2 (its taskiter has no epilogue
+    # to fold), so the harness pins it instead of failing every build.
+    max_unroll: Dict[str, int] = field(default_factory=dict)
+    # Presentation metadata for the paper table (plot.py --latex-table): the name
+    # and application class to print. Kept next to the app rather than in the
+    # plotting script, so one file describes each app completely.
+    pretty: str = ""
+    klass: str = ""
+    # What the panel of the paper figure puts on its x axis: "size" (the problem
+    # size sweep) or "variant" (the app's variants at a single size). Krylov earns
+    # "variant": five solvers at one size say more about generality than one
+    # solver at three sizes, and the paper has room for exactly one panel each.
+    panel_x: str = "size"
 
 
 # ---- krylov: grid n, matrix N=n^3, work ~ n^3; -t/-s = task counts (0=threads) --
@@ -233,6 +315,9 @@ KRYLOV = AppSpec(
     sizes=[32, 48, 64],
     iters=50,
     grain_arity=2,          # "s:t"
+    pretty="Krylov",
+    klass="Iterative solvers",
+    panel_x="variant",
 )
 
 # ---- lulesh: mesh side s, zones = s^3; -nb = tasks per loop ---------------------
@@ -255,6 +340,8 @@ LULESH = AppSpec(
     sizes=[16, 32, 48, 64],
     iters=30,
     grain_arity=1,          # "nb"
+    pretty="LULESH",
+    klass="PDE time stepping",
 )
 
 # ---- llm.c: SEQUENCE_SIZE T is a compile-time macro -> rebuild per size ---------
@@ -291,6 +378,10 @@ LLMC = AppSpec(
     rebuild_per_size=True,
     llmc_defs=_llmc_defs,
     grain_arity=3,          # "GRAN_TMP:OC_SPLIT:OC_BACK_SPLIT"
+    backends=["cpu", "gpu", "ompss"],
+    max_unroll={"ompss": 1},
+    pretty="llm.c",
+    klass="AI/ML training",
 )
 
 # ---- mnmg: Datalog transitive closure; dataset data_<N>.bin, N = #edges --------
@@ -324,6 +415,8 @@ MNMG = AppSpec(
     work=lambda n: (float(n), "edges"),
     sizes=[7035, 23874],
     iters=0,                           # unused: round count comes from the data
+    pretty="MNMG",
+    klass="Graph analytics",
 )
 
 APPS: Dict[str, AppSpec] = {a.name: a for a in (KRYLOV, LULESH, LLMC, MNMG)}

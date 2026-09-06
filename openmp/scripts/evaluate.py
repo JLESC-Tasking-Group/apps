@@ -13,8 +13,10 @@ Configurations always include the three references (synchronous, no-taskgraph,
 taskgraph:none) plus one taskgraph:<opt> per CGIR optimization combo (see
 appspecs.py / --opts). The synchronous / no-taskgraph / taskgraph split is a
 compile-time choice, so binaries are rebuilt per configuration; the CGIR pass
-within a taskgraph build is the run-time OMP_TASKGRAPH_OPT. CPU vs GPU (--target)
-is orthogonal and applied to every build.
+within a taskgraph build is a run-time environment variable. The backend
+(--target cpu | gpu | ompss) is orthogonal and applied to every build; `ompss`
+runs the OmpSs-2 / NODES port of the same source and takes its pass list through
+NODES_TASKITER_CGIR_OPT, so one --opts string is comparable across runtimes.
 
 Examples
 --------
@@ -42,7 +44,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from appspecs import APPS, DEFAULT_OPTS, default_configs  # noqa: E402
+from appspecs import APPS, BACKENDS, DEFAULT_OPTS, default_configs  # noqa: E402
 
 APPS_OPENMP = Path(__file__).resolve().parent.parent
 
@@ -53,8 +55,8 @@ DEFAULT_ENV = {
 }
 
 CSV_FIELDS = [
-    "run_id", "timestamp", "machine",
-    "app", "variant", "config", "opt", "build_vars", "backend",
+    "run_id", "timestamp", "machine", "tag",
+    "app", "variant", "config", "opt", "build_vars", "backend", "env",
     "size", "work", "work_label", "iters", "unroll", "grain",
     "avg_ms", "stddev_ms", "iter0_ms", "iter1_ms", "elapsed_s", "fom", "flops", "gflops",
     "residual", "error",
@@ -64,6 +66,16 @@ CSV_FIELDS = [
 
 def sanitize(s):
     return re.sub(r"[^A-Za-z0-9._-]+", "-", str(s)).strip("-")
+
+
+def ordered_unique(seq):
+    """De-duplicate while preserving order (a set would reorder the sweep)."""
+    seen, out = set(), []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 
 def build_cmd(app, variant, cfg, size, iters, backend_vars, grain, unroll):
@@ -77,6 +89,30 @@ def build_cmd(app, variant, cfg, size, iters, backend_vars, grain, unroll):
         g = None if cfg.grain1 else grain
         argv.append("LLMC_DEFS=" + app.llmc_defs(size, iters, app.batch, g, unroll))
     return argv
+
+
+def parse_env(items, ap):
+    """Parse repeated --env K=V into an ordered dict, rejecting malformed items.
+
+    An unparsable item is fatal rather than skipped: the point of --env is to
+    change what is measured (a JIT cache regime, say), so silently dropping one
+    would produce a row that is labelled as one regime and ran as another."""
+    env = {}
+    for item in items:
+        if "=" not in item:
+            ap.error(f"--env: '{item}' is not K=V")
+        k, _, v = item.partition("=")
+        k = k.strip()
+        if not k:
+            ap.error(f"--env: '{item}' has an empty variable name")
+        env[k] = v
+    return env
+
+
+def effective_unroll(app, backend, unroll):
+    """Clamp an unroll to what the app supports on this backend (see AppSpec)."""
+    cap = app.max_unroll.get(backend)
+    return min(unroll, cap) if cap else unroll
 
 
 def effective_iters(iters, unroll):
@@ -129,8 +165,19 @@ def main():
     ap.add_argument("--opts", default="", help="semicolon-separated CGIR opt combos, each "
                     "a comma/space list of passes (e.g. 'reduce-node,transitive-reduction;batch'); "
                     "each combo -> one taskgraph:<opt> config. Default from appspecs.")
-    ap.add_argument("--target", choices=["cpu", "gpu"], default="cpu",
-                    help="backend for every build (USE_TARGET); default cpu")
+    ap.add_argument("--target", choices=sorted(BACKENDS), default="cpu",
+                    help="backend for every build; 'cpu'/'gpu' are OpenMP/XKOMP host "
+                    "tasks vs target offload, 'ompss' is the OmpSs-2/NODES port "
+                    "(host only, and only for apps that have one). Default cpu")
+    ap.add_argument("--env", action="append", default=[], metavar="K=V",
+                    help="extra environment variable applied to every run (repeatable). "
+                    "Applied after the harness' own variables, so it can override them "
+                    "-- which is how the JIT cache regimes are swept, e.g. "
+                    "--env CGIR_JIT_CACHE=0 (cold) or --env CGIR_JIT_CACHE_DIR=/tmp/jitc "
+                    "(persistent). Recorded in the `env` column of runs.csv.")
+    ap.add_argument("--tag", default="", help="free-form string written to the `tag` column "
+                    "of runs.csv, to mark a sweep (e.g. 'jit-cold') so several sweeps can "
+                    "share one results file and still be told apart")
     ap.add_argument("--threads", type=int, default=0, help="OMP_NUM_THREADS (0=leave unset)")
     ap.add_argument("--places", default=DEFAULT_ENV["OMP_PLACES"], help="OMP_PLACES")
     ap.add_argument("--drivers", default=DEFAULT_ENV["XKRT_DRIVERS"], help="XKRT_DRIVERS")
@@ -148,7 +195,12 @@ def main():
         print("apps:")
         for name, spec in APPS.items():
             print(f"  {name:8s} variants={spec.variants} sizes={spec.sizes} iters={spec.iters}"
+                  f" backends={spec.backends}"
                   f"{' (rebuild per size)' if spec.rebuild_per_size else ''}")
+        print("\nbackends:")
+        for name, b in sorted(BACKENDS.items()):
+            print(f"  {name:8s} build={b.build} passes via {b.opt_env}"
+                  f"{' env=' + str(b.env) if b.env else ''}")
         opts = _parse_opts(args.opts)
         print("\nconfigurations:")
         for c in default_configs(opts):
@@ -183,9 +235,22 @@ def main():
         if a not in APPS:
             ap.error(f"unknown app '{a}' in --grain (known: {', '.join(APPS)})")
     configs = default_configs(_parse_opts(args.opts))
-    backend_vars = {"USE_TARGET": "1" if args.target == "gpu" else "0"}
+    backend = BACKENDS[args.target]
+    backend_vars = dict(backend.build)
     if args.no_taskgraphloop:
         backend_vars["USE_TASKGRAPHLOOP"] = "0"
+    extra_env = parse_env(args.env, ap)
+    env_col = " ".join(f"{k}={v}" for k, v in extra_env.items())
+
+    # An app without a port for this backend is skipped, not built: its task
+    # constructs would compile to nothing and the run would silently measure a
+    # serial program.
+    skipped = [a for a in selected if args.target not in APPS[a].backends]
+    selected = [a for a in selected if args.target in APPS[a].backends]
+    if skipped:
+        print(f"[skip ] no {args.target} port: {', '.join(skipped)}", file=sys.stderr)
+    if not selected:
+        ap.error(f"none of the selected apps has a '{args.target}' port")
 
     outdir = Path(args.outdir)
     runs_csv = Path(args.out) if args.out else outdir / "runs.csv"
@@ -257,6 +322,10 @@ def main():
                 # unroll 1 -- pinned rather than taking unrolls[0], so that
                 # `--unroll 2,4` cannot label the baseline series "no-taskgraph u2".
                 cfg_unrolls = unrolls if cfg.taskgraph else [1]
+                # Clamp to what the app accepts here, then de-duplicate: on a
+                # backend capped at 1, `--unroll 1,2,4` must run once, not thrice.
+                cfg_unrolls = ordered_unique(effective_unroll(app, args.target, u)
+                                             for u in cfg_unrolls)
                 # product() materializes its arguments, so the one-shot zip is safe
                 for unroll, (size, grain) in itertools.product(cfg_unrolls,
                                                                zip(sizes, grains)):
@@ -265,20 +334,28 @@ def main():
                     work, work_label = app.work(size)
                     vtag = f"-{variant}" if variant else ""
                     disp = f"{app_name}/{variant}" if variant else app_name
+                    # The tag is part of the id, not only of its own column: the
+                    # two CGIR side files join on run_id, so two sweeps that
+                    # differ only by --env (the JIT cache regimes) must not
+                    # collide there.
+                    tagpart = f"-{sanitize(args.tag)}" if args.tag else ""
                     run_id = sanitize(f"{app_name}{vtag}-{args.target}-{cfg.label}"
-                                      f"-n{size}-u{unroll}-{ts_run}")
+                                      f"-n{size}-u{unroll}{tagpart}-{ts_run}")
                     argv = [app.binary(variant)] + list(
                         app.run_args(variant, size, eff_iters, cfg, grain, unroll))
                     workdir = APPS_OPENMP / app.directory
 
                     env = dict(os.environ)
                     env.update(DEFAULT_ENV)
+                    env.update(backend.env)
                     env["OMP_PLACES"] = args.places
                     env["XKRT_DRIVERS"] = args.drivers
                     if args.threads:
                         env["OMP_NUM_THREADS"] = str(args.threads)
                     if cfg.opt is not None:
-                        env["OMP_TASKGRAPH_OPT"] = cfg.opt
+                        # Same pass names for every backend; only the variable the
+                        # runtime reads them from differs (see appspecs.Backend).
+                        env[backend.opt_env] = cfg.opt
                     # CGIR stats: only taskgraph configs produce passes. cgstats
                     # is per-pass command-graph stats; jitstats is the per-run JIT
                     # compile breakdown + cache reuse (populated only for opts that
@@ -287,6 +364,9 @@ def main():
                         env["CGIR_STATS_CSV"] = str(stats_csv)
                         env["CGIR_STATS_TAG"] = run_id
                         env["CGIR_JIT_STATS_CSV"] = str(jit_csv)
+                    # Last, so a sweep can override anything above -- notably the
+                    # CGIR_JIT_CACHE* knobs whose regimes are the point of --env.
+                    env.update(extra_env)
 
                     pretty = " ".join(argv)
                     utag = f" u={unroll}" if unroll != 1 else ""
@@ -297,11 +377,12 @@ def main():
                     row.update({
                         "run_id": run_id,
                         "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
-                        "machine": machine, "app": app_name, "variant": variant,
+                        "machine": machine, "tag": args.tag,
+                        "app": app_name, "variant": variant,
                         "config": cfg.label, "opt": ("" if cfg.opt is None else cfg.opt),
                         "build_vars": " ".join(f"{k}={v}" for k, v in
                                                {**cfg.build, **backend_vars}.items()),
-                        "backend": args.target, "size": size,
+                        "backend": args.target, "env": env_col, "size": size,
                         "work": work, "work_label": work_label, "iters": eff_iters,
                         "unroll": unroll,
                         "grain": (":".join(map(str, grain)) if grain else ""),

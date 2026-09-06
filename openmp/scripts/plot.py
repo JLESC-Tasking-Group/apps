@@ -14,6 +14,18 @@ under results/figures (PDF by default; see --format):
     before -> after) and per-pass wall time, from cgstats.csv joined on the run
     tag. Only the taskgraph configurations contribute here.
 
+The two above are the exploratory views: one figure per app, every metric, no
+editorial choices. The paper's two artifacts are opt-in, and make choices:
+
+  * --paper -> paper-speedup : one panel per app, speedup over --baseline, the
+    incremental pipeline as bars and the references (synchronous, and the
+    hand-written CUDA implementations passed with --external) as markers.
+  * --latex-table PATH : the statistics table, joining runs.csv with cgstats.csv
+    and jitstats.csv -- the recorded graph, what each pass did to it, what the
+    passes cost, and how many replays repay that cost against --baseline.
+
+Both normalize against the same --baseline, so they cannot disagree.
+
 A per-(app, variant) coverage summary is printed first, so runs that failed (and
 are therefore not plottable) are reported rather than silently omitted.
 
@@ -164,6 +176,15 @@ def canon_config(label):
     if m:
         unroll, label = " u" + m.group(1), label[:m.start()]
     return _canon_passes(label) + unroll
+
+
+def canon_pipeline(label):
+    """canon_config() without the unroll: the pass set alone.
+
+    The unroll is a property of the *run*, not of the pipeline, so anything that
+    selects "the rows of pipeline X" (the table) must ignore it, while anything
+    that draws one series per run (the figures) must not."""
+    return _canon_passes(_UNROLL_SUFFIX.sub("", label.strip()))
 
 
 def _canon_passes(label):
@@ -571,6 +592,457 @@ def plot_graph_stats(rows, cgstats_path, figdir, dpi, fmt, show):
         _save(fig, figdir, f"graph-{app}", dpi, fmt, show)
 
 
+# --------------------------------------------------------------------------- #
+# The paper figure and the paper table.
+#
+# plot_time / plot_graph_stats above are the exploratory views: one figure per
+# app, every metric, no editorial choices. The two functions below are the
+# opposite -- they produce the two artifacts the evaluation section has room for,
+# and therefore make choices (which baseline, which panels, which columns).
+# --------------------------------------------------------------------------- #
+
+# Short legend labels for the incremental pipeline, keyed by canonical pass set.
+# The figure has four bars per group and no room for a pass list in each; the
+# `opt` column of runs.csv stays the ground truth.
+PAPER_LABELS = {
+    "taskgraph:none":                                                "record/replay",
+    "taskgraph:reduce-node,transitive-reduction":                    "+reduce",
+    "taskgraph:reduce-node,transitive-reduction,jit":                "+jit",
+    "taskgraph:reduce-node,transitive-reduction,prog-fuse,jit":      "+prog-fuse",
+    "taskgraph:reduce-node,transitive-reduction,prog-fuse,jit,sequence,batch":
+                                                                     "+packing",
+}
+
+# Configurations drawn as point markers rather than bars: they are references,
+# not steps of the pipeline, and a bar each would double the width of the figure.
+MARKERS = {
+    "synchronous": dict(marker="x", color="black", s=42, zorder=5,
+                        label="synchronous"),
+    "no-taskgraph": dict(marker="_", color="black", s=64, zorder=5,
+                         label="no-taskgraph (=1)"),
+}
+
+
+def paper_label(config):
+    """Legend text for a configuration.
+
+    The paper's pipelines get their short name. Anything else is abbreviated to
+    "+<last pass>" -- the incremental sweep reads as "this bar adds that pass to
+    the one on its left", so the last pass is the only informative part, and a
+    full pass list would make the legend wider than the figure."""
+    key = canon_pipeline(config)
+    if key in PAPER_LABELS:
+        return PAPER_LABELS[key]
+    head, _, opt = key.partition(":")
+    if head != "taskgraph" or not opt:
+        return config
+    passes = [p for p in opt.split(",") if p]
+    return "+" + passes[-1] if passes else config
+
+
+def load_external(path):
+    """Read the hand-written reference implementations, which no sweep produces.
+
+    These are the CUDA baselines that ship with two of the apps (MNMGDatalog's
+    v2_cudagraph in tc.cu, llm.c's train_gpt2.cu). They are not configurations of
+    our stack -- different source, different toolchain -- so they are not in
+    runs.csv and are supplied as their own small file:
+
+        app,variant,size,label,avg_ms
+        mnmg,,7035,CUDA graph (hand-written),0.061
+
+    Returns {(app, variant, size): (label, avg_ms)}."""
+    out = {}
+    with open(path, newline="") as fh:
+        for r in csv.DictReader(fh):
+            v = fnum(r.get("avg_ms"))
+            if v is None or v <= 0:
+                continue
+            out[(r["app"], r.get("variant", "") or "", int(r["size"]))] = \
+                (r.get("label", "reference"), v)
+    return out
+
+
+def _panel_series(grp, xkey):
+    """Reduce a panel's rows to {config: {x: avg_ms}} plus the ordered x values.
+
+    `xkey` is "size" or "variant": which of the two the panel varies. Whichever
+    it is NOT must be constant within the panel; the caller guarantees that by
+    filtering, so a leftover duplicate (a re-run) simply takes the last value."""
+    data = defaultdict(dict)
+    order = []
+    for r in grp:
+        v = fnum(r.get("avg_ms"))
+        if v is None or v <= 0:
+            continue
+        x = int(r["size"]) if xkey == "size" else (r.get("variant") or "")
+        data[r["config"]][x] = v
+        if x not in order:
+            order.append(x)
+    return data, sorted(order, key=lambda x: (isinstance(x, str), x))
+
+
+EXTERNAL_LEGEND = "hand-written CUDA"
+
+
+def plot_paper_speedup(rows, figdir, dpi, fmt, show, styles, baseline,
+                       external, panel_size, apps_order, figsize=None,
+                       unroll=None):
+    """The end-to-end figure: one panel per app, speedup over `baseline`.
+
+    Speedup rather than time because the four apps differ by two orders of
+    magnitude in absolute time; a shared y axis of milliseconds would compress
+    three panels into a line. The baseline (`no-taskgraph` by default: the same
+    program, same task granularity, without record/replay) is the honest
+    reference for "what does the command graph buy", and is drawn at y=1.
+
+    Exactly one unroll is drawn (`unroll`, default the largest in the input).
+    Drawing several would double the bars per group while the legend -- which
+    names pipelines, not runs -- could not tell them apart; the unroll sweep is
+    reported in the table instead.
+    """
+    import matplotlib.pyplot as plt
+
+    # load_runs() folded the unroll into the config label; undo that selection
+    # here rather than plumb a second key through _panel_series().
+    def run_unroll(r):
+        try:
+            return int(r.get("unroll") or 1)
+        except ValueError:
+            return 1
+
+    us = {run_unroll(r) for r in rows}
+    keep = unroll if unroll in us else (max(us) if us else 1)
+    # A reference configuration never unrolls (evaluate.py pins it to 1), so it
+    # must survive whatever unroll the pipelines are shown at.
+    rows = [r for r in rows
+            if run_unroll(r) == keep
+            or canon_pipeline(r["config"]) in
+               {canon_pipeline(baseline)} | {canon_pipeline(c) for c in MARKERS}]
+    if len(us) > 1:
+        print(f"  paper figure: unroll {keep} (of {sorted(us)})", file=sys.stderr)
+
+    try:
+        from appspecs import APPS
+    except ImportError:
+        APPS = {}
+
+    # Group rows into panels. An app whose panel varies the variant is pinned to
+    # one size (the largest it has, or --panel-size) so the five solvers are
+    # compared on equal work; an app whose panel varies the size keeps them all.
+    panels = []
+    for app in apps_order:
+        grp = [r for r in rows if r["app"] == app]
+        if not grp:
+            continue
+        spec = APPS.get(app)
+        xkey = getattr(spec, "panel_x", "size") if spec else "size"
+        if xkey == "variant":
+            sizes = sorted({int(r["size"]) for r in grp if r.get("size", "")})
+            if not sizes:
+                continue
+            pinned = panel_size if panel_size in sizes else sizes[-1]
+            grp = [r for r in grp if int(r["size"]) == pinned]
+            sub = f"n={pinned}"
+        else:
+            variants = sorted({r.get("variant", "") for r in grp})
+            if len(variants) > 1:
+                # A size-panel of an app with variants would overlay them; keep
+                # the first so the figure cannot silently average two solvers.
+                grp = [r for r in grp if r.get("variant", "") == variants[0]]
+                sub = variants[0]
+            else:
+                sub = variants[0] if variants[0] else ""
+        title = (getattr(spec, "pretty", None) or app) + (f" ({sub})" if sub else "")
+        panels.append((app, title, xkey, grp))
+
+    if not panels:
+        print("  (no rows for the paper figure)", file=sys.stderr)
+        return
+
+    # Sized for a two-column figure* whose final width is the ~7in text block:
+    # the aspect ratio is what survives the scaling, and a wider-than-3.5:1 figure
+    # would end up too short to read once shrunk.
+    fig, axes = plt.subplots(1, len(panels),
+                             figsize=(figsize or (2.8 * len(panels), 3.1)),
+                             squeeze=False)
+    axes = axes[0]
+    handles = {}
+
+    for ax, (app, title, xkey, grp) in zip(axes, panels):
+        data, xs = _panel_series(grp, xkey)
+        ref = next((v for c, v in data.items()
+                    if canon_pipeline(c) == canon_pipeline(baseline)), None)
+        if not ref:
+            ax.set_title(f"{title}\n(no '{baseline}')")
+            print(f"  WARNING: {app}: no '{baseline}' run -> panel left empty",
+                  file=sys.stderr)
+            continue
+        # An x value the baseline does not cover cannot be turned into a speedup;
+        # dropping it is honest, keeping an empty slot would read as "no gain".
+        dropped = [x for x in xs if x not in ref]
+        xs = [x for x in xs if x in ref]
+        if dropped:
+            print(f"  WARNING: {app}: no '{baseline}' at {dropped} -> omitted",
+                  file=sys.stderr)
+        if not xs:
+            ax.set_title(f"{title}\n(no '{baseline}')")
+            continue
+
+        # Bars: the pipeline, in the order the sweep produced it (which is the
+        # order passes are added), skipping the reference series.
+        bars = [c for c in ordered_unique(r["config"] for r in grp)
+                if canon_pipeline(c) != canon_pipeline(baseline) and c not in MARKERS]
+        width = 0.8 / max(len(bars), 1)
+        idx = list(range(len(xs)))
+        for i, c in enumerate(bars):
+            h = [(ref[x] / data[c][x]) if (x in data[c] and x in ref) else float("nan")
+                 for x in xs]
+            offs = [xi - 0.4 + width * (i + 0.5) for xi in idx]
+            b = ax.bar(offs, h, width, label=paper_label(c),
+                       **styles[canon_config(c)], **BAR_EDGE)
+            handles.setdefault(paper_label(c), b)
+
+        # References as markers, at the group centre.
+        for c, kw in MARKERS.items():
+            if c not in data or canon_pipeline(c) == canon_pipeline(baseline):
+                continue
+            ys = [(ref[x] / data[c][x]) if (x in data[c] and x in ref) else float("nan")
+                  for x in xs]
+            kw = dict(kw)
+            lbl = kw.pop("label")
+            sc = ax.scatter(idx, ys, **kw)
+            handles.setdefault(lbl, sc)
+
+        # The speedups this panel is actually about: our own bars.
+        finite = [ref[x] / data[c][x] for c in bars for x in xs
+                  if x in data[c] and data[c][x] > 0]
+        # Freeze the y range on them (and on the markers already drawn). An
+        # external implementation far outside it would flatten every bar in the
+        # panel, so it is clipped -- and named, so the clipping is never silent.
+        top = max(ax.get_ylim()[1], (max(finite) if finite else 0.0) * 1.15, 1.2)
+        ax.set_ylim(0, top)
+
+        # The hand-written CUDA implementation of this app, where there is one.
+        ext = [external.get((app, grp[0].get("variant", ""), x)) if xkey == "size"
+               else external.get((app, x, int(grp[0]["size"]))) for x in xs]
+        if any(e for e in ext):
+            ys = [(ref[x] / e[1]) if (e and x in ref) else float("nan")
+                  for x, e in zip(xs, ext)]
+            over = [f"{x}:{y:.2g}" for x, y in zip(xs, ys) if y == y and y > top]
+            if over:
+                print(f"  WARNING: {app}: hand-written reference off scale at "
+                      f"{', '.join(over)} (axis capped at {top:.2g})",
+                      file=sys.stderr)
+            sc = ax.scatter(idx, ys, marker="*", s=90, color="black",
+                            zorder=6, label=EXTERNAL_LEGEND, clip_on=True)
+            handles.setdefault(EXTERNAL_LEGEND, sc)
+
+        # A whole panel one or two orders of magnitude away from 1 is almost never
+        # a real result: it means the baseline measured something else -- typically
+        # an asynchronous configuration whose tasks were still in flight when it
+        # stopped the clock. Say so, rather than let the panel into the paper.
+        m = median(finite)
+        if m is not None and not (0.05 <= m <= 20.0):
+            print(f"  WARNING: {app}: median speedup vs '{baseline}' is {m:.3g} "
+                  f"-- implausible; check that '{baseline}' drains its tasks before "
+                  f"it stops the clock", file=sys.stderr)
+
+        ax.axhline(1.0, color="black", lw=0.8, ls="--", zorder=1)
+        ax.set_xticks(idx)
+        labels = [str(x) for x in xs]
+        # Solver names are long enough to collide at this panel width.
+        rot = 25 if max((len(l) for l in labels), default=0) > 4 else 0
+        ax.set_xticklabels(labels, rotation=rot,
+                           ha="right" if rot else "center")
+        ax.set_xlabel("problem size" if xkey == "size" else "solver")
+        ax.set_title(title)
+        ax.grid(axis="y", ls=":", alpha=0.6)
+        ax.set_axisbelow(True)
+
+    axes[0].set_ylabel(f"speedup over\n{baseline}")
+    # One legend for the whole figure, below it: four panels each carrying the
+    # same five entries would cost more area than the panels.
+    fig.legend(handles.values(), handles.keys(), loc="upper center",
+               bbox_to_anchor=(0.5, 0.0), ncol=min(len(handles), 4), frameon=False)
+    fig.tight_layout()
+    _save(fig, figdir, "paper-speedup", dpi, fmt, show)
+
+
+def _cg_by_tag(cgstats_path):
+    """cgstats.csv indexed as {tag: {pass: row}} -- the per-pass graph metrics of
+    one run, keyed by the run_id it joins on."""
+    out = defaultdict(dict)
+    with open(cgstats_path, newline="") as fh:
+        for r in csv.DictReader(fh):
+            out[r.get("tag", "")][r.get("pass", "")] = r
+    return out
+
+
+def _jit_by_tag(jitstats_path):
+    out = {}
+    if not Path(jitstats_path).exists():
+        return out
+    with open(jitstats_path, newline="") as fh:
+        for r in csv.DictReader(fh):
+            out[r.get("tag", "")] = r
+    return out
+
+
+def _fmt(v, prec=0):
+    if v is None:
+        return "--"
+    return f"{v:.{prec}f}" if prec else f"{int(round(v))}"
+
+
+def latex_table(rows, cgstats_path, jitstats_path, baseline, full_pipeline, out):
+    """Emit the paper's single statistics table as LaTeX.
+
+    One row per (app, variant, size, backend) of the FULL pipeline, carrying what
+    the evaluation section has to justify in one place:
+
+      * what the recorded graph looks like, and what each pass does to it
+        (the paper's claims about reduce / prog-fuse / packing),
+      * what running the passes costs (the paper's complexity bounds are
+        pessimistic and say so; this is the measured cost),
+      * how many replays repay that cost -- computed against `baseline`, which
+        must be the same reference the figure normalizes to, or the two artifacts
+        would tell different stories.
+
+    The break-even is t_opt / (t_baseline - t_optimized) per replay. It is
+    reported as "--" when the optimized configuration is not faster: there is then
+    no number of replays that repays the compilation, and printing a huge integer
+    would suggest otherwise."""
+    try:
+        from appspecs import APPS
+    except ImportError:
+        APPS = {}
+
+    cg = _cg_by_tag(cgstats_path) if Path(cgstats_path).exists() else {}
+    jit = _jit_by_tag(jitstats_path)
+
+    def key_of(r):
+        return (r["app"], r.get("variant", ""), r.get("size"), r.get("backend", ""))
+
+    def unroll_of(r):
+        try:
+            return int(r.get("unroll") or 1)
+        except ValueError:
+            return 1
+
+    # The baseline never unrolls (evaluate.py pins it to 1), so one value per key.
+    base = {}
+    for r in rows:
+        if canon_pipeline(r["config"]) != canon_pipeline(baseline):
+            continue
+        v = fnum(r.get("avg_ms"))
+        if v:
+            base[key_of(r)] = v
+
+    # The pipeline may have been swept over several unrolls; the table reports the
+    # smallest and the largest, which is the whole taskgraphloop result in two
+    # columns, and takes its graph statistics from the largest (the configuration
+    # the figure shows).
+    swept = defaultdict(dict)   # key -> {unroll: row}
+    for r in rows:
+        if canon_pipeline(r["config"]) != canon_pipeline(full_pipeline):
+            continue
+        if fnum(r.get("avg_ms")):
+            swept[key_of(r)][unroll_of(r)] = r
+
+    body = []
+    for key in sorted(swept, key=lambda k: (k[0], k[1], int(k[2] or 0))):
+        by_unroll = swept[key]
+        umin, umax = min(by_unroll), max(by_unroll)
+        r = by_unroll[umax]
+        tag = r["run_id"]
+        passes = cg.get(tag, {})
+        if not passes:
+            continue
+        spec = APPS.get(r["app"])
+
+        def before(p, m):
+            return fnum(passes.get(p, {}).get(m + "_before"))
+
+        def after(p, m):
+            return fnum(passes.get(p, {}).get(m + "_after"))
+
+        # The recorded graph is what the FIRST pass of the pipeline saw.
+        first = next((p for p in PASS_ORDER if p in passes), None)
+        v0, e0 = before(first, "nodes"), before(first, "edges")
+        # ... after both reduction passes ...
+        v1 = after("transitive-reduction", "nodes") or after("reduce-node", "nodes")
+        e1 = after("transitive-reduction", "edges") or after("reduce-node", "edges")
+        # ... PROG commands collapsed by fusion ...
+        p0, p1 = before("prog-fuse", "prog"), after("prog-fuse", "prog")
+        # ... and nodes left to submit after packing (batch runs after sequence).
+        vp = after("batch", "nodes") or after("sequence", "nodes")
+
+        t_opt = sum(fnum(p.get("pass_ms")) or 0.0 for p in passes.values())
+        t_jit = fnum((jit.get(tag) or {}).get("jit_total_s"))
+        if t_jit:
+            # jitstats reports the whole process; the pass row already counts it.
+            t_opt = max(t_opt, t_jit * 1000.0)
+
+        t_opt_ms = t_opt
+        t_new = fnum(r.get("avg_ms"))
+        t_lo = fnum(by_unroll[umin].get("avg_ms"))
+        t_ref = base.get(key)
+        gain = (t_ref - t_new) if (t_ref and t_new) else None
+        breakeven = (t_opt_ms / gain) if (gain and gain > 0) else None
+
+        body.append([
+            (getattr(spec, "pretty", None) or r["app"]) +
+            (f" {r['variant']}" if r.get("variant") else ""),
+            getattr(spec, "klass", "") or "",
+            str(r.get("size", "")),
+            f"{_fmt(v0)}/{_fmt(e0)}",
+            f"{_fmt(v1)}/{_fmt(e1)}",
+            f"{_fmt(p0)}$\\to${_fmt(p1)}",
+            _fmt(vp),
+            _fmt(t_opt_ms, 1),
+            _fmt(fnum(r.get("iter0_ms")), 2),
+            _fmt(t_lo, 3) + (f" / {_fmt(t_new, 3)}" if umax != umin else ""),
+            _fmt(breakeven),
+        ])
+
+    ucols = sorted({u for v in swept.values() for u in v})
+    replay_head = ("replay (ms)" if len(ucols) < 2
+                   else f"replay (ms) $u{ucols[0]}$/$u{ucols[-1]}$")
+    header = ["Application", "Class", "Size", "$|V|/|E|$", "after \\code{reduce}",
+              "\\code{PROG}", "packed", "$t_{opt}$ (ms)", "record (ms)",
+              replay_head, "break-even"]
+
+    lines = [
+        "% Generated by scripts/plot.py --latex-table. Do not edit by hand.",
+        "% baseline = " + baseline + " ; pipeline = " + full_pipeline,
+        "\\begin{table*}[t]",
+        "  \\centering",
+        # \texttt rather than the paper's \code in the caption: \code is a
+        # \lstinline, which is fragile in a moving argument and breaks the list
+        # of tables. Cells are not moving arguments, so they keep \code.
+        "  \\caption{Recorded command graphs, what each pass does to them, and what "
+        "running the passes costs. $t_{opt}$ is the total time of the passes, paid "
+        "once; break-even is the number of replays over which it is repaid against "
+        "\\texttt{" + baseline.replace("_", "\\_") + "}.}",
+        "  \\label{tbl:apps}",
+        "  {\\footnotesize",
+        "  \\begin{tabular}{@{}l l r r r r r r r r r@{}}",
+        "    \\toprule",
+        "    " + " & ".join(f"\\textbf{{{h}}}" for h in header) + " \\\\",
+        "    \\midrule",
+    ]
+    lines += ["    " + " & ".join(c for c in b) + " \\\\" for b in body]
+    lines += ["    \\bottomrule", "  \\end{tabular}}", "\\end{table*}"]
+
+    text = "\n".join(lines) + "\n"
+    if out == "-":
+        print(text)
+    else:
+        Path(out).write_text(text)
+        print(f"wrote {out}", file=sys.stderr)
+
+
 def _save(fig, figdir, name, dpi, fmt, show):
     import matplotlib.pyplot as plt
     figdir.mkdir(parents=True, exist_ok=True)
@@ -613,6 +1085,36 @@ def main():
                     "style assignment (repeatable). Figures of one runs.csv are always "
                     "mutually consistent; point every invocation at the same superset "
                     "file to keep figures plotted from *different* files consistent too")
+    ap.add_argument("--paper", action="store_true",
+                    help="also render the paper figure (paper-speedup.<fmt>): one panel "
+                    "per app, speedup over --baseline, the pipeline as bars and the "
+                    "references as markers")
+    ap.add_argument("--baseline", default="no-taskgraph",
+                    help="configuration the paper figure and the break-even column "
+                    "normalize against (default: no-taskgraph)")
+    ap.add_argument("--panel-size", type=int, default=0,
+                    help="problem size at which an app whose panel varies the variant "
+                    "(krylov) is compared; default: its largest size")
+    ap.add_argument("--apps", default="krylov,lulesh,llm.c,mnmg",
+                    help="comma list fixing the panel order of the paper figure")
+    ap.add_argument("--external", default="",
+                    help="CSV of hand-written reference implementations to overlay "
+                    "(app,variant,size,label,avg_ms); see load_external()")
+    ap.add_argument("--paper-unroll", type=int, default=0,
+                    help="unroll the paper figure shows (default: the largest in the "
+                    "input). One only: the legend names pipelines, not runs")
+    ap.add_argument("--paper-figsize", default="", metavar="W,H",
+                    help="override the paper figure size in inches (default: "
+                    "2.8 per panel x 3.1)")
+    ap.add_argument("--latex-table", default="", metavar="PATH",
+                    help="write the paper's statistics table as LaTeX to PATH "
+                    "('-' for stdout). Joins runs.csv with cgstats.csv/jitstats.csv")
+    ap.add_argument("--pipeline",
+                    default="taskgraph:reduce-node,transitive-reduction,jit,prog-fuse,"
+                            "sequence,batch",
+                    help="configuration the LaTeX table reports (default: the full "
+                    "pipeline)")
+    ap.add_argument("--jitstats", default="", help="jitstats.csv (default: <outdir>/jitstats.csv)")
     ap.add_argument("--dpi", type=int, default=140)
     args = ap.parse_args()
 
@@ -625,6 +1127,7 @@ def main():
     outdir = Path(args.outdir)
     runs_csv = Path(args.runs) if args.runs else outdir / "runs.csv"
     cgstats_csv = Path(args.cgstats) if args.cgstats else outdir / "cgstats.csv"
+    jitstats_csv = Path(args.jitstats) if args.jitstats else outdir / "jitstats.csv"
     figdir = Path(args.figdir) if args.figdir else outdir / "figures"
 
     if not runs_csv.exists():
@@ -647,6 +1150,13 @@ def main():
             ap.error(f"no cgstats.csv at {cgstats_csv} (it is written by "
                      f"evaluate.py unless --no-stats)")
 
+    if args.latex_table:
+        if not cgstats_csv.exists():
+            ap.error(f"--latex-table needs {cgstats_csv} (written by evaluate.py "
+                     f"unless --no-stats)")
+        latex_table(rows, cgstats_csv, jitstats_csv, args.baseline, args.pipeline,
+                    args.latex_table)
+
     if args.no_figures:
         return
 
@@ -664,6 +1174,21 @@ def main():
     report_styles(styles)
 
     plot_time(rows, figdir, args.dpi, args.logy, args.format, args.show, styles)
+    if args.paper:
+        if args.external and not Path(args.external).exists():
+            ap.error(f"--external: no such file {args.external}")
+        external = load_external(args.external) if args.external else {}
+        figsize = None
+        if args.paper_figsize:
+            try:
+                w, h = (float(x) for x in args.paper_figsize.split(","))
+                figsize = (w, h)
+            except ValueError:
+                ap.error("--paper-figsize: expected W,H in inches")
+        plot_paper_speedup(rows, figdir, args.dpi, args.format, args.show, styles,
+                           args.baseline, external, args.panel_size,
+                           [a.strip() for a in args.apps.split(",") if a.strip()],
+                           figsize, args.paper_unroll or None)
     if cgstats_csv.exists():
         plot_graph_stats(rows, cgstats_csv, figdir, args.dpi, args.format, args.show)
     else:

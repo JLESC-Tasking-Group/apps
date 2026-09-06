@@ -20,9 +20,8 @@ CFLAGS += -DNB_STEPS=10
 LLMC_DEFS ?=
 CFLAGS += $(LLMC_DEFS)
 
-# OmpSs-2 host backend (mutually exclusive with USE_TARGET):
-#CFLAGS  += -DUSE_OMPSS=1 -fompss-2=libnodes
-#LDFLAGS += -lnuma
+# The OmpSs-2 / NODES host backend is `make USE_OMPSS=1` (compiler and flags come
+# from ../common.mk; set OMPSS_CC to the OmpSs-2 clang++ if it is not `clang++`).
 
 SRC = timer.c mpi_utils.c ompss-2_wrappers.c train_gpt2.c
 TEST_SRC = timer.c mpi_utils.c ompss-2_wrappers.c test_gpt2.c

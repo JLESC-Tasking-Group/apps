@@ -17,7 +17,18 @@
 # clang(++) is the supported compiler (the taskgraph construct needs Julian's
 # LLVM / XKOMP fork). A portable CPU build (USE_TASKGRAPH=0) also works on
 # vanilla clang. Override on the command line with `make CC=clang++`.
-CC = xkcxx -DUSE_XKOMP=1
+#
+# USE_OMPSS=1 targets NODES/OmpSs-2 instead, which is a different toolchain, so
+# it takes its compiler from OMPSS_CC (default: the OmpSs-2 clang++). Selecting
+# it here rather than at the call site keeps `make USE_OMPSS=1` working on its
+# own -- the XKOMP default would otherwise be silently wrong.
+USE_OMPSS ?= 0
+ifeq ($(USE_OMPSS),1)
+  OMPSS_CC ?= clang++
+  CC = $(OMPSS_CC)
+else
+  CC = xkcxx -DUSE_XKOMP=1
+endif
 
 # ---- Backend / schedule toggles (override on the command line) ------------
 USE_TARGET     ?= 0     # 0: host CPU tasks        1: GPU target offload
@@ -26,16 +37,14 @@ USE_TASKGRAPHLOOP ?= 1  # 1: unroll -u iterations into ONE graph instance (taskg
                         # 0: one graph instance per iteration (the A/B baseline)
 USE_SYNC       ?= 0     # 0: asynchronous tasks     1: synchronous blocking
 USE_REPLAYABLE ?= 0     # mark task-generating constructs replayable(1)
-USE_OMPSS      ?= 0     # 1: emit OmpSs-2 (#pragma oss) host tasks instead of omp
+                        # (USE_OMPSS is declared above, next to the compiler it selects)
 
 # ---- Common flags ---------------------------------------------------------
 # -I.. makes the shared apps/openmp/tasking.h resolvable as #include "tasking.h"
 # from each app's build dir (one level below apps/openmp).
 CFLAGS += -I..
-CFLAGS += -fopenmp -fopenmp-version=60
 CFLAGS += -O3
 #CFLAGS += -O0 -g
-CFLAGS += -fopenmp-task-jit-abi=packed        # XKOMP JIT (none|pointers|packed)
 CFLAGS += -DUSE_TARGET=$(USE_TARGET)
 CFLAGS += -DUSE_TASKGRAPH=$(USE_TASKGRAPH)
 CFLAGS += -DUSE_TASKGRAPHLOOP=$(USE_TASKGRAPHLOOP)
@@ -45,12 +54,21 @@ CFLAGS += -DUSE_OMPSS=$(USE_OMPSS)
 
 LDFLAGS += -lm
 
-# ---- OmpSs-2 host backend (USE_OMPSS=1); needs the OmpSs-2 compiler ----------
-# The shared tasking.h switches `omp task` -> `oss task` when USE_OMPSS=1. Enable
-# the OmpSs-2 compiler/runtime flags here (mutually exclusive with USE_TARGET):
+# ---- Tasking backend flags -------------------------------------------------
+# The shared tasking.h switches `omp task` -> `oss task` when USE_OMPSS=1. The two
+# backends are different toolchains and their flags do not overlap: -fompss-2
+# already implies the OmpSs-2 tasking front end, and -fopenmp-task-jit-abi is an
+# XKOMP-fork flag that the OmpSs-2 clang rejects. (Mutually exclusive with
+# USE_TARGET; tasking.h enforces that with an #error.)
 ifeq ($(USE_OMPSS),1)
+  # libnodes both selects the runtime and makes the compiler preserve each task
+  # body as LLVM-IR in the NANOS6 convention, which is what CGIR's prog-fuse/jit
+  # passes consume.
   CFLAGS  += -fompss-2=libnodes
   LDFLAGS += -lnuma
+else
+  CFLAGS  += -fopenmp -fopenmp-version=60
+  CFLAGS  += -fopenmp-task-jit-abi=packed     # XKOMP JIT (none|pointers|packed)
 endif
 
 # ---- GPU (OpenMP target offload), active only when USE_TARGET=1 -----------

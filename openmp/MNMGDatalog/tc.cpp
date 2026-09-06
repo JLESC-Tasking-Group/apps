@@ -502,8 +502,9 @@ static inline void tc_round(TCContext &ctx)
     k_writeback(ctx);
 }
 
-/* Per-round wall times. The number of rounds is data-dependent (the fixpoint runs
- * until no new fact is produced), so the vector grows as the solve proceeds. */
+/* Per-instance wall times, in seconds PER ROUND (the epilogue divides by the
+ * unroll). The number of rounds is data-dependent (the fixpoint runs until no new
+ * fact is produced), so the vector grows as the solve proceeds. */
 typedef struct { double *v; int n, cap; } TCTimes;
 
 static void tc_times_push(TCTimes *t, double x)
@@ -785,19 +786,26 @@ static void tc_print_csv(const char *csv, int input, int iters, u64 tc, double t
 /* ------------------------------------------------------------------------- */
 /* Timing model and report.                                                   */
 /*                                                                            */
-/* The measured unit is one fixpoint ROUND, reported the way the Krylov drivers */
-/* report iterations (krylov/common/driver.cpp):                               */
+/* The reported unit is one taskgraph INSTANCE -- a group of `unroll` fixpoint  */
+/* rounds (-u), one round when unrolling is off -- and the value is always ms   */
+/* per ROUND, so it stays comparable across -u. The split is the Krylov drivers'*/
+/* (krylov/common/driver.cpp), and it is the runtime's own phase structure:     */
 /*                                                                            */
-/*   round 0            the round that RECORDS the task graph (XKOMP rc == 1)  */
-/*   round 1            first replay; also where the command graph is built    */
+/*   instance 0         RECORDS the task graph (XKOMP rc == 1)                 */
+/*   instance 1         first replay; also where the command graph is built    */
 /*                      and optimized (XKOMP rc == 2)                          */
-/*   rounds 2..N-1      steady state -> avg / stddev                           */
+/*   instances 2..N-1   steady state -> avg / stddev                           */
 /*                                                                            */
 /* CAVEAT: unlike a Krylov iteration, TC rounds do very different amounts of   */
 /* work -- the frontier grows for the first rounds and then collapses. The     */
 /* steady-state stddev therefore mostly reflects that frontier-size profile,   */
-/* NOT run-to-run jitter. The record/replay comparison (round 0 and round 1    */
-/* against the steady mean) is what the split is for.                          */
+/* NOT run-to-run jitter. The record/replay comparison (instance 0 and instance */
+/* 1 against the steady mean) is what the split is for.                        */
+/*                                                                            */
+/* CAVEAT (-u > 1): convergence is only tested between instances, so the LAST  */
+/* instance may hold up to unroll-1 converged rounds. Those do no work (an     */
+/* empty frontier copies nothing), which makes that instance cheap and pulls   */
+/* the steady-state mean down -- the more so the fewer instances there are.    */
 /*                                                                            */
 /* End-to-end "total time" is the MNMGDatalog paper's metric and per-phase     */
 /* breakdown (Table "End-to-end total time (ms)" / Fig. "TC per-phase total    */
@@ -805,16 +813,16 @@ static void tc_print_csv(const char *csv, int input, int iters, u64 tc, double t
 /* the whole measured fixpoint plus the one-shot result compaction. Unlike the  */
 /* CUDA reference -- which captures and instantiates the graph in a separate,  */
 /* separately-timed phase -- XKOMP records and builds INSIDE the loop, so there */
-/* is no separate build phase: that cost sits in compute, visible as rounds 0  */
-/* and 1. Every number printed is measured; none is extrapolated.              */
+/* is no separate build phase: that cost sits in compute, visible as instances */
+/* 0 and 1. Every number printed is measured; none is extrapolated.            */
 /* ------------------------------------------------------------------------- */
 typedef struct {
-    double round0_s;        /* round 0: records the task graph                */
-    double round1_s;        /* round 1: graph build + first replay            */
-    double steady_s;        /* mean of the steady-state rounds                */
-    double steady_sd_s;     /* sample stddev of the steady-state rounds       */
-    int    steady_from;     /* index of the first steady-state round          */
-    int    steady_n;        /* number of steady-state rounds                  */
+    double round0_s;        /* instance 0: records the task graph             */
+    double round1_s;        /* instance 1: graph build + first replay         */
+    double steady_s;        /* mean of the steady-state instances             */
+    double steady_sd_s;     /* sample stddev of the steady-state instances    */
+    int    steady_from;     /* index of the first steady-state instance       */
+    int    steady_n;        /* number of steady-state instances               */
 } TCTimings;
 
 /* Split the per-round times into record / first-replay / steady state. With
@@ -964,16 +972,21 @@ int main(int argc, char **argv)
     {
         char lbl[64];
         const int graphed = (USE_TASKGRAPH && !USE_SYNC);
-        snprintf(lbl, sizeof lbl, "round 0%s", graphed ? " (record)" : "");
+        /* Entries are per taskgraph INSTANCE -- a group of `unroll` rounds (-u),
+         * one round when unrolling is off -- and always in ms per ROUND, so they
+         * stay comparable across -u. Instance 0 records the graph, instance 1
+         * builds and optimizes the command graph and runs the first replay, and
+         * instances 2.. are the steady state. */
+        snprintf(lbl, sizeof lbl, "instance 0%s", graphed ? " (record)" : "");
         printf("  %-27s : %10.3f ms\n", lbl, st.round0_s * 1000.0);
         if (times.n >= 2) {
-            snprintf(lbl, sizeof lbl, "round 1%s", graphed ? " (1st replay)" : "");
+            snprintf(lbl, sizeof lbl, "instance 1%s", graphed ? " (1st replay)" : "");
             printf("  %-27s : %10.3f ms\n", lbl, st.round1_s * 1000.0);
         }
         if (times.n >= 3) {
-            snprintf(lbl, sizeof lbl, "rounds %d..%d (avg)", st.steady_from, times.n - 1);
-            printf("  %-27s : %10.3f ms   (%d rounds)\n", lbl, st.steady_s * 1000.0, st.steady_n);
-            snprintf(lbl, sizeof lbl, "rounds %d..%d (stddev)", st.steady_from, times.n - 1);
+            snprintf(lbl, sizeof lbl, "instances %d..%d (avg)", st.steady_from, times.n - 1);
+            printf("  %-27s : %10.3f ms   (%d instances)\n", lbl, st.steady_s * 1000.0, st.steady_n);
+            snprintf(lbl, sizeof lbl, "instances %d..%d (stddev)", st.steady_from, times.n - 1);
             printf("  %-27s : %10.3f ms\n", lbl, st.steady_sd_s * 1000.0);
         }
     }

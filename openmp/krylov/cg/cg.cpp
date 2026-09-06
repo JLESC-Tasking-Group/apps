@@ -116,17 +116,21 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
                        [&] (size_t inst, size_t done)
         {
             (void) done;
-            /* Per-instance timing (always) + optional residual print (-p). A
-             * depend-synchronized host task (no taskwait): it runs after the
-             * instance's last task (gamma) and records the wall time into
-             * st->iter_ms[inst], divided by `unroll` so the unit stays one
-             * iteration. With -p it also reads back the residual scalar (async
-             * D2H) and prints it. Spawned rather than run inline so that the
-             * configurations without a taskgraph barrier keep pipelining. */
+            /* Per-instance timing (always) + optional residual print (-p).
+             * Records the wall time into st->iter_ms[inst], divided by `unroll`
+             * so the unit stays one iteration whatever -u is.
+             *
+             * EPILOGUE_TASK measures inline where the instance is provably
+             * drained (any taskgraph build: replay is synchronous), which is
+             * exact; elsewhere it emits a depend-synchronized host task that
+             * fires after the instance's last task (gamma) without blocking, so
+             * the no-taskgraph configuration keeps pipelining across instances.
+             * EPILOGUE_NOWAIT likewise drops `nowait` from the -p read-back when
+             * inline, so the residual cannot be read while its D2H is in flight. */
             if (print_dbg) {
-                OMP_TARGET_UPDATE(from(g_new[0:1]) NOWAIT DEPEND(inout, g_new[0]))
+                OMP_TARGET_UPDATE(from(g_new[0:1]) EPILOGUE_NOWAIT DEPEND(inout, g_new[0]))
             }
-            OMP_HOST_TASK(DEFAULT_NONE firstprivate(inst, unroll, g_new, gamma, print_dbg, st)
+            EPILOGUE_TASK(DEFAULT_NONE firstprivate(inst, unroll, g_new, gamma, print_dbg, st)
                           shared(prev_ts) DEPEND(in, g_new[0], gamma[0]))
             {
                 const double now = omp_get_wtime();

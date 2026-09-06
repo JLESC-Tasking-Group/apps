@@ -37,7 +37,7 @@ void krylov_stats_free(KrylovStats *s)
     s->iter_ms = NULL;
 }
 
-void krylov_stats_report(const KrylovStats *s, const char *unit, int taskgraph, double flops)
+void krylov_stats_report(const KrylovStats *s, int taskgraph, double flops)
 {
     char lbl[64];
 
@@ -49,18 +49,21 @@ void krylov_stats_report(const KrylovStats *s, const char *unit, int taskgraph, 
             printf("  %-27s : %10.3f GFLOP/s\n", "performance", flops / s->total_s / 1e9);
     }
 
+    /* Times are per taskgraph INSTANCE -- a group of `unroll` iterations -- and
+     * always in ms per iteration (the solver divides by `unroll`), so they stay
+     * comparable across -u. The three phases are the runtime's own: xkomp
+     * records the graph on instance 0, builds and optimizes the command graph on
+     * instance 1 and then replays, so instance 1 carries the whole build cost
+     * and instances 2.. are the steady state. */
     if (s->niter >= 1) {
-        snprintf(lbl, sizeof lbl, "%s 0%s", unit, taskgraph ? " (record)" : "");
+        snprintf(lbl, sizeof lbl, "instance 0%s", taskgraph ? " (record)" : "");
         printf("  %-27s : %10.3f ms\n", lbl, s->iter_ms[0]);
     }
     if (s->niter >= 2) {
-        snprintf(lbl, sizeof lbl, "%s 1%s", unit, taskgraph ? " (1st replay)" : "");
+        snprintf(lbl, sizeof lbl, "instance 1%s", taskgraph ? " (1st replay)" : "");
         printf("  %-27s : %10.3f ms\n", lbl, s->iter_ms[1]);
     }
     if (s->niter >= 3) {
-        /* Steady-state iterations 2..niter-1 (iteration 0 = record and iteration
-         * 1 = first replay are excluded as outliers). Report mean and the
-         * (sample) standard deviation of the per-iteration time. */
         const int cnt = s->niter - 2;
         double sum = 0.0;
         for (int i = 2; i < s->niter; i++) sum += s->iter_ms[i];
@@ -73,9 +76,9 @@ void krylov_stats_report(const KrylovStats *s, const char *unit, int taskgraph, 
         }
         const double stddev = (cnt > 1) ? sqrt(var / (cnt - 1)) : 0.0;
 
-        snprintf(lbl, sizeof lbl, "%ss 2..%d (avg)", unit, s->niter - 1);
-        printf("  %-27s : %10.3f ms   (%d %ss)\n", lbl, mean, cnt, unit);
-        snprintf(lbl, sizeof lbl, "%ss 2..%d (stddev)", unit, s->niter - 1);
+        snprintf(lbl, sizeof lbl, "instances 2..%d (avg)", s->niter - 1);
+        printf("  %-27s : %10.3f ms   (%d instances)\n", lbl, mean, cnt);
+        snprintf(lbl, sizeof lbl, "instances 2..%d (stddev)", s->niter - 1);
         printf("  %-27s : %10.3f ms\n", lbl, stddev);
     }
 }
@@ -284,8 +287,7 @@ int main(int argc, char **argv)
     printf("  relative error        : %.6e   (||x-xexact|| / ||xexact||)\n", sqrt(err2 / xe2));
 
     const double flops = d->flops ? d->flops(&A, &prm) : 0.0;
-    krylov_stats_report(&st, d->restarted ? "restart" : "iteration",
-                        USE_TASKGRAPH && !USE_SYNC, flops);
+    krylov_stats_report(&st, USE_TASKGRAPH && !USE_SYNC, flops);
 
     free(Ax); host_free(x); free(b); free(xexact);
     spmat_free(&A);

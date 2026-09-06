@@ -114,13 +114,19 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
         {
             (void) done;
             /* Per-instance timing (always) + optional residual print (-p).
-             * Depend-synchronized host task (no taskwait), anchored on rho (=
-             * ||r||_A^2); consecutive firings bracket one instance's work,
-             * divided by `unroll` to stay per-iteration. */
+             * Anchored on rho (= ||r||_A^2); consecutive firings bracket one
+             * instance's work, divided by `unroll` to stay per-iteration.             *
+             * EPILOGUE_TASK measures inline where the instance is provably
+             * drained (any taskgraph build: replay is synchronous), which is
+             * exact; elsewhere it emits the host task, which must not block or
+             * the no-taskgraph configuration loses its cross-instance
+             * pipelining. EPILOGUE_NOWAIT likewise drops `nowait` from the -p
+             * read-back when inline, so the residual cannot be read while its
+             * D2H is still in flight. */
             if (print_dbg) {
-                OMP_TARGET_UPDATE(from(rho[0:1]) NOWAIT DEPEND(inout, rho[0]))
+                OMP_TARGET_UPDATE(from(rho[0:1]) EPILOGUE_NOWAIT DEPEND(inout, rho[0]))
             }
-            OMP_HOST_TASK(DEFAULT_NONE firstprivate(inst, unroll, rho, print_dbg, st)
+            EPILOGUE_TASK(DEFAULT_NONE firstprivate(inst, unroll, rho, print_dbg, st)
                           shared(prev_ts) DEPEND(in, rho[0]))
             {
                 const double now = omp_get_wtime();

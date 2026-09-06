@@ -3571,18 +3571,24 @@ int main(int argc, char *argv[])
         // Metrics for one taskgraph instance (`nstep` steps), reported per step.
         // Created OUTSIDE the recorded region -- an index baked into a recorded
         // task would be replayed unchanged and every instance would overwrite the
-        // same slots. Spawned as a task rather than run inline so the
-        // configurations without a taskgraph barrier keep pipelining.
+        // same slots.
+        //
+        // EPILOGUE_TASK measures inline where the instance is provably drained
+        // (any taskgraph build: replay is synchronous), which is exact; elsewhere
+        // -- including the OmpSs `taskiter` path below, where this must stay a
+        // real task -- it emits the host task, which must not block or the
+        // no-taskgraph configuration loses its pipelining. EPILOGUE_NOWAIT
+        // likewise drops `nowait` from the loss read-back when inline, so it
+        // cannot be read while its D2H is in flight.
         auto llmc_metrics = [&] (size_t inst, int nstep)
         {
             // OMPT_SET_LABEL("metrics");
 #if USE_TARGET
-            // Bring the scalar loss back to the host (only per-instance D2H),
-            // then print from a host task.
-            #pragma omp target update from(model.mean_loss) nowait \
-                DEPEND(inout, model.mean_loss)
+            // Bring the scalar loss back to the host (only per-instance D2H).
+            OMP_TARGET_UPDATE(from(model.mean_loss) EPILOGUE_NOWAIT \
+                              DEPEND(inout, model.mean_loss))
 #endif
-            OMP_HOST_TASK(DEPEND(in, model.mean_loss) firstprivate(inst, nstep))
+            EPILOGUE_TASK(DEPEND(in, model.mean_loss) firstprivate(inst, nstep))
             {
                 double time_elapsed_it_s = TOCK(1) / (double) nstep;
                 double tokens_per_seconds = BATCH_SIZE * SEQUENCE_SIZE / time_elapsed_it_s;

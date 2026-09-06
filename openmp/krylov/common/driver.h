@@ -52,11 +52,12 @@ typedef struct {
 void krylov_stats_init  (KrylovStats *s, int niter);
 void krylov_stats_free  (KrylovStats *s);
 /* Print total time; total (theoretical) FLOPs and the derived GFLOP/s; then
- * iteration 0, iteration 1, and the mean and (sample) standard deviation of
- * iterations 2..niter-1. `unit` is "iteration" or "restart"; when `taskgraph`
- * is nonzero the first two lines are annotated (record)/(1st replay). Pass
- * flops <= 0 to omit the FLOP lines. */
-void krylov_stats_report(const KrylovStats *s, const char *unit, int taskgraph, double flops);
+ * instance 0, instance 1, and the mean and (sample) standard deviation of
+ * instances 2..niter-1 -- the runtime's own record / build+first-replay /
+ * steady-state phases (see krylov_stats_report). Every figure is in ms per
+ * ITERATION whatever -u is. When `taskgraph` is nonzero the first two lines are
+ * annotated (record)/(1st replay). Pass flops <= 0 to omit the FLOP lines. */
+void krylov_stats_report(const KrylovStats *s, int taskgraph, double flops);
 
 /* ---- theoretical FLOP costs of the tasked kernels ----
  * n = vector length, nnz = matrix nonzeros. Standard textbook counts: SpMV does

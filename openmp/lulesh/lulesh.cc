@@ -1331,14 +1331,18 @@ OMP_TARGET_ENTER_DATA( \
                  [&] (size_t inst, size_t done)
   {
     (void) done;
-    /* Per-instance timing + progress print. Run OUTSIDE the recorded region and
-     * spawned as a depend-synchronized task so it fires after the instance's
-     * last work (TimeIncrement update + end-of-step reductions) and before the
-     * next instance's TimeIncrement -- and so that it does not serialize the
-     * configurations that have no taskgraph barrier. It reads the host copies of
-     * cycle/time/deltatime kept current by the earlier `target update from`.
-     * Divided by `unroll` so the reported unit stays one cycle at any -u. */
-    OMP_HOST_TASK(firstprivate(inst, unroll, iter_times) shared(prev_ts)
+    /* Per-instance timing + progress print, OUTSIDE the recorded region. Reads
+     * the host copies of cycle/time/deltatime kept current by the earlier
+     * `target update from`, and divides by `unroll` so the reported unit stays
+     * one cycle at any -u.
+     *
+     * EPILOGUE_TASK measures inline where the instance is provably drained (any
+     * taskgraph build: replay is synchronous), which is exact; elsewhere it
+     * emits a depend-synchronized task that fires after the instance's last work
+     * (TimeIncrement update + end-of-step reductions) and before the next
+     * instance's TimeIncrement, without serializing the configurations that have
+     * no taskgraph barrier. */
+    EPILOGUE_TASK(firstprivate(inst, unroll, iter_times) shared(prev_ts)
                   DEPEND(in, cycle[0], time[0], deltatime[0], dtcourant[0], dthydro[0]))
     {
         const double now = omp_get_wtime();
@@ -2815,10 +2819,15 @@ OMP_TARGET_ENTER_DATA( \
   printf("TDG creation time    = %10.8g (s)\n", t1 - t0);
 
   /* Timing summary (record / 1st replay / steady mean+stddev), parseable by
-   * scripts/evaluate.py -- same breakdown as the krylov app. Times are per
-   * cycle; the record / 1st-replay entries are the first two taskgraph
-   * instances, i.e. cycles [0, unroll) and [unroll, 2*unroll). */
+   * scripts/evaluate.py -- same breakdown, and the same labels, as the krylov
+   * and mnmg apps. Entries are per taskgraph INSTANCE, i.e. instance k covers
+   * cycles [k*unroll, (k+1)*unroll), and every figure is in ms per CYCLE (the
+   * epilogue divides by `unroll`) so they stay comparable across -u. The three
+   * phases are the runtime's own: xkomp records the graph on instance 0, builds
+   * and optimizes the command graph on instance 1 and then replays, so instance
+   * 1 carries the whole build cost and instances 2.. are the steady state. */
   if (ninst > 0) {
+    const int graphed = (USE_TASKGRAPH && !USE_SYNC);
     const int lo  = (ninst > 2) ? 2 : (ninst > 1 ? 1 : 0);  /* first steady instance */
     const int cnt = ninst - lo;
     double mean = 0.0;
@@ -2829,11 +2838,15 @@ OMP_TARGET_ENTER_DATA( \
     const double sd = (cnt > 1) ? sqrt(var / (cnt - 1)) : 0.0;
     if (unroll > 1)
       printf("taskgraph unroll     : %10d cycles/instance (%d instances)\n", unroll, ninst);
-    printf("iteration 0          : %10.3f ms  (record)\n", iter_times[0]);
-    printf("iteration 1          : %10.3f ms  (1st replay)\n",
-           (ninst > 1) ? iter_times[1] : iter_times[0]);
-    printf("iterations 2.. (avg)    : %10.3f ms\n", mean);
-    printf("iterations 2.. (stddev) : %10.3f ms\n", sd);
+    printf("instance 0%-11s: %10.3f ms\n", graphed ? " (record)" : "", iter_times[0]);
+    if (ninst > 1)
+      printf("instance 1%-11s: %10.3f ms\n",
+             graphed ? " (1st replay)" : "", iter_times[1]);
+    /* Report the window actually averaged: it starts below 2 only when there are
+     * too few instances for the record / first replay to be dropped. */
+    printf("instances %d..%d (avg)    : %10.3f ms   (%d instances)\n",
+           lo, ninst - 1, mean, cnt);
+    printf("instances %d..%d (stddev) : %10.3f ms\n", lo, ninst - 1, sd);
   }
   free(iter_times);
 

@@ -100,52 +100,61 @@ def _mean_std(xs):
     return (m, s)
 
 
-def _parse_krylov(text):
+# All three C/C++ apps print the same four timing lines, in the same words, so
+# one parser serves them. They are per taskgraph INSTANCE -- a group of `unroll`
+# iterations -- and always in ms per iteration, and they map onto the runtime's
+# own phases: instance 0 records the graph (XKOMP rc == 1), instance 1 builds and
+# optimizes the command graph and runs the first replay (rc == 2), instances 2..
+# are steady replays.
+#
+# `instance` vs `instances` disambiguates the singular lines from the plural ones
+# without a lookahead: "instances 2..31" can never match "instance 1", because
+# the 's' sits where the space would be. [^:\n] rather than [^:] so a line that
+# is absent cannot reach forward to a colon several lines below.
+def _parse_instances(text):
     return {
-        "avg_ms":    _grab(text, r"(?:iterations|restarts) 2\.\..*\(avg\)\s*:\s*" + _F + r"\s*ms"),
-        "stddev_ms": _grab(text, r"(?:iterations|restarts) 2\.\..*\(stddev\)\s*:\s*" + _F + r"\s*ms"),
-        "iter0_ms":  _grab(text, r"(?:iteration|restart) 0.*:\s*" + _F + r"\s*ms"),
+        "iter0_ms":  _grab(text, r"instance 0[^:\n]*:\s*" + _F + r"\s*ms"),
+        "iter1_ms":  _grab(text, r"instance 1[^:\n]*:\s*" + _F + r"\s*ms"),
+        "avg_ms":    _grab(text, r"instances \d+\.\.\d+[^:\n]*\(avg\)[^:\n]*:\s*" + _F + r"\s*ms"),
+        "stddev_ms": _grab(text, r"instances \d+\.\.\d+[^:\n]*\(stddev\)[^:\n]*:\s*" + _F + r"\s*ms"),
+    }
+
+
+def _parse_krylov(text):
+    m = _parse_instances(text)
+    m.update({
         "elapsed_s": _grab(text, r"total solve time\s*:\s*" + _F),
         "flops":     _grab(text, r"theoretical flops\s*:\s*" + _F),
         "gflops":    _grab(text, r"performance\s*:\s*" + _F),
         "residual":  _grab(text, r"relative residual\s*:\s*" + _F),
         "error":     _grab(text, r"relative error\s*:\s*" + _F),
-    }
+    })
+    return m
 
 
 def _parse_lulesh(text):
-    return {
-        "avg_ms":    _grab(text, r"iterations 2\.\..*\(avg\)\s*:\s*" + _F + r"\s*ms"),
-        "stddev_ms": _grab(text, r"iterations 2\.\..*\(stddev\)\s*:\s*" + _F + r"\s*ms"),
-        "iter0_ms":  _grab(text, r"iteration 0\s*:\s*" + _F + r"\s*ms"),
+    m = _parse_instances(text)
+    m.update({
         "elapsed_s": _grab(text, r"Elapsed time\s*=\s*" + _F),
         "fom":       _grab(text, r"FOM\s*=\s*" + _F + r"\s*\(z/s\)"),
-    }
+    })
+    return m
 
 
 def _parse_mnmg(text):
-    # tc.cpp reports per-ROUND times in the same shape as the Krylov drivers (see
-    # MNMGDatalog/tc.cpp): round 0 records the task graph, round 1 is the first
-    # replay (and where the command graph is built), rounds 2.. are steady state.
+    # Same four instance lines as krylov / lulesh; here they are ms per fixpoint
+    # ROUND. The extra work is the fallback: the round count is data-dependent
+    # (the fixpoint runs to convergence), so a small graph -- or a large -u --
+    # can leave fewer than three instances and no steady-state window at all.
     # "total time (end-to-end)" is the MNMGDatalog paper's metric (file IO + H2D +
     # setup + compute + D2H) and is printed in ms, unlike the other apps' seconds.
-    avg = _grab(text, r"rounds \d+\.\.\d+ \(avg\)\s*:\s*" + _F + r"\s*ms")
-    std = _grab(text, r"rounds \d+\.\.\d+ \(stddev\)\s*:\s*" + _F + r"\s*ms")
-    it0 = _grab(text, r"round 0[^:]*:\s*" + _F + r"\s*ms")
-    if avg is None:
-        # fewer than 3 rounds: no steady-state window, fall back to the last
-        # round that was reported.
-        avg = _grab(text, r"round 1[^:]*:\s*" + _F + r"\s*ms")
-        if avg is None:
-            avg = it0
-        std = 0.0 if avg is not None else None
+    m = _parse_instances(text)
+    if m["avg_ms"] is None:
+        m["avg_ms"] = m["iter1_ms"] if m["iter1_ms"] is not None else m["iter0_ms"]
+        m["stddev_ms"] = 0.0 if m["avg_ms"] is not None else None
     total_ms = _grab(text, r"total time \(end-to-end\)\s*:\s*" + _F + r"\s*ms")
-    return {
-        "avg_ms":    avg,
-        "stddev_ms": std,
-        "iter0_ms":  it0,
-        "elapsed_s": (total_ms / 1000.0) if total_ms is not None else None,
-    }
+    m["elapsed_s"] = (total_ms / 1000.0) if total_ms is not None else None
+    return m
 
 
 def _parse_llmc(text):
@@ -162,7 +171,8 @@ def _parse_llmc(text):
     return {
         "avg_ms":    avg,
         "stddev_ms": std,
-        "iter0_ms":  runs[0] if runs else None,
+        "iter0_ms":  runs[0] if len(runs) > 0 else None,   # record
+        "iter1_ms":  runs[1] if len(runs) > 1 else None,   # build + 1st replay
         "elapsed_s": _grab(text, r"Took\s+" + _F + r"\s*s"),
     }
 

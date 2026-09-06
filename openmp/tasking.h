@@ -226,6 +226,44 @@
 # define TASKWAIT TG_PRAGMA(omp taskwait)
 #endif
 
+/* ----------------------------------------------------------------------------
+ * How a TASKGRAPH_LOOP epilogue may observe the instance it follows.
+ *
+ * TASKGRAPH_INSTANCE_DRAINED is nonzero when the instance is provably COMPLETE
+ * by the time the epilogue runs: xkomp's record pass ends with an implicit
+ * taskwait (xkomp_taskgraph_end -> task_dependency_graph_record_stop) and its
+ * replay is submitted with COMMAND_FLAG_SYNCHRONOUS, so xkomp_taskgraph_begin /
+ * _end returning means the instance has finished; USE_SYNC blocks per kernel.
+ *
+ * The epilogue can then take its timestamp INLINE -- exactly. Otherwise the
+ * instance is still in flight and the timestamp must ride a depend-synchronized
+ * host task, which must NOT block or the no-taskgraph configuration loses the
+ * cross-iteration pipelining it exists to demonstrate.
+ *
+ * This is not cosmetic. A host task spawned after a drained instance is ready
+ * immediately, but the encountering thread goes straight into the next
+ * instance's synchronous replay, so the task can execute *during* it -- pushing
+ * its timestamp late. The steady-state mean telescopes and is immune, but the
+ * record and first-replay figures are single differences: they would absorb the
+ * slip, and those are exactly the two the timing report calls out (instance 0 =
+ * record, instance 1 = command-graph build + optimize + first replay).
+ *
+ *   EPILOGUE_TASK(clauses)  the host task, or nothing when the block may run
+ *                           inline (the block itself is written once either way)
+ *   EPILOGUE_NOWAIT         `nowait` on an epilogue read-back, or nothing when
+ *                           drained -- an inline reader must not race an
+ *                           in-flight async D2H (e.g. the -p residual).
+ * ------------------------------------------------------------------------- */
+#define TASKGRAPH_INSTANCE_DRAINED (USE_SYNC || (USE_TASKGRAPH && !USE_OMPSS))
+
+#if TASKGRAPH_INSTANCE_DRAINED
+# define EPILOGUE_TASK(...)                 /* nothing: the block runs inline */
+# define EPILOGUE_NOWAIT                    /* blocking: already drained */
+#else
+# define EPILOGUE_TASK(...) OMP_HOST_TASK(__VA_ARGS__)
+# define EPILOGUE_NOWAIT    NOWAIT
+#endif
+
 /* ---- Dependency-clause abstraction ----
  *   OpenMP (USE_OMPSS == 0):
  *     DEPEND(in, a[x:y], b)           -> depend(in: a[x:y], b)
@@ -379,9 +417,14 @@
 /* Dispatch for TASKGRAPH_LOOP. Every configuration groups `unroll` iterations
  * per "instance" and calls the epilogue once per group, so the iteration count,
  * the task order and the epilogue cadence are identical everywhere -- only who
- * records the group changes. That is what makes -u inert (rather than merely
- * harmless) in the configurations without a taskgraph, and what lets an app size
- * its per-instance arrays the same way whatever it is built with. */
+ * records the group changes. That is what lets an app size its per-instance
+ * arrays the same way whatever it is built with, and what keeps the reported
+ * numbers comparable across -u.
+ *
+ * It does NOT make -u a no-op where there is no taskgraph: the epilogue, and so
+ * the timing/progress task, fires once per `unroll` iterations rather than once
+ * per iteration. That is a small real effect (measured ~1.7% on LULESH s=100,
+ * nb=8), not a barrier being amortized -- there is no barrier to amortize there. */
 template <typename Cond, typename Epilogue, typename Body>
 static inline size_t
 tasking_taskgraph_loop(size_t unroll, Cond cond, Epilogue epilogue, Body body)

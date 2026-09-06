@@ -56,7 +56,7 @@ CSV_FIELDS = [
     "run_id", "timestamp", "machine",
     "app", "variant", "config", "opt", "build_vars", "backend",
     "size", "work", "work_label", "iters", "unroll", "grain",
-    "avg_ms", "stddev_ms", "iter0_ms", "elapsed_s", "fom", "flops", "gflops",
+    "avg_ms", "stddev_ms", "iter0_ms", "iter1_ms", "elapsed_s", "fom", "flops", "gflops",
     "residual", "error",
     "returncode", "status", "cmd",
 ]
@@ -198,6 +198,8 @@ def main():
     ts_run = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
     new_file = not runs_csv.exists() or runs_csv.stat().st_size == 0
+    if not args.dry_run and not new_file:
+        _check_csv_header(runs_csv, ap)
     fh = None if args.dry_run else open(runs_csv, "a", newline="")
     writer = None
     if fh:
@@ -250,10 +252,11 @@ def main():
         for variant in variants:
             for cfg in configs:
                 # Only a taskgraph has the per-instance barrier that unrolling
-                # amortizes; everywhere else the apps group iterations identically
-                # whatever the unroll, so one pass at the first value is the whole
-                # story (and the reference the taskgraph rows are compared to).
-                cfg_unrolls = unrolls if cfg.taskgraph else unrolls[:1]
+                # amortizes. The other configurations are the reference the
+                # taskgraph rows are compared against, so they run once, at
+                # unroll 1 -- pinned rather than taking unrolls[0], so that
+                # `--unroll 2,4` cannot label the baseline series "no-taskgraph u2".
+                cfg_unrolls = unrolls if cfg.taskgraph else [1]
                 # product() materializes its arguments, so the one-shot zip is safe
                 for unroll, (size, grain) in itertools.product(cfg_unrolls,
                                                                zip(sizes, grains)):
@@ -352,6 +355,33 @@ def main():
             print(f"cgstats  -> {stats_csv}", file=sys.stderr)
             print(f"jitstats -> {jit_csv}", file=sys.stderr)
     return 0 if n_fail == 0 else 1
+
+
+def _check_csv_header(path, ap):
+    """Refuse to append rows that do not match an existing runs.csv header.
+
+    The header is only written for a NEW file, so appending after CSV_FIELDS has
+    changed would silently write rows of a different width than the header they
+    live under -- and csv.DictReader maps by position, so every column after the
+    first difference would be misread, for the old rows and the new ones alike.
+    Corrupting a results file that way is much worse than refusing to write."""
+    try:
+        with open(path, newline="") as fh:
+            header = next(csv.reader(fh), None)
+    except OSError as e:
+        ap.error(f"cannot read {path}: {e}")
+    if header is None or header == CSV_FIELDS:
+        return
+    added   = [c for c in CSV_FIELDS if c not in header]
+    removed = [c for c in header if c not in CSV_FIELDS]
+    detail  = ", ".join(filter(None, [
+        f"added {added}" if added else "",
+        f"removed {removed}" if removed else "",
+        "same columns, different order" if not added and not removed else "",
+    ]))
+    ap.error(f"{path} has a stale header ({detail}). Appending would misalign "
+             f"every column after the change. Move it aside (e.g. `mv {path} "
+             f"{path}.bak`) and rerun, or pass --out to write elsewhere.")
 
 
 def _parse_opts(arg):

@@ -52,7 +52,7 @@ import math
 import re
 import sys
 import zlib
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 
 APPS_OPENMP = Path(__file__).resolve().parent.parent
@@ -327,6 +327,74 @@ def select_evaluated(rows):
         print(f"  {name} is no longer in the app registry: {n} row(s) omitted",
               file=sys.stderr)
     return kept
+
+
+def aggregate_repeats(rows):
+    """Reduce the repeats of a configuration (evaluate.py --repeat) to one row.
+
+    A repeat is a whole separate process, so it re-measures everything a single
+    run holds fixed by accident: JIT output, page cache, clock and power state.
+    That is the variance that matters on short problems -- LULESH at n=16 moved
+    26% between repeats of a pass that provably changes nothing -- and a run's
+    own `stddev_ms`, taken across the instances inside one process, cannot see
+    any of it.
+
+    The survivor carries the MEDIAN `avg_ms`, not the mean: repeats are a small
+    sample and their outliers are one-sided (a process can be slowed by the
+    machine, never sped up by it), so one bad repeat would drag a mean but not a
+    median. `lo_ms`/`hi_ms` keep the extremes for the error bars and `nrep`
+    records how many runs are behind the number.
+
+    Rows are keyed on everything that defines a measurement, so anything that
+    is not the same experiment stays separate. Runs with no repeat column (any
+    CSV written before --repeat existed) key on their own run_id and so pass
+    through untouched, as nrep=1."""
+    groups = OrderedDict()
+    for r in rows:
+        if r.get("rep", "") == "":
+            key = ("__single__", r.get("run_id", id(r)))
+        else:
+            key = (r.get("app", ""), r.get("variant", ""), r.get("config", ""),
+                   r.get("opt", ""), r.get("backend", ""), r.get("size", ""),
+                   r.get("unroll", ""), r.get("grain", ""), r.get("iters", ""),
+                   r.get("tag", ""), r.get("env", ""))
+        groups.setdefault(key, []).append(r)
+
+    out, nrep_seen = [], defaultdict(int)
+    for key, grp in groups.items():
+        times = sorted(t for t in (fnum(g.get("avg_ms")) for g in grp)
+                       if t is not None and t > 0)
+        if not times:
+            out.append(dict(grp[0], nrep="0")
+                       if len(grp) == 1 else dict(grp[0], nrep=str(len(grp))))
+            continue
+        # Keep the repeat whose time is the median, so every other column
+        # (answer, residual, fom, run_id) stays consistent with the time
+        # reported next to it rather than being blended across processes.
+        med = times[len(times) // 2]
+        rep = min(grp, key=lambda g: abs((fnum(g.get("avg_ms")) or 1e30) - med))
+        out.append(dict(rep, avg_ms=f"{med:.6g}",
+                        lo_ms=f"{times[0]:.6g}", hi_ms=f"{times[-1]:.6g}",
+                        nrep=str(len(times)),
+                        # cgstats/jitstats join on run_id, so the survivor has to
+                        # carry its siblings' ids for the cost table to reduce
+                        # the per-pass times over the same runs as the replay.
+                        rep_run_ids=" ".join(g.get("run_id", "") for g in grp)))
+        nrep_seen[len(times)] += 1
+
+    if nrep_seen and set(nrep_seen) != {1}:
+        counts = ", ".join(f"{n} repeat(s) x{c}" for n, c in sorted(nrep_seen.items()))
+        print(f"  repeats collapsed to medians: {counts}", file=sys.stderr)
+        # A configuration measured fewer times than the rest is a single sample
+        # wearing the same error bar as the others; say which, rather than let
+        # it look equally well measured.
+        most = max(nrep_seen, key=lambda n: nrep_seen[n])
+        thin = sorted({n for n in nrep_seen if n < most})
+        if thin:
+            print(f"  WARNING: some configurations have only {thin} repeat(s) "
+                  f"where most have {most}: their spread is not comparable",
+                  file=sys.stderr)
+    return out
 
 
 def report_answers(rows, reference):
@@ -778,8 +846,14 @@ def _panel_series(grp, xkey):
 
     `xkey` is "size" or "variant": which of the two the panel varies. Whichever
     it is NOT must be constant within the panel; the caller guarantees that by
-    filtering, so a leftover duplicate (a re-run) simply takes the last value."""
-    data = defaultdict(dict)
+    filtering, so a leftover duplicate (a re-run) simply takes the last value.
+
+    Also returns the repeat extremes as {config: {x: (lo, hi)}}, from the
+    lo_ms/hi_ms that aggregate_repeats() left on the row. A row measured once
+    has no spread, so it reports its own value for both -- an interval of zero
+    width, which is the truthful statement that nothing is known about how much
+    it would move on a second run."""
+    data, spread = defaultdict(dict), defaultdict(dict)
     order = []
     for r in grp:
         v = fnum(r.get("avg_ms"))
@@ -787,9 +861,41 @@ def _panel_series(grp, xkey):
             continue
         x = int(r["size"]) if xkey == "size" else (r.get("variant") or "")
         data[r["config"]][x] = v
+        spread[r["config"]][x] = (fnum(r.get("lo_ms")) or v, fnum(r.get("hi_ms")) or v)
         if x not in order:
             order.append(x)
-    return data, sorted(order, key=lambda x: (isinstance(x, str), x))
+    return data, sorted(order, key=lambda x: (isinstance(x, str), x)), spread
+
+
+def _speedup_err(heights, xs, cfg, data, spread, ref, ref_spread):
+    """Asymmetric yerr for a row of speedup bars, or None if nothing varied.
+
+    A speedup is a ratio of two measured times, so its uncertainty comes from
+    both: the widest ratio consistent with the repeats is the fastest baseline
+    over the slowest pipeline run, and the narrowest is the reverse. Taking the
+    extremes of both is deliberately conservative -- it is the range of
+    speedups you could have reported by pairing any baseline repeat with any
+    pipeline repeat, so a bar whose interval clears 1.0 clears it under every
+    pairing, not just the flattering one.
+
+    Returns None when every interval has zero width (no repeats anywhere), so a
+    single-sample figure draws no bars rather than a row of degenerate ticks
+    implying a precision that was never measured."""
+    lo_err, hi_err, any_spread = [], [], False
+    for h, x in zip(heights, xs):
+        if h != h or x not in data.get(cfg, {}) or x not in ref:
+            lo_err.append(0.0); hi_err.append(0.0)
+            continue
+        t_lo, t_hi = spread.get(cfg, {}).get(x, (data[cfg][x], data[cfg][x]))
+        r_lo, r_hi = ref_spread.get(x, (ref[x], ref[x]))
+        s_lo, s_hi = r_lo / t_hi, r_hi / t_lo
+        if t_hi > t_lo or r_hi > r_lo:
+            any_spread = True
+        # Clamp: the median ratio need not sit inside the corner-to-corner
+        # range, and a negative yerr would draw the bar inside out.
+        lo_err.append(max(h - s_lo, 0.0))
+        hi_err.append(max(s_hi - h, 0.0))
+    return [lo_err, hi_err] if any_spread else None
 
 
 EXTERNAL_LEGEND = "hand-written CUDA"
@@ -904,9 +1010,11 @@ def plot_paper_speedup(rows, figdir, dpi, fmt, show, styles, baseline,
     handles = {}
 
     for ax, (app, title, xkey, grp) in zip(axes, panels):
-        data, xs = _panel_series(grp, xkey)
+        data, xs, spread = _panel_series(grp, xkey)
         ref = next((v for c, v in data.items()
                     if canon_pipeline(c) == canon_pipeline(baseline)), None)
+        ref_spread = next((v for c, v in spread.items()
+                           if canon_pipeline(c) == canon_pipeline(baseline)), {})
         if not ref:
             ax.set_title(f"{title}\n(no '{baseline}')")
             print(f"  WARNING: {app}: no '{baseline}' run -> panel left empty",
@@ -929,6 +1037,7 @@ def plot_paper_speedup(rows, figdir, dpi, fmt, show, styles, baseline,
                 if canon_pipeline(c) != canon_pipeline(baseline) and c not in MARKERS]
         width = 0.8 / max(len(bars), 1)
         idx = list(range(len(xs)))
+        whisker_top = 0.0
         for i, c in enumerate(bars):
             h = [(ref[x] / data[c][x]) if (x in data[c] and x in ref) else float("nan")
                  for x in xs]
@@ -936,6 +1045,12 @@ def plot_paper_speedup(rows, figdir, dpi, fmt, show, styles, baseline,
             b = ax.bar(offs, h, width, label=paper_label(c),
                        **styles[canon_config(c)], **BAR_EDGE)
             handles.setdefault(paper_label(c), b)
+            err = _speedup_err(h, xs, c, data, spread, ref, ref_spread)
+            if err is not None:
+                ax.errorbar(offs, h, yerr=err, fmt="none", ecolor="black",
+                            elinewidth=0.8, capsize=1.8, capthick=0.8, zorder=5)
+                whisker_top = max([whisker_top]
+                                  + [y + e for y, e in zip(h, err[1]) if y == y])
 
         # References as markers, at the group centre.
         for c, kw in MARKERS.items():
@@ -954,7 +1069,10 @@ def plot_paper_speedup(rows, figdir, dpi, fmt, show, styles, baseline,
         # Freeze the y range on them (and on the markers already drawn). An
         # external implementation far outside it would flatten every bar in the
         # panel, so it is clipped -- and named, so the clipping is never silent.
-        top = max(ax.get_ylim()[1], (max(finite) if finite else 0.0) * 1.15, 1.2)
+        # Whiskers included: a clipped one reads as a shorter one, i.e. as more
+        # certainty than was measured.
+        top = max(ax.get_ylim()[1], (max(finite) if finite else 0.0) * 1.15,
+                  whisker_top * 1.05, 1.2)
         ax.set_ylim(0, top)
 
         # The hand-written CUDA implementation of this app, where there is one.
@@ -1001,6 +1119,141 @@ def plot_paper_speedup(rows, figdir, dpi, fmt, show, styles, baseline,
                bbox_to_anchor=(0.5, 0.0), ncol=min(len(handles), 4), frameon=False)
     fig.tight_layout()
     _save(fig, figdir, "paper-speedup", dpi, fmt, show)
+
+
+def plot_paper_unroll(rows, figdir, dpi, fmt, show, styles, baseline,
+                      apps_order, tag=None, figsize=None):
+    """Speedup against `baseline` as a function of the unroll, one panel per app.
+
+    A taskgraph instance ends in a taskwait: every task it recorded must finish
+    before the next instance starts. The un-recorded program has no such point
+    and lets consecutive iterations overlap, so record/replay begins one barrier
+    per iteration behind it, and on an app whose iteration does not by itself
+    fill the device that deficit is larger than anything the passes recover.
+    Unrolling folds `u` iterations into one instance, which pays the barrier
+    once per `u` instead of once per iteration.
+
+    This is the figure that says whether a command graph is worth recording at
+    all for a given app: where the curve crosses 1.0 is the unroll at which the
+    graph stops costing more synchronization than it saves.
+
+    The baseline runs no taskgraph, so it has no unroll to vary (evaluate.py
+    pins it to u=1) -- it is the same horizontal reference at every x."""
+    import matplotlib.pyplot as plt
+
+    def run_unroll(r):
+        try:
+            return int(r.get("unroll") or 1)
+        except ValueError:
+            return 1
+
+    # One sweep only. The unroll sweep is usually tagged so it does not merge
+    # with the main one, and mixing them here would put two measurements of the
+    # same unroll on the same curve -- the second silently replacing the first.
+    if tag is not None:
+        rows = [r for r in rows if (r.get("tag") or "") == tag]
+        if not rows:
+            print(f"  no runs tagged '{tag or '(untagged)'}': skipping the "
+                  f"unroll figure", file=sys.stderr)
+            return
+    else:
+        tags = {(r.get("tag") or "") for r in rows}
+        if len(tags) > 1:
+            print(f"  WARNING: unroll figure spans {len(tags)} sweeps "
+                  f"({', '.join(sorted(t or '(untagged)' for t in tags))}): two "
+                  f"runs at the same unroll will collide. Pass --unroll-tag",
+                  file=sys.stderr)
+
+    panels = []
+    for app in apps_order:
+        grp = [r for r in rows if r["app"] == app and fnum(r.get("avg_ms"))]
+        # One variant per panel: two solvers' curves overlaid in one axes would
+        # read as one app measured twice.
+        variants = sorted({r.get("variant", "") for r in grp})
+        if len(variants) > 1:
+            grp = [r for r in grp if r.get("variant", "") == variants[0]]
+        # And one size: the crossing point moves with problem size, so mixing
+        # sizes into a single curve would average two different answers.
+        sizes = sorted({int(r["size"]) for r in grp if r.get("size", "")})
+        if not sizes:
+            continue
+        grp = [r for r in grp if int(r["size"]) == sizes[-1]]
+        if len({run_unroll(r) for r in grp}) < 2:
+            continue                      # nothing to say about unroll here
+        panels.append((app, variants[0], sizes[-1], grp))
+
+    if not panels:
+        print("  (no app has more than one unroll: skipping the unroll figure. "
+              "Run evaluate.py --unroll 1,2,4,8,16)", file=sys.stderr)
+        return
+
+    try:
+        from appspecs import APPS
+    except ImportError:
+        APPS = {}
+
+    fig, axes = plt.subplots(1, len(panels),
+                             figsize=(figsize or (2.9 * len(panels), 2.9)),
+                             squeeze=False)
+    axes = axes[0]
+    handles = {}
+
+    for ax, (app, variant, size, grp) in zip(axes, panels):
+        # {pipeline: {unroll: (median, lo, hi)}}, the unroll taken from the
+        # column rather than the label suffix load_runs() added.
+        series = defaultdict(dict)
+        ref = None
+        for r in grp:
+            pipe = canon_pipeline(_UNROLL_SUFFIX.sub("", r["config"]))
+            v = fnum(r.get("avg_ms"))
+            lo, hi = fnum(r.get("lo_ms")) or v, fnum(r.get("hi_ms")) or v
+            if pipe == canon_pipeline(baseline):
+                ref = (v, lo, hi)
+                continue
+            # The other references (synchronous, ...) run no taskgraph either, so
+            # they have no unroll to vary: evaluate.py pins them to u=1 and a
+            # "curve" through their single point would suggest they were measured
+            # across the axis and found flat.
+            if pipe in MARKERS:
+                continue
+            series[pipe][run_unroll(r)] = (v, lo, hi)
+        if ref is None:
+            ax.set_title(f"{app}\n(no '{baseline}')")
+            print(f"  WARNING: {app}: no '{baseline}' run -> unroll panel empty",
+                  file=sys.stderr)
+            continue
+
+        for pipe, by_u in series.items():
+            us = sorted(by_u)
+            ys = [ref[0] / by_u[u][0] for u in us]
+            # Same corner-to-corner interval as the bar figure.
+            err = [[max(y - ref[1] / by_u[u][2], 0.0) for y, u in zip(ys, us)],
+                   [max(ref[2] / by_u[u][1] - y, 0.0) for y, u in zip(ys, us)]]
+            st = styles[canon_config(pipe)]
+            ln = ax.errorbar(us, ys, yerr=(err if any(any(e) for e in err) else None),
+                             marker="o", ms=4, lw=1.4, capsize=2,
+                             color=st["color"], label=paper_label(pipe))
+            handles.setdefault(paper_label(pipe), ln)
+
+        ax.axhline(1.0, color="black", lw=0.8, ls="--", zorder=1)
+        ax.set_xscale("log", base=2)
+        all_u = sorted({u for by_u in series.values() for u in by_u})
+        ax.set_xticks(all_u)
+        ax.set_xticklabels([str(u) for u in all_u])
+        ax.minorticks_off()
+        ax.set_xlabel("iterations per taskgraph instance")
+        spec = APPS.get(app)
+        pretty = (getattr(spec, "pretty", None) or app)
+        sub = f"{variant} " if variant else ""
+        ax.set_title(f"{pretty} ({sub}n={size})")
+        ax.grid(ls=":", alpha=0.6)
+        ax.set_axisbelow(True)
+
+    axes[0].set_ylabel(f"speedup over\n{baseline}")
+    fig.legend(handles.values(), handles.keys(), loc="upper center",
+               bbox_to_anchor=(0.5, 0.0), ncol=min(len(handles), 4), frameon=False)
+    fig.tight_layout()
+    _save(fig, figdir, "paper-unroll", dpi, fmt, show)
 
 
 def _cg_by_tag(cgstats_path):
@@ -1077,15 +1330,29 @@ def _cost_rows(rows, cgstats_path, jitstats_path, baseline, baseline_tag,
             continue
         if (r.get("tag") or "") != tag:
             continue
-        passes = cg.get(r["run_id"], {})
-        if not passes:
+        # Every repeat of this configuration that cgstats knows about. Optimizing
+        # is measured per run like replaying is, so a single run's pass times are
+        # a single sample of it too.
+        ids = [i for i in (r.get("rep_run_ids") or r["run_id"]).split() if i in cg]
+        if not ids:
             continue
+        passes = cg.get(r["run_id"]) or cg[ids[0]]
+
+        def pass_ms(name):
+            """Median of `name` over the repeats, or None if none recorded it."""
+            vs = sorted(v for v in (fnum(cg[i][name].get("pass_ms"))
+                                    for i in ids if name in cg[i]) if v is not None)
+            return vs[len(vs) // 2] if vs else None
 
         per = {}
         for label, names in COST_PASSES:
-            ms = [fnum(passes[n].get("pass_ms")) for n in names if n in passes]
+            ms = [pass_ms(n) for n in names]
             per[label] = sum(v for v in ms if v is not None)
-        total = sum(fnum(p.get("pass_ms")) or 0.0 for p in passes.values())
+        # Summed from the same medians as the columns, so the total is the total
+        # of what the table shows rather than a separately-medianed number the
+        # columns do not add up to.
+        all_names = {n for i in ids for n in cg[i]}
+        total = sum(v for v in (pass_ms(n) for n in sorted(all_names)) if v is not None)
 
         t_new = fnum(r.get("avg_ms"))
         t_ref = base.get(key(r))
@@ -1301,6 +1568,19 @@ def main():
                     help="also render the paper figure (paper-speedup.<fmt>): one panel "
                     "per app, speedup over --baseline, the pipeline as bars and the "
                     "references as markers")
+    ap.add_argument("--paper-unroll-figure", action="store_true",
+                    help="also render paper-unroll.<fmt>: speedup over --baseline "
+                    "against the number of iterations folded into one taskgraph "
+                    "instance. A taskgraph instance ends in a taskwait while the "
+                    "un-recorded program overlaps iterations freely, so this is "
+                    "where the curve crosses 1.0 that says whether recording a "
+                    "graph pays for that barrier. Needs evaluate.py --unroll with "
+                    "more than one value")
+    ap.add_argument("--unroll-tag", default=None, metavar="TAG",
+                    help="runs.csv `tag` the unroll figure reads, to keep it to the "
+                    "one sweep that varied the unroll (\"\" selects the untagged "
+                    "main sweep). Without it the figure spans every sweep and two "
+                    "runs at the same unroll collide")
     ap.add_argument("--baseline", default="no-taskgraph",
                     help="configuration the paper figure and the break-even column "
                     "normalize against (default: no-taskgraph)")
@@ -1370,6 +1650,11 @@ def main():
         if not rows:
             ap.error("every run was rejected by the answer check")
 
+    # After the answer check (a rejected repeat must not enter a median) and
+    # before anything reads a time, so the figures and both tables see exactly
+    # one row per configuration and need no notion of repeats themselves.
+    rows = aggregate_repeats(rows)
+
     if args.reference:
         report_speedups(rows, args.reference)
 
@@ -1424,6 +1709,11 @@ def main():
                            args.baseline, external, args.panel_size,
                            [a.strip() for a in args.apps.split(",") if a.strip()],
                            figsize, args.paper_unroll or None)
+    if args.paper_unroll_figure and not args.no_figures:
+        plot_paper_unroll(rows, figdir, args.dpi, args.format, args.show, styles,
+                          args.baseline,
+                          [a.strip() for a in args.apps.split(",") if a.strip()],
+                          args.unroll_tag)
     if cgstats_csv.exists():
         plot_graph_stats(rows, cgstats_csv, figdir, args.dpi, args.format, args.show)
     else:

@@ -72,7 +72,12 @@ table; see below.
 
 ## Reproducing the paper's evaluation
 
-Two artifacts, five sweeps. `$OPTS` is the incremental pipeline (the default of
+`results/sweep1-single/` holds the earlier single-run sweep, kept because it is
+what the pre-`--repeat` numbers came from and it still replots with
+`--outdir results/sweep1-single`. It is not the paper's data: one run per
+configuration cannot separate a pass from the machine (see `--repeat` below).
+
+Three artifacts, five sweeps. `$OPTS` is the incremental pipeline (the default of
 `appspecs.py`, spelled out here so a sweep is self-describing):
 
 ```sh
@@ -98,8 +103,19 @@ SZ='krylov=64;lulesh=16,60,100;mnmg=7035,23874'
 IT='krylov=200;lulesh=208'
 GR='krylov=4:4;lulesh=1,4,8'
 ./scripts/evaluate.py --target gpu --apps krylov,lulesh,mnmg \
-    --opts "$OPTS" --unroll 1,8 --sizes "$SZ" --iters "$IT" --grain "$GR"
+    --opts "$OPTS" --unroll 1,8 --sizes "$SZ" --iters "$IT" --grain "$GR" \
+    --repeat 5
 ```
+
+`--repeat 5` is not optional. A run's own `stddev_ms` is taken over the instances
+*inside* one process, so it cannot see what changes between processes -- the code
+the JIT emitted, the page cache, the clock and power state. On the smaller
+problems that is the larger variance by far: with one run per configuration,
+`prog-fuse` appeared to cost 26% on LULESH at `n=16` while the pass provably did
+nothing at all (node count 442 -> 442, zero chains fused). Repeats are what tell
+a pass apart from the machine; `plot.py` reduces them to a median and draws the
+extremes as whiskers. Repeats are interleaved, not consecutive, so machine drift
+is spread across configurations instead of landing on one.
 
 `--grain` is what makes these graphs parallel -- four tasks per Krylov vector
 operation, and a task count per LULESH size. It also removes every fusible chain,
@@ -119,14 +135,30 @@ instances 0 and 1 are the record and the build, so a short run has a
 steady-state mean over two or three samples. A clean dry-run prints no such
 warning.
 
-**2. `taskgraphloop` control** -- same iteration count and epilogue cadence, one
-recorded instance per iteration. The difference against sweep 1 is the gain that
-comes from cross-iteration overlap rather than from fewer instances.
+**2. The unroll sweep** -- `figures/paper-unroll.pdf`, the figure behind
+§5.2's instance-barrier paragraph. A taskgraph instance ends in a taskwait, so
+consecutive instances cannot overlap while `no-taskgraph` overlaps iterations
+freely; unrolling pays that barrier once per group instead of once per iteration.
+The curve's crossing of 1.0 is what says whether recording a graph pays for
+itself on a given app -- LULESH is *slower* than `no-taskgraph` until several
+iterations share an instance.
 
 ```sh
-./scripts/evaluate.py --target gpu --apps lulesh,krylov --variants cg \
-    --opts "$OPTS" --unroll 1,8 --no-taskgraphloop --tag no-tgl
+./scripts/evaluate.py --target gpu --apps lulesh,krylov,mnmg --variants cg \
+    --opts "$OPTS" --unroll 1,2,4,8,16 --iters "$IT" --repeat 5 --tag unroll \
+    --sizes 'krylov=64;lulesh=100;mnmg=23874' --grain 'krylov=4:4;lulesh=8'
 ```
+
+One size per app, the largest: the crossing point moves with problem size, so a
+curve may only carry one, and the figure pins each panel to the largest size it
+finds. Sweeping `$SZ` here instead would measure 405 extra runs and discard them.
+
+Then `./scripts/plot.py --paper-unroll-figure --unroll-tag unroll`. The tag is
+what keeps the figure to this sweep: sweep 1 also ran `u=1` and `u=8`, and
+without it both would land on the same curve with the second silently replacing
+the first. No `--omit` either -- the sweep needs its own `no-taskgraph`
+reference, which the harness pins to `u=1` by itself (it records no graph, so it
+has no unroll to vary).
 
 **3. The on-disk JIT cache** -- the cost table's `cached` break-even column.
 
@@ -199,13 +231,22 @@ EOF
 
 ```sh
 ./scripts/plot.py --paper --latex-tables ../../paper/sections \
-                  --pipeline 'taskgraph:reduce-node,transitive-reduction,jit,prog-fuse,sequence,batch'
+                  --pipeline 'taskgraph:reduce-node,transitive-reduction,jit,prog-fuse,sequence,batch' \
+                  --baseline-tag '' --cached-tag jit-disk-warm
+./scripts/plot.py --paper-unroll-figure --unroll-tag unroll
 ```
 
-That writes `figures/paper-speedup.pdf` (copy it to `paper/figures/eval-speedup.pdf`)
-and the section's two tables: `generated-table-graph.tex` (what the passes do to
-the graph) and `generated-table-cost.tex` (what they cost, and the replays that
-repay it). `--pipeline` must name the pipeline actually swept.
+That writes `figures/paper-speedup.pdf` (copy it to `paper/figures/eval-speedup.pdf`),
+`figures/paper-unroll.pdf` (-> `paper/figures/eval-unroll.pdf`) and the section's
+two tables: `generated-table-graph.tex` (what the passes do to the graph) and
+`generated-table-cost.tex` (what they cost, and the replays that repay it).
+`--pipeline` must name the pipeline actually swept.
+
+Bars are medians over `--repeat` runs and whiskers span the extreme ratios --
+fastest baseline over slowest replay, and the reverse -- so a bar clears 1.0
+only if it does so under every pairing of the runs behind it. A configuration
+measured fewer times than the rest is reported, because its whisker is not
+comparable to the others'.
 
 The baseline of both the figure and the break-even column is `no-taskgraph`
 (`--baseline`), so the two artifacts always tell the same story.

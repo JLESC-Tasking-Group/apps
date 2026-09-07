@@ -58,7 +58,7 @@ DEFAULT_ENV = {
 CSV_FIELDS = [
     "run_id", "timestamp", "machine", "tag",
     "app", "variant", "config", "opt", "build_vars", "backend", "env",
-    "size", "work", "work_label", "iters", "unroll", "grain",
+    "size", "work", "work_label", "iters", "unroll", "grain", "rep",
     "avg_ms", "stddev_ms", "iter0_ms", "iter1_ms", "elapsed_s", "fom", "flops", "gflops",
     "residual", "error", "answer", "verdict",
     "returncode", "status", "cmd",
@@ -188,6 +188,14 @@ def main():
                     "-- which is how the JIT cache regimes are swept, e.g. "
                     "--env CGIR_JIT_CACHE=0 (cold) or --env CGIR_JIT_CACHE_DIR=/tmp/jitc "
                     "(persistent). Recorded in the `env` column of runs.csv.")
+    ap.add_argument("--repeat", type=int, default=1, metavar="N",
+                    help="run the whole sweep N times, writing one row per run. "
+                    "A run's own stddev spans the instances INSIDE one process, so "
+                    "it cannot see what varies between processes -- JIT output, "
+                    "page cache, clock and power state. That variance is the larger "
+                    "one on short-running problems, so a single run cannot say "
+                    "whether two configurations differ. Repeats measure it; plot.py "
+                    "reduces them to a median and min-max whiskers. Use >= 5")
     ap.add_argument("--omit", default="", metavar="LIST",
                     help="comma list of reference configurations NOT to run, from "
                     + ", ".join(REFERENCE_CONFIGS) + ". None of them runs a CGIR pass, "
@@ -255,6 +263,8 @@ def main():
     for a in grain_by_app:
         if a not in APPS:
             ap.error(f"unknown app '{a}' in --grain (known: {', '.join(APPS)})")
+    if args.repeat < 1:
+        ap.error(f"--repeat: {args.repeat} is not a positive run count")
     omit = [o.strip() for o in args.omit.split(",") if o.strip()]
     for o in omit:
         if o not in REFERENCE_CONFIGS:
@@ -329,176 +339,189 @@ def main():
         built[key] = ok
         return ok
 
-    for app_name in selected:
-        app = APPS[app_name]
-        # A variant-less app (variants == [""]) always runs; the --variants filter
-        # only applies to apps that expose real variants (e.g. krylov's solvers).
-        if app.variants == [""]:
-            variants = [""]
-        else:
-            variants = [v for v in app.variants if not variant_filter or v in variant_filter]
-        sizes = size_by_app.get(app_name) or size_default or app.sizes
-        iters = iters_by_app.get(app_name) or iters_default or app.iters
-        # One grain entry per size (None -> the app's own default granularity).
-        grains = _grain_for_sizes(app, grain_by_app.get(app_name) or grain_default,
-                                  sizes, app_name in grain_by_app, ap)
-        unrolls = unroll_by_app.get(app_name) or unroll_default or [1]
+    # Repeats are round-robin (every configuration once, then all of them
+    # again), not N consecutive runs of the same one. The machine drifts --
+    # clocks, power, page cache -- and consecutive repeats would turn that
+    # drift into a systematic per-configuration bias, which is exactly the
+    # error repeating is meant to expose. Interleaving spreads it over all of
+    # them instead.
+    for rep in range(1, args.repeat + 1):
+        if args.repeat > 1:
+            print(f"\n===== repeat {rep}/{args.repeat} =====", file=sys.stderr)
+        for app_name in selected:
+            app = APPS[app_name]
+            # A variant-less app (variants == [""]) always runs; the --variants filter
+            # only applies to apps that expose real variants (e.g. krylov's solvers).
+            if app.variants == [""]:
+                variants = [""]
+            else:
+                variants = [v for v in app.variants if not variant_filter or v in variant_filter]
+            sizes = size_by_app.get(app_name) or size_default or app.sizes
+            iters = iters_by_app.get(app_name) or iters_default or app.iters
+            # One grain entry per size (None -> the app's own default granularity).
+            grains = _grain_for_sizes(app, grain_by_app.get(app_name) or grain_default,
+                                      sizes, app_name in grain_by_app, ap)
+            unrolls = unroll_by_app.get(app_name) or unroll_default or [1]
 
-        for variant in variants:
-            for cfg in configs:
-                # Only a taskgraph has the per-instance barrier that unrolling
-                # amortizes. The other configurations are the reference the
-                # taskgraph rows are compared against, so they run once, at
-                # unroll 1 -- pinned rather than taking unrolls[0], so that
-                # `--unroll 2,4` cannot label the baseline series "no-taskgraph u2".
-                cfg_unrolls = unrolls if cfg.taskgraph else [1]
-                # Clamp to what the app accepts here, then de-duplicate: on a
-                # backend capped at 1, `--unroll 1,2,4` must run once, not thrice.
-                cfg_unrolls = ordered_unique(
-                    effective_unroll(app, args.target, variant, u) for u in cfg_unrolls)
-                # product() materializes its arguments, so the one-shot zip is safe
-                for unroll, (size, grain) in itertools.product(cfg_unrolls,
-                                                               zip(sizes, grains)):
-                    eff_iters = effective_iters(variant_iters(app, variant, iters),
-                                                unroll)
-                    ok = do_build(app, variant, cfg, size, eff_iters, grain, unroll)
-                    work, work_label = app.work(size)
-                    vtag = f"-{variant}" if variant else ""
-                    disp = f"{app_name}/{variant}" if variant else app_name
-                    # The tag is part of the id, not only of its own column: the
-                    # two CGIR side files join on run_id, so two sweeps that
-                    # differ only by --env (the JIT cache regimes) must not
-                    # collide there.
-                    tagpart = f"-{sanitize(args.tag)}" if args.tag else ""
-                    run_id = sanitize(f"{app_name}{vtag}-{args.target}-{cfg.label}"
-                                      f"-n{size}-u{unroll}{tagpart}-{ts_run}")
-                    argv = [app.binary(variant)] + list(
-                        app.run_args(variant, size, eff_iters, cfg, grain, unroll))
-                    workdir = APPS_OPENMP / app.directory
+            for variant in variants:
+                for cfg in configs:
+                    # Only a taskgraph has the per-instance barrier that unrolling
+                    # amortizes. The other configurations are the reference the
+                    # taskgraph rows are compared against, so they run once, at
+                    # unroll 1 -- pinned rather than taking unrolls[0], so that
+                    # `--unroll 2,4` cannot label the baseline series "no-taskgraph u2".
+                    cfg_unrolls = unrolls if cfg.taskgraph else [1]
+                    # Clamp to what the app accepts here, then de-duplicate: on a
+                    # backend capped at 1, `--unroll 1,2,4` must run once, not thrice.
+                    cfg_unrolls = ordered_unique(
+                        effective_unroll(app, args.target, variant, u) for u in cfg_unrolls)
+                    # product() materializes its arguments, so the one-shot zip is safe
+                    for unroll, (size, grain) in itertools.product(cfg_unrolls,
+                                                                   zip(sizes, grains)):
+                        eff_iters = effective_iters(variant_iters(app, variant, iters),
+                                                    unroll)
+                        ok = do_build(app, variant, cfg, size, eff_iters, grain, unroll)
+                        work, work_label = app.work(size)
+                        vtag = f"-{variant}" if variant else ""
+                        disp = f"{app_name}/{variant}" if variant else app_name
+                        # The tag is part of the id, not only of its own column: the
+                        # two CGIR side files join on run_id, so two sweeps that
+                        # differ only by --env (the JIT cache regimes) must not
+                        # collide there.
+                        tagpart = f"-{sanitize(args.tag)}" if args.tag else ""
+                        # ts_run is fixed for the sweep, so the repeat index is what
+                        # separates one repeat's id from the next -- and the CGIR side
+                        # files join on it, so they must not collide either.
+                        reppart = f"-r{rep}" if args.repeat > 1 else ""
+                        run_id = sanitize(f"{app_name}{vtag}-{args.target}-{cfg.label}"
+                                          f"-n{size}-u{unroll}{tagpart}{reppart}-{ts_run}")
+                        argv = [app.binary(variant)] + list(
+                            app.run_args(variant, size, eff_iters, cfg, grain, unroll))
+                        workdir = APPS_OPENMP / app.directory
 
-                    env = dict(os.environ)
-                    env.update(DEFAULT_ENV)
-                    env.update(backend.env)
-                    env["OMP_PLACES"] = args.places
-                    env["XKRT_DRIVERS"] = args.drivers
-                    if args.threads:
-                        env["OMP_NUM_THREADS"] = str(args.threads)
-                    if cfg.opt is not None:
-                        # Same pass names for every backend; only the variable the
-                        # runtime reads them from differs (see appspecs.Backend).
-                        env[backend.opt_env] = cfg.opt
-                    # CGIR stats: only taskgraph configs produce passes. cgstats
-                    # is per-pass command-graph stats; jitstats is the per-run JIT
-                    # compile breakdown + cache reuse (populated only for opts that
-                    # include the `jit` pass). Both join runs.csv on run_id == tag.
-                    if not args.no_stats and cfg.opt is not None:
-                        env["CGIR_STATS_CSV"] = str(stats_csv)
-                        env["CGIR_STATS_TAG"] = run_id
-                        env["CGIR_JIT_STATS_CSV"] = str(jit_csv)
-                    # Last, so a sweep can override anything above -- notably the
-                    # CGIR_JIT_CACHE* knobs whose regimes are the point of --env.
-                    env.update(extra_env)
+                        env = dict(os.environ)
+                        env.update(DEFAULT_ENV)
+                        env.update(backend.env)
+                        env["OMP_PLACES"] = args.places
+                        env["XKRT_DRIVERS"] = args.drivers
+                        if args.threads:
+                            env["OMP_NUM_THREADS"] = str(args.threads)
+                        if cfg.opt is not None:
+                            # Same pass names for every backend; only the variable the
+                            # runtime reads them from differs (see appspecs.Backend).
+                            env[backend.opt_env] = cfg.opt
+                        # CGIR stats: only taskgraph configs produce passes. cgstats
+                        # is per-pass command-graph stats; jitstats is the per-run JIT
+                        # compile breakdown + cache reuse (populated only for opts that
+                        # include the `jit` pass). Both join runs.csv on run_id == tag.
+                        if not args.no_stats and cfg.opt is not None:
+                            env["CGIR_STATS_CSV"] = str(stats_csv)
+                            env["CGIR_STATS_TAG"] = run_id
+                            env["CGIR_JIT_STATS_CSV"] = str(jit_csv)
+                        # Last, so a sweep can override anything above -- notably the
+                        # CGIR_JIT_CACHE* knobs whose regimes are the point of --env.
+                        env.update(extra_env)
 
-                    # The apps drop instance 0 (record) and 1 (build + first
-                    # replay) from the steady-state window, so a run with fewer
-                    # than three instances has no steady state at all and a few
-                    # more has a mean of two or three samples. Say so rather than
-                    # let a stddev over 2 points into the paper.
-                    ninst = (eff_iters // unroll) if (eff_iters and unroll) else 0
-                    if cfg.taskgraph and 0 < ninst < 5:
-                        print(f"      -> only {ninst} instances "
-                              f"({eff_iters} iters / u{unroll}): "
-                              f"{max(ninst - 2, 0)} steady-state samples",
+                        # The apps drop instance 0 (record) and 1 (build + first
+                        # replay) from the steady-state window, so a run with fewer
+                        # than three instances has no steady state at all and a few
+                        # more has a mean of two or three samples. Say so rather than
+                        # let a stddev over 2 points into the paper.
+                        ninst = (eff_iters // unroll) if (eff_iters and unroll) else 0
+                        if cfg.taskgraph and 0 < ninst < 5:
+                            print(f"      -> only {ninst} instances "
+                                  f"({eff_iters} iters / u{unroll}): "
+                                  f"{max(ninst - 2, 0)} steady-state samples",
+                                  file=sys.stderr)
+
+                        pretty = " ".join(argv)
+                        utag = f" u={unroll}" if unroll != 1 else ""
+                        print(f"[run ] {cfg.label:34s} {disp} n={size}{utag} : {pretty}",
                               file=sys.stderr)
 
-                    pretty = " ".join(argv)
-                    utag = f" u={unroll}" if unroll != 1 else ""
-                    print(f"[run ] {cfg.label:34s} {disp} n={size}{utag} : {pretty}",
-                          file=sys.stderr)
+                        row = {k: "" for k in CSV_FIELDS}
+                        row.update({
+                            "run_id": run_id,
+                            "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                            "machine": machine, "tag": args.tag,
+                            "app": app_name, "variant": variant,
+                            "config": cfg.label, "opt": ("" if cfg.opt is None else cfg.opt),
+                            "build_vars": " ".join(f"{k}={v}" for k, v in
+                                                   {**cfg.build, **backend_vars}.items()),
+                            "backend": args.target, "env": env_col, "size": size,
+                            "work": work, "work_label": work_label, "iters": eff_iters,
+                            "unroll": unroll, "rep": rep,
+                            "grain": (":".join(map(str, grain)) if grain else ""),
+                            "cmd": pretty,
+                        })
 
-                    row = {k: "" for k in CSV_FIELDS}
-                    row.update({
-                        "run_id": run_id,
-                        "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
-                        "machine": machine, "tag": args.tag,
-                        "app": app_name, "variant": variant,
-                        "config": cfg.label, "opt": ("" if cfg.opt is None else cfg.opt),
-                        "build_vars": " ".join(f"{k}={v}" for k, v in
-                                               {**cfg.build, **backend_vars}.items()),
-                        "backend": args.target, "env": env_col, "size": size,
-                        "work": work, "work_label": work_label, "iters": eff_iters,
-                        "unroll": unroll,
-                        "grain": (":".join(map(str, grain)) if grain else ""),
-                        "cmd": pretty,
-                    })
-
-                    if args.dry_run:
-                        continue
-                    if not ok:
-                        row["status"] = "build_fail"
-                        row["returncode"] = 1
-                        n_fail += 1
-                        fail_by_app[app_name] = fail_by_app.get(app_name, 0) + 1
-                        writer.writerow(row); fh.flush()
-                        continue
-
-                    try:
-                        p = subprocess.run(argv, cwd=str(workdir), env=env,
-                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                           text=True, timeout=(args.timeout or None))
-                        row["returncode"] = p.returncode
-                        row["status"] = "ok" if p.returncode == 0 else "run_fail"
-                        metrics = app.parse(p.stdout)
-                        for k, v in metrics.items():
-                            if v is not None:
-                                row[k] = v
-
-                        if p.returncode == 0:
-                            n_ok += 1
-                        elif metrics.get("avg_ms") is not None:
-                            # The run produced its complete result and then died,
-                            # typically in teardown. Keeping the numbers but
-                            # flagging the row beats throwing away a measurement
-                            # that is there -- and beats pretending it is clean.
-                            row["status"] = "ok_crashed_at_exit"
-                            n_ok += 1
-                            print(f"      -> completed, then exited with "
-                                  f"{p.returncode}: kept as ok_crashed_at_exit",
-                                  file=sys.stderr)
-                        else:
+                        if args.dry_run:
+                            continue
+                        if not ok:
+                            row["status"] = "build_fail"
+                            row["returncode"] = 1
                             n_fail += 1
                             fail_by_app[app_name] = fail_by_app.get(app_name, 0) + 1
-                            sys.stderr.write(p.stdout[-2000:] + "\n")
+                            writer.writerow(row); fh.flush()
+                            continue
 
-                        # The app's own verdict is authoritative and immediate: a
-                        # run that says it computed the wrong thing must never be
-                        # reported as a data point, however fast it was.
-                        if str(row.get("verdict", "")).lower() in ("fail", "failed"):
-                            row["status"] = "wrong_answer"
-                            print(f"      -> WRONG ANSWER: {app_name} reported "
-                                  f"verdict '{row['verdict']}'", file=sys.stderr)
+                        try:
+                            p = subprocess.run(argv, cwd=str(workdir), env=env,
+                                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                               text=True, timeout=(args.timeout or None))
+                            row["returncode"] = p.returncode
+                            row["status"] = "ok" if p.returncode == 0 else "run_fail"
+                            metrics = app.parse(p.stdout)
+                            for k, v in metrics.items():
+                                if v is not None:
+                                    row[k] = v
 
-                        # One line per run in the log, carrying what the run
-                        # computed and not only how fast. A sweep whose log shows
-                        # only timings cannot be audited afterwards -- which is
-                        # exactly the position a silently-corrupted campaign
-                        # leaves you in.
-                        summary = [f"{row['status']}"]
-                        if row.get("avg_ms") != "":
-                            summary.append(f"avg={row['avg_ms']} ms")
-                        if row.get("verdict") != "":
-                            summary.append(f"verdict={row['verdict']}")
-                        if row.get("answer") != "":
-                            summary.append(f"answer={row['answer']}")
-                        print("      -> " + "  ".join(summary), file=sys.stderr)
-                    except subprocess.TimeoutExpired:
-                        row["status"] = "timeout"
-                        row["returncode"] = -1
-                        n_fail += 1
-                        fail_by_app[app_name] = fail_by_app.get(app_name, 0) + 1
-                        print(f"      -> timeout after {args.timeout:.0f}s", file=sys.stderr)
+                            if p.returncode == 0:
+                                n_ok += 1
+                            elif metrics.get("avg_ms") is not None:
+                                # The run produced its complete result and then died,
+                                # typically in teardown. Keeping the numbers but
+                                # flagging the row beats throwing away a measurement
+                                # that is there -- and beats pretending it is clean.
+                                row["status"] = "ok_crashed_at_exit"
+                                n_ok += 1
+                                print(f"      -> completed, then exited with "
+                                      f"{p.returncode}: kept as ok_crashed_at_exit",
+                                      file=sys.stderr)
+                            else:
+                                n_fail += 1
+                                fail_by_app[app_name] = fail_by_app.get(app_name, 0) + 1
+                                sys.stderr.write(p.stdout[-2000:] + "\n")
 
-                    writer.writerow(row); fh.flush()
+                            # The app's own verdict is authoritative and immediate: a
+                            # run that says it computed the wrong thing must never be
+                            # reported as a data point, however fast it was.
+                            if str(row.get("verdict", "")).lower() in ("fail", "failed"):
+                                row["status"] = "wrong_answer"
+                                print(f"      -> WRONG ANSWER: {app_name} reported "
+                                      f"verdict '{row['verdict']}'", file=sys.stderr)
+
+                            # One line per run in the log, carrying what the run
+                            # computed and not only how fast. A sweep whose log shows
+                            # only timings cannot be audited afterwards -- which is
+                            # exactly the position a silently-corrupted campaign
+                            # leaves you in.
+                            summary = [f"{row['status']}"]
+                            if row.get("avg_ms") != "":
+                                summary.append(f"avg={row['avg_ms']} ms")
+                            if row.get("verdict") != "":
+                                summary.append(f"verdict={row['verdict']}")
+                            if row.get("answer") != "":
+                                summary.append(f"answer={row['answer']}")
+                            print("      -> " + "  ".join(summary), file=sys.stderr)
+                        except subprocess.TimeoutExpired:
+                            row["status"] = "timeout"
+                            row["returncode"] = -1
+                            n_fail += 1
+                            fail_by_app[app_name] = fail_by_app.get(app_name, 0) + 1
+                            print(f"      -> timeout after {args.timeout:.0f}s", file=sys.stderr)
+
+                        writer.writerow(row); fh.flush()
 
     if fh:
         fh.close()

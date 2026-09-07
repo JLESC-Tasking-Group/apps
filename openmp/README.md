@@ -94,11 +94,17 @@ fatal, so the same mistake fails loudly instead.
 costs of the table. `cgstats.csv` / `jitstats.csv` are written automatically.
 
 ```sh
+SZ='krylov=64;lulesh=16,60,100;mnmg=7035,23874'
+IT='krylov=200;lulesh=208'
+GR='krylov=4:4;lulesh=1,4,8'
 ./scripts/evaluate.py --target gpu --apps krylov,lulesh,mnmg \
-    --opts "$OPTS" --unroll 1,8 \
-    --sizes 'krylov=64;lulesh=16,60,100;mnmg=7035,23874' \
-    --iters 'krylov=200;lulesh=104'
+    --opts "$OPTS" --unroll 1,8 --sizes "$SZ" --iters "$IT" --grain "$GR"
 ```
+
+`--grain` is what makes these graphs parallel -- four tasks per Krylov vector
+operation, and a task count per LULESH size. It also removes every fusible chain,
+which is why `prog-fuse` is flat in the results; a run at `krylov=0:0` (one task
+per operation) is the configuration in which fusion has something to do.
 
 Krylov gets a single size on purpose: its panel of the figure puts the five
 solvers on the x axis (`AppSpec.panel_x`), which says more about generality than
@@ -122,28 +128,54 @@ comes from cross-iteration overlap rather than from fewer instances.
     --opts "$OPTS" --unroll 1,8 --no-taskgraphloop --tag no-tgl
 ```
 
-**3. JIT cache regimes** -- the same full pipeline three times. `--tag` keeps the
-three apart in one results file (it is part of `run_id`, so the CGIR side files
-stay joinable).
+**3. The on-disk JIT cache** -- the cost table's `cached` break-even column.
+
+`CGIR_JIT_CACHE_DIR` is opt-in, so sweep 1 pays a cold compile in every run, and
+JIT is 75-99% of the optimization cost. This sweep measures what a *later* run of
+the same application costs, once the compiled kernels are on disk.
+
+Run the full pipeline twice against the same cache directory. The first pass uses
+`CGIR_JIT_CACHE_MODE=w`, which writes to the cache and never reads it: without
+that, a populating run reuses artifacts it produced moments earlier and is not a
+first run at all. The second pass uses `r`, so it measures against a cache it
+does not modify and can be repeated. `plot.py --cached-tag` reads the second.
 
 ```sh
 FULL='reduce-node,transitive-reduction,jit,prog-fuse,sequence,batch'
-./scripts/evaluate.py --target gpu --opts "$FULL" --unroll 8 \
-    --env CGIR_JIT_CACHE=0            --tag jit-cold
-./scripts/evaluate.py --target gpu --opts "$FULL" --unroll 8 \
-    --tag jit-mem                      # in-process cache: the default
-./scripts/evaluate.py --target gpu --opts "$FULL" --unroll 8 \
-    --env CGIR_JIT_CACHE_DIR=$PWD/results/jitcache --tag jit-disk   # run twice
+D=$PWD/results/jitcache && rm -rf $D
+run () {   # $1 = cache mode, $2 = tag
+  ./scripts/evaluate.py --target gpu --apps krylov,lulesh,mnmg --opts "$FULL" \
+      --unroll 8 --sizes "$SZ" --iters "$IT" --grain "$GR" \
+      --env CGIR_JIT_CACHE_DIR=$D --env CGIR_JIT_CACHE_MODE=$1 --tag $2
+}
+run w jit-disk-cold      # fills the cache, reads nothing: a true first run
+run r jit-disk-warm      # reads it, writes nothing: the measurement
 ```
+
+Add `--omit synchronous,no-taskgraph` to both if sweep 1 already measured them on
+the same problems: they run no CGIR pass, so re-running them only produces a
+second copy of each, and `plot.py --baseline-tag` then has to be told which one
+to use. The cost table's *cold* column comes from sweep 1 rather than from
+`jit-disk-cold`, so that it excludes the cost of writing the cache out.
+
+Check it worked in `results/jitstats.csv`: the `jit-disk-cold` rows must have
+`device_disk_reuse = 0` (it read nothing) and the `jit-disk-warm` rows must have
+`device_compiled = 0` (it compiled nothing).
 
 **4. OmpSs-2 / NODES, CPU** -- the second runtime. Needs a NODES built
 `--with-cgir`; the harness turns the CGIR path on (`taskiter.opt.use_cgir`) and
 passes the same pass names through `NODES_TASKITER_CGIR_OPT`.
 
+Run both host backends, not just OmpSs-2: the same application and the same
+passes under two runtimes is the paired comparison, and it is the only place the
+`sequence` pass (host super-tasks) is exercised at all.
+
 ```sh
 export OMPSS_CC=<ompss-2 clang++>
-./scripts/evaluate.py --target ompss --apps krylov --variants cg \
-    --opts "$OPTS" --unroll 1,8 --sizes 'krylov=64' --iters 'krylov=200'
+for T in cpu ompss; do
+  ./scripts/evaluate.py --target $T --apps krylov --variants cg \
+      --opts "$OPTS" --unroll 1,8 --sizes 'krylov=64' --iters 'krylov=200'
+done
 ```
 
 On this backend `tasking.h` records through `#pragma oss taskiter`, and `--unroll`
@@ -166,9 +198,14 @@ EOF
 **Rendering:**
 
 ```sh
-./scripts/plot.py --paper --external results/external.csv \
-                  --latex-table ../../paper/sections/generated-table.tex
+./scripts/plot.py --paper --latex-tables ../../paper/sections \
+                  --pipeline 'taskgraph:reduce-node,transitive-reduction,jit,prog-fuse,sequence,batch'
 ```
+
+That writes `figures/paper-speedup.pdf` (copy it to `paper/figures/eval-speedup.pdf`)
+and the section's two tables: `generated-table-graph.tex` (what the passes do to
+the graph) and `generated-table-cost.tex` (what they cost, and the replays that
+repay it). `--pipeline` must name the pipeline actually swept.
 
 The baseline of both the figure and the break-even column is `no-taskgraph`
 (`--baseline`), so the two artifacts always tell the same story.

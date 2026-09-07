@@ -109,153 +109,6 @@ OPT_LABELS = {
 # separator is ',', so no comma-valued option may be set through it -- which is
 # exactly why the pass list has an env var of its own.)
 # --------------------------------------------------------------------------- #
-@dataclass
-class Backend:
-    label: str                  # value of the `backend` column in runs.csv
-    build: Dict[str, str]       # make variables
-    opt_env: str                # env var carrying the CGIR pass list
-    env: Dict[str, str] = field(default_factory=dict)
-
-
-BACKENDS: Dict[str, Backend] = {
-    "cpu":   Backend("cpu",   {"USE_TARGET": "0", "USE_OMPSS": "0"}, "OMP_TASKGRAPH_OPT"),
-    "gpu":   Backend("gpu",   {"USE_TARGET": "1", "USE_OMPSS": "0"}, "OMP_TASKGRAPH_OPT"),
-    "ompss": Backend("ompss", {"USE_TARGET": "0", "USE_OMPSS": "1"}, "NODES_TASKITER_CGIR_OPT",
-                     {"NODES_CONFIG_OVERRIDE": "taskiter.opt.use_cgir=true"}),
-}
-
-
-@dataclass
-class Config:
-    label: str                 # legend label, e.g. "taskgraph:reduce-node,transitive-reduction"
-    build: Dict[str, str]      # make variables, e.g. {"USE_SYNC": "1", ...}
-    opt: Optional[str]         # CGIR pass list (None if no taskgraph)
-    grain1: bool = False       # run with one task/kernel per loop (sync baseline)
-
-    @property
-    def taskgraph(self) -> bool:
-        """Whether this configuration records a taskgraph -- i.e. whether it has
-        the per-instance barrier that --unroll exists to amortize. Elsewhere the
-        unroll is inert by construction (the apps group iterations identically in
-        every configuration), so sweeping it there would only burn machine time."""
-        return self.build.get("USE_TASKGRAPH") == "1"
-
-
-def default_configs(opts: List[str]) -> List[Config]:
-    cfgs = [
-        Config("synchronous",    {"USE_SYNC": "1", "USE_TASKGRAPH": "0"}, None, grain1=True),
-        Config("no-taskgraph",   {"USE_SYNC": "0", "USE_TASKGRAPH": "0"}, None),
-        Config("taskgraph:none", {"USE_SYNC": "0", "USE_TASKGRAPH": "1"}, ""),
-    ]
-    for o in opts:
-        cfgs.append(Config(f"taskgraph:{o}", {"USE_SYNC": "0", "USE_TASKGRAPH": "1"}, o))
-    return cfgs
-
-
-# --------------------------------------------------------------------------- #
-# Metric parsing helpers.
-# --------------------------------------------------------------------------- #
-_F = r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)"
-
-
-def _grab(text, pattern, cast=float):
-    m = re.search(pattern, text)
-    if not m:
-        return None
-    try:
-        return cast(m.group(1))
-    except (ValueError, IndexError):
-        return None
-
-
-def _mean_std(xs):
-    xs = [x for x in xs if x is not None]
-    if not xs:
-        return (None, None)
-    m = sum(xs) / len(xs)
-    s = math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) if len(xs) > 1 else 0.0
-    return (m, s)
-
-
-# All three C/C++ apps print the same four timing lines, in the same words, so
-# one parser serves them. They are per taskgraph INSTANCE -- a group of `unroll`
-# iterations -- and always in ms per iteration, and they map onto the runtime's
-# own phases: instance 0 records the graph (XKOMP rc == 1), instance 1 builds and
-# optimizes the command graph and runs the first replay (rc == 2), instances 2..
-# are steady replays.
-#
-# `instance` vs `instances` disambiguates the singular lines from the plural ones
-# without a lookahead: "instances 2..31" can never match "instance 1", because
-# the 's' sits where the space would be. [^:\n] rather than [^:] so a line that
-# is absent cannot reach forward to a colon several lines below.
-def _parse_instances(text):
-    return {
-        "iter0_ms":  _grab(text, r"instance 0[^:\n]*:\s*" + _F + r"\s*ms"),
-        "iter1_ms":  _grab(text, r"instance 1[^:\n]*:\s*" + _F + r"\s*ms"),
-        "avg_ms":    _grab(text, r"instances \d+\.\.\d+[^:\n]*\(avg\)[^:\n]*:\s*" + _F + r"\s*ms"),
-        "stddev_ms": _grab(text, r"instances \d+\.\.\d+[^:\n]*\(stddev\)[^:\n]*:\s*" + _F + r"\s*ms"),
-    }
-
-
-# The "answer" of a run: a number the app computes from its final state, which
-# every configuration of the same problem must reproduce. It is what makes the
-# optimization passes falsifiable -- a speedup from a run that computed something
-# else is not a speedup. `verdict` is the app's own pass/fail line, when it has
-# one. plot.py's report_answers() enforces both.
-def _parse_krylov(text):
-    m = _parse_instances(text)
-    m.update({
-        "elapsed_s": _grab(text, r"total solve time\s*:\s*" + _F),
-        "flops":     _grab(text, r"theoretical flops\s*:\s*" + _F),
-        "gflops":    _grab(text, r"performance\s*:\s*" + _F),
-        "residual":  _grab(text, r"relative residual\s*:\s*" + _F),
-        "error":     _grab(text, r"relative error\s*:\s*" + _F),
-    })
-    # Compared ACROSS configurations, not against a fixed threshold: a solver may
-    # legitimately fail to converge on a given matrix (and then every
-    # configuration says so, which is a property of the problem), but no
-    # optimization pass may change the number it converged to.
-    m["answer"] = m["residual"]
-    return m
-
-
-def _parse_lulesh(text):
-    m = _parse_instances(text)
-    m.update({
-        # The app prints ":Elapsed time (s)  :  12.34" and ":FOM (z/s)  : 1.2e6",
-        # i.e. colon-separated -- not "FOM = x". Matching on '=' silently left
-        # both columns empty for every LULESH run ever recorded.
-        "elapsed_s": _grab(text, r"Elapsed time[^:\n]*:\s*" + _F),
-        "fom":       _grab(text, r"FOM[^:\n]*:\s*" + _F),
-        # LULESH's own verdict. NOTE it is only a symmetry check over plane 0 of
-        # the energy array (TotalRelDiff < 1e-9), so it catches an asymmetric
-        # corruption but not a uniform one; `answer` below covers the rest.
-        "verdict":   _grab(text, r"Verification[^:\n]*:\s*(\w+)", cast=str),
-        "answer":    _grab(text, r"TotalAbsDiff\s*:\s*" + _F),
-    })
-    return m
-
-
-def _parse_mnmg(text):
-    # Same four instance lines as krylov / lulesh; here they are ms per fixpoint
-    # ROUND. The extra work is the fallback: the round count is data-dependent
-    # (the fixpoint runs to convergence), so a small graph -- or a large -u --
-    # can leave fewer than three instances and no steady-state window at all.
-    # "total time (end-to-end)" is the MNMGDatalog paper's metric (file IO + H2D +
-    # setup + compute + D2H) and is printed in ms, unlike the other apps' seconds.
-    m = _parse_instances(text)
-    if m["avg_ms"] is None:
-        m["avg_ms"] = m["iter1_ms"] if m["iter1_ms"] is not None else m["iter0_ms"]
-        m["stddev_ms"] = 0.0 if m["avg_ms"] is not None else None
-    total_ms = _grab(text, r"total time \(end-to-end\)\s*:\s*" + _F + r"\s*ms")
-    m["elapsed_s"] = (total_ms / 1000.0) if total_ms is not None else None
-    # The size of the transitive closure: an exact integer every configuration
-    # must agree on.
-    m["answer"] = _grab(text, r"TC\s*=\s*" + _F + r"\s*tuples")
-    return m
-
-
-# --------------------------------------------------------------------------- #
 # Backends. A backend fixes the tasking runtime and the device the work runs on;
 # it is orthogonal to the configuration (which fixes the schedule and the CGIR
 # pass set) and is chosen once per sweep with --target.
@@ -303,12 +156,22 @@ class Config:
         return self.build.get("USE_TASKGRAPH") == "1"
 
 
-def default_configs(opts: List[str]) -> List[Config]:
+# The configurations every sweep compares its pipelines against. None of them
+# runs a CGIR pass, so a follow-up sweep that only varies how the passes are
+# configured measures them again for nothing -- and lands a second copy of each
+# in the results, which the analysis then has to choose between. `--omit` leaves
+# them out; see evaluate.py.
+REFERENCE_CONFIGS = ["synchronous", "no-taskgraph", "taskgraph:none"]
+
+
+def default_configs(opts: List[str], omit: Optional[List[str]] = None) -> List[Config]:
+    omit = set(omit or [])
     cfgs = [
         Config("synchronous",    {"USE_SYNC": "1", "USE_TASKGRAPH": "0"}, None, grain1=True),
         Config("no-taskgraph",   {"USE_SYNC": "0", "USE_TASKGRAPH": "0"}, None),
         Config("taskgraph:none", {"USE_SYNC": "0", "USE_TASKGRAPH": "1"}, ""),
     ]
+    cfgs = [c for c in cfgs if c.label not in omit]
     for o in opts:
         cfgs.append(Config(f"taskgraph:{o}", {"USE_SYNC": "0", "USE_TASKGRAPH": "1"}, o))
     return cfgs
@@ -446,17 +309,16 @@ class AppSpec:
     backends: List[str] = field(default_factory=lambda: ["cpu", "gpu"])
     # Unroll cap per backend, for an app that cannot fold iterations there.
     max_unroll: Dict[str, int] = field(default_factory=dict)
-    # Same, per variant: GMRES is a restarted solver, so each restart ends with a
-    # host least-squares solve that the next restart consumes and two restarts
-    # cannot share a graph instance. The app forces unroll to 1 there anyway
-    # (krylov/gmres/gmres.cpp:98); pinning it here keeps the harness from writing
-    # a row labelled u=8 that in fact ran at u=1.
+    # Same, per variant, for a solver whose iterations cannot share a graph
+    # instance (a restarted method, whose restart ends with a host solve the next
+    # one consumes). Pinning it here keeps the harness from writing a row
+    # labelled u=8 that in fact ran at u=1.
     variant_max_unroll: Dict[str, int] = field(default_factory=dict)
     # Inner steps that one `-i` unit buys, per variant. `-i` does not mean the
     # same thing for every solver: for a restarted method it counts RESTART
-    # CYCLES of `-m` steps each (gmres: RESTARTS=10 cycles of RESTART_M=30), so
-    # the value giving CG 200 iterations would give GMRES 6000. The harness
-    # divides by this, so one --iters stays comparable work across the variants.
+    # CYCLES of several inner steps each, so the value giving CG 200 iterations
+    # would give it many times more. The harness divides by this, so one --iters
+    # stays comparable work across the variants.
     variant_iters_div: Dict[str, int] = field(default_factory=dict)
     # Presentation metadata for the paper table (plot.py --latex-table): the name
     # and application class to print. Kept next to the app rather than in the
@@ -468,13 +330,21 @@ class AppSpec:
     # "variant": five solvers at one size say more about generality than one
     # solver at three sizes, and the paper has room for exactly one panel each.
     panel_x: str = "size"
-    # Relative tolerance on the `answer` across configurations of one problem.
-    # Not zero: a fused kernel may reassociate floating-point arithmetic, which
-    # perturbs the last bits. It must stay far below the corruption it exists to
-    # catch -- prog-fuse dropping a device barrier moved CG's residual from
-    # 4e-15 to 2.6e-03, eleven orders of magnitude clear of this. mnmg's answer
-    # is an exact tuple count, so it gets 0.
+    # Tolerance on the `answer` across configurations of one problem, as an
+    # absolute floor and a relative part -- two runs agree when
+    #     |a - b| <= rtol * max(|a|,|b|)      (they are relatively close)
+    #  or (|a| <= atol and |b| <= atol)       (both are effectively zero)
+    #
+    # Both parts are needed. `rtol` alone catches the corruption this exists for:
+    # a device barrier dropped from a fused kernel moved CG's residual from 4e-15
+    # to 2.6e-03, eleven orders of magnitude clear of any tolerance. But it
+    # rejects everything when the answer is a quantity whose CORRECT value is
+    # zero: a converged solver's residual lands wherever round-off puts it, and
+    # 4.02e-15 against 4.06e-15 is a 1% relative difference between two results
+    # that are both exactly right. `atol` is the level below which the quantity
+    # has stopped meaning anything, so two values under it agree by construction.
     answer_rtol: float = 1e-6
+    answer_atol: float = 0.0
 
 
 # ---- krylov: grid n, matrix N=n^3, work ~ n^3; -t/-s = task counts (0=threads) --
@@ -526,7 +396,7 @@ def _krylov_run(variant, size, iters, cfg, grain, unroll):
 KRYLOV = AppSpec(
     name="krylov",
     directory="krylov",
-    variants=["cg", "cr", "bicgstab", "minres", "gmres"],
+    variants=["cg", "cr", "bicgstab", "minres"],
     make_target=lambda v: v,
     binary=lambda v: f"./{v}.x",
     run_args=_krylov_run,
@@ -535,9 +405,12 @@ KRYLOV = AppSpec(
     sizes=[32, 48, 64],
     iters=50,
     grain_arity=2,          # "s:t"
-    variant_max_unroll={"gmres": 1},
     backends=["cpu", "gpu", "ompss"],
-    variant_iters_div={"gmres": 30},   # RESTART_M
+    # The answer is the relative residual. Below 1e-9 the solve has converged and
+    # the remaining digits are round-off, so two runs there agree whatever they
+    # print; above it (a solver that did not converge on this matrix) the relative
+    # test applies and every configuration must still land on the same value.
+    answer_atol=1e-9,
     pretty="Krylov",
     klass="Iterative solvers",
     panel_x="variant",
@@ -566,6 +439,11 @@ LULESH = AppSpec(
     pretty="LULESH",
     klass="PDE time stepping",
     backends=["cpu", "gpu", "ompss"],
+    # TotalAbsDiff is a symmetry residual of the final energy field: zero for a
+    # correct run, and a few 1e-8 in practice. LULESH's own `Verification` line
+    # (TotalRelDiff < 1e-9) is the primary check here -- see _parse_lulesh -- and
+    # this floor keeps the cross-configuration test from firing on round-off.
+    answer_atol=1e-6,
 )
 
 # ---- mnmg: Datalog transitive closure; dataset data_<N>.bin, N = #edges --------
@@ -602,7 +480,9 @@ MNMG = AppSpec(
     pretty="MNMG",
     klass="Graph analytics",
     backends=["cpu", "gpu", "ompss"],
-    answer_rtol=0.0,                   # an exact tuple count
+    # The transitive closure has an exact size; there is nothing to round off.
+    answer_rtol=0.0,
+    answer_atol=0.0,
 )
 
 APPS: Dict[str, AppSpec] = {a.name: a for a in (KRYLOV, LULESH, MNMG)}

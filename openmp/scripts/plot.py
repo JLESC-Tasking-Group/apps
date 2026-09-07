@@ -302,6 +302,33 @@ def report_coverage(rows):
 
     return [r for r in rows if r.get("status") in OK_STATUS]
 
+def select_evaluated(rows):
+    """Keep only the app variants the app registry still lists.
+
+    appspecs.py is what defines the evaluation, so a variant dropped from an
+    AppSpec is dropped from the figures and tables too -- without re-running the
+    sweep, and without the two ever disagreeing about what was evaluated. Data
+    for an unknown app is left alone: the registry describes the apps it drives,
+    not every CSV it may be pointed at."""
+    try:
+        from appspecs import APPS
+    except ImportError:
+        return rows
+
+    kept, dropped = [], defaultdict(int)
+    for r in rows:
+        spec = APPS.get(r["app"])
+        v = r.get("variant", "")
+        if spec is None or not v or v in spec.variants:
+            kept.append(r)
+        else:
+            dropped[f"{r['app']}/{v}"] += 1
+    for name, n in sorted(dropped.items()):
+        print(f"  {name} is no longer in the app registry: {n} row(s) omitted",
+              file=sys.stderr)
+    return kept
+
+
 def report_answers(rows, reference):
     """Drop every run that did not compute the same thing as the reference.
 
@@ -350,13 +377,21 @@ def report_answers(rows, reference):
             kept.append(r)
             continue
 
-        rtol = getattr(APPS.get(r["app"]), "answer_rtol", 1e-6)
-        scale = max(abs(want), abs(got))
-        if abs(got - want) <= rtol * scale or (scale == 0.0 and got == want):
+        spec = APPS.get(r["app"])
+        rtol = getattr(spec, "answer_rtol", 1e-6)
+        atol = getattr(spec, "answer_atol", 0.0)
+        # Relatively close, OR both below the level at which the quantity stops
+        # meaning anything. The second clause is what makes this usable on a
+        # converged solver's residual, whose correct value is zero and whose
+        # digits are therefore round-off -- see AppSpec.answer_atol.
+        close = abs(got - want) <= rtol * max(abs(want), abs(got))
+        both_negligible = abs(got) <= atol and abs(want) <= atol
+        if close or both_negligible:
             kept.append(r)
         else:
             rejected.append((r, f"answer {got:.6g} != {want:.6g} "
-                                f"(reference '{reference}', rtol {rtol:g})"))
+                                f"(reference '{reference}', rtol {rtol:g}, "
+                                f"atol {atol:g})"))
 
     print("answer check (every configuration must reproduce the reference's result):",
           file=sys.stderr)
@@ -788,14 +823,38 @@ def plot_paper_speedup(rows, figdir, dpi, fmt, show, styles, baseline,
 
     us = {run_unroll(r) for r in rows}
     keep = unroll if unroll in us else (max(us) if us else 1)
-    # A reference configuration never unrolls (evaluate.py pins it to 1), so it
-    # must survive whatever unroll the pipelines are shown at.
-    rows = [r for r in rows
-            if run_unroll(r) == keep
-            or canon_pipeline(r["config"]) in
-               {canon_pipeline(baseline)} | {canon_pipeline(c) for c in MARKERS}]
+
+    # Show each series at the requested unroll, or -- when it has no run there --
+    # at the largest one it does have. An app that cannot be unrolled is not an
+    # app to leave out of the figure: GMRES is pinned to u=1 because a restarted
+    # solver ends each restart with a host solve the next one consumes, so two
+    # restarts cannot share a graph instance. Filtering on the unroll alone drew
+    # its panel empty.
+    best = {}
+    for r in rows:
+        u = run_unroll(r)
+        if u > keep:
+            continue
+        k = (r["app"], r.get("variant", ""), r.get("size", ""),
+             canon_pipeline(r["config"]))
+        if k not in best or u > run_unroll(best[k]):
+            best[k] = r
+
+    # Drop the ` u<N>` that load_runs() folded into the label. The figure now
+    # shows one series per pipeline, each at its own best unroll, so the unroll is
+    # no longer what tells two series apart -- and leaving it in would make a
+    # pipeline that ran at u=1 a *different* series from the same pipeline at
+    # u=8, giving the group extra bars and pushing them out of position. Copy
+    # rather than edit in place: these rows are shared with the other figures.
+    rows = []
+    for r in best.values():
+        r = dict(r)
+        r["config"] = _UNROLL_SUFFIX.sub("", r["config"])
+        rows.append(r)
+
     if len(us) > 1:
-        print(f"  paper figure: unroll {keep} (of {sorted(us)})", file=sys.stderr)
+        print(f"  paper figure: unroll {keep} where available (of {sorted(us)})",
+              file=sys.stderr)
 
     try:
         from appspecs import APPS
@@ -970,146 +1029,93 @@ def _fmt(v, prec=0):
     return f"{v:.{prec}f}" if prec else f"{int(round(v))}"
 
 
-def latex_table(rows, cgstats_path, jitstats_path, baseline, full_pipeline, out):
-    """Emit the paper's single statistics table as LaTeX.
+# The canonical order the library applies passes in, and the label each gets in
+# the cost table. reduce-node and transitive-reduction are two passes in the
+# implementation and one -- `reduce` -- in the paper, so their times are summed.
+COST_PASSES = [
+    ("reduce",     ["reduce-node", "transitive-reduction"]),
+    ("prog-fuse",  ["prog-fuse"]),
+    ("JIT",        ["jit"]),
+    ("packing",    ["sequence", "batch"]),
+]
 
-    One row per (app, variant, size, backend) of the FULL pipeline, carrying what
-    the evaluation section has to justify in one place:
 
-      * what the recorded graph looks like, and what each pass does to it
-        (the paper's claims about reduce / prog-fuse / packing),
-      * what running the passes costs (the paper's complexity bounds are
-        pessimistic and say so; this is the measured cost),
-      * how many replays repay that cost -- computed against `baseline`, which
-        must be the same reference the figure normalizes to, or the two artifacts
-        would tell different stories.
+def _cost_rows(rows, cgstats_path, jitstats_path, baseline, baseline_tag,
+               full_pipeline, tag):
+    """Per-problem cost and amortization for the runs of `full_pipeline` tagged
+    `tag` (an empty tag matches the untagged main sweep).
 
-    The break-even is t_opt / (t_baseline - t_optimized) per replay. It is
-    reported as "--" when the optimized configuration is not faster: there is then
-    no number of replays that repays the compilation, and printing a huge integer
-    would suggest otherwise."""
-    try:
-        from appspecs import APPS
-    except ImportError:
-        APPS = {}
+    Returns {(app, variant, size, backend): dict}, each holding the per-pass
+    milliseconds, the total, and the replays needed to repay it against
+    `baseline`. Split out so the same computation serves the main sweep and the
+    warm-cache sweep, which differ only in which rows they read.
 
+    The baseline is taken from `baseline_tag` alone, not from whichever matching
+    row happens to come last. It does not run a CGIR pass, so every sweep that
+    includes it measures the same thing -- but not to the same digits, and using
+    a different one per regime would put run-to-run noise into the difference
+    between the columns, which is the comparison the table exists to make."""
     cg = _cg_by_tag(cgstats_path) if Path(cgstats_path).exists() else {}
-    jit = _jit_by_tag(jitstats_path)
 
-    def key_of(r):
-        return (r["app"], r.get("variant", ""), r.get("size"), r.get("backend", ""))
+    def key(r):
+        return (r["app"], r.get("variant", ""), r.get("size", ""), r.get("backend", ""))
 
-    def unroll_of(r):
-        try:
-            return int(r.get("unroll") or 1)
-        except ValueError:
-            return 1
-
-    # The baseline never unrolls (evaluate.py pins it to 1), so one value per key.
     base = {}
     for r in rows:
-        if canon_pipeline(r["config"]) != canon_pipeline(baseline):
-            continue
-        v = fnum(r.get("avg_ms"))
-        if v:
-            base[key_of(r)] = v
+        if (canon_pipeline(r["config"]) == canon_pipeline(baseline)
+                and (r.get("tag") or "") == baseline_tag):
+            v = fnum(r.get("avg_ms"))
+            if v:
+                base[key(r)] = v
+    if not base:
+        print(f"  no '{baseline}' run tagged '{baseline_tag or '(untagged)'}': "
+              f"break-even cannot be computed (see --baseline-tag)", file=sys.stderr)
 
-    # The pipeline may have been swept over several unrolls; the table reports the
-    # smallest and the largest, which is the whole taskgraphloop result in two
-    # columns, and takes its graph statistics from the largest (the configuration
-    # the figure shows).
-    swept = defaultdict(dict)   # key -> {unroll: row}
+    out = {}
     for r in rows:
         if canon_pipeline(r["config"]) != canon_pipeline(full_pipeline):
             continue
-        if fnum(r.get("avg_ms")):
-            swept[key_of(r)][unroll_of(r)] = r
-
-    body = []
-    for key in sorted(swept, key=lambda k: (k[0], k[1], int(k[2] or 0))):
-        by_unroll = swept[key]
-        umin, umax = min(by_unroll), max(by_unroll)
-        r = by_unroll[umax]
-        tag = r["run_id"]
-        passes = cg.get(tag, {})
+        if (r.get("tag") or "") != tag:
+            continue
+        passes = cg.get(r["run_id"], {})
         if not passes:
             continue
-        spec = APPS.get(r["app"])
 
-        def before(p, m):
-            return fnum(passes.get(p, {}).get(m + "_before"))
+        per = {}
+        for label, names in COST_PASSES:
+            ms = [fnum(passes[n].get("pass_ms")) for n in names if n in passes]
+            per[label] = sum(v for v in ms if v is not None)
+        total = sum(fnum(p.get("pass_ms")) or 0.0 for p in passes.values())
 
-        def after(p, m):
-            return fnum(passes.get(p, {}).get(m + "_after"))
-
-        # The recorded graph is what the FIRST pass of the pipeline saw.
-        first = next((p for p in PASS_ORDER if p in passes), None)
-        v0, e0 = before(first, "nodes"), before(first, "edges")
-        # ... after both reduction passes ...
-        v1 = after("transitive-reduction", "nodes") or after("reduce-node", "nodes")
-        e1 = after("transitive-reduction", "edges") or after("reduce-node", "edges")
-        # ... PROG commands collapsed by fusion ...
-        p0, p1 = before("prog-fuse", "prog"), after("prog-fuse", "prog")
-        # ... and nodes left to submit after packing (batch runs after sequence).
-        vp = after("batch", "nodes") or after("sequence", "nodes")
-
-        t_opt = sum(fnum(p.get("pass_ms")) or 0.0 for p in passes.values())
-        t_jit = fnum((jit.get(tag) or {}).get("jit_total_s"))
-        if t_jit:
-            # jitstats reports the whole process; the pass row already counts it.
-            t_opt = max(t_opt, t_jit * 1000.0)
-
-        t_opt_ms = t_opt
         t_new = fnum(r.get("avg_ms"))
-        t_lo = fnum(by_unroll[umin].get("avg_ms"))
-        t_ref = base.get(key)
+        t_ref = base.get(key(r))
         gain = (t_ref - t_new) if (t_ref and t_new) else None
-        breakeven = (t_opt_ms / gain) if (gain and gain > 0) else None
+        per["total"] = total
+        per["replay"] = t_new
+        per["breakeven"] = (total / gain) if (gain and gain > 0) else None
+        # Keep the best (largest-unroll) row per problem, as the graph table does.
+        k = key(r)
+        if k not in out or (fnum(r.get("unroll")) or 1) >= out[k].get("_unroll", 0):
+            per["_unroll"] = fnum(r.get("unroll")) or 1
+            out[k] = per
+    return out
 
-        body.append([
-            (getattr(spec, "pretty", None) or r["app"]) +
-            (f" {r['variant']}" if r.get("variant") else ""),
-            getattr(spec, "klass", "") or "",
-            str(r.get("size", "")),
-            f"{_fmt(v0)}/{_fmt(e0)}",
-            f"{_fmt(v1)}/{_fmt(e1)}",
-            f"{_fmt(p0)}$\\to${_fmt(p1)}",
-            _fmt(vp),
-            _fmt(t_opt_ms, 1),
-            _fmt(fnum(r.get("iter0_ms")), 2),
-            _fmt(t_lo, 3) + (f" / {_fmt(t_new, 3)}" if umax != umin else ""),
-            _fmt(breakeven),
-        ])
 
-    ucols = sorted({u for v in swept.values() for u in v})
-    replay_head = ("replay (ms)" if len(ucols) < 2
-                   else f"replay (ms) $u{ucols[0]}$/$u{ucols[-1]}$")
-    header = ["Application", "Class", "Size", "$|V|/|E|$", "after \\code{reduce}",
-              "\\code{PROG}", "packed", "$t_{opt}$ (ms)", "record (ms)",
-              replay_head, "break-even"]
-
+def _emit_table(caption, label, colspec, header, body, out):
     lines = [
-        "% Generated by scripts/plot.py --latex-table. Do not edit by hand.",
-        "% baseline = " + baseline + " ; pipeline = " + full_pipeline,
+        "% Generated by scripts/plot.py. Do not edit by hand.",
         "\\begin{table*}[t]",
         "  \\centering",
-        # \texttt rather than the paper's \code in the caption: \code is a
-        # \lstinline, which is fragile in a moving argument and breaks the list
-        # of tables. Cells are not moving arguments, so they keep \code.
-        "  \\caption{Recorded command graphs, what each pass does to them, and what "
-        "running the passes costs. $t_{opt}$ is the total time of the passes, paid "
-        "once; break-even is the number of replays over which it is repaid against "
-        "\\texttt{" + baseline.replace("_", "\\_") + "}.}",
-        "  \\label{tbl:apps}",
+        "  \\caption{" + caption + "}",
+        "  \\label{" + label + "}",
         "  {\\footnotesize",
-        "  \\begin{tabular}{@{}l l r r r r r r r r r@{}}",
+        "  \\begin{tabular}{" + colspec + "}",
         "    \\toprule",
         "    " + " & ".join(f"\\textbf{{{h}}}" for h in header) + " \\\\",
         "    \\midrule",
     ]
-    lines += ["    " + " & ".join(c for c in b) + " \\\\" for b in body]
+    lines += ["    " + " & ".join(c) + " \\\\" for c in body]
     lines += ["    \\bottomrule", "  \\end{tabular}}", "\\end{table*}"]
-
     text = "\n".join(lines) + "\n"
     if out == "-":
         print(text)
@@ -1117,6 +1123,130 @@ def latex_table(rows, cgstats_path, jitstats_path, baseline, full_pipeline, out)
         Path(out).write_text(text)
         print(f"wrote {out}", file=sys.stderr)
 
+
+def latex_table_graph(rows, cgstats_path, full_pipeline, out):
+    """The applications and what the passes do to their command graph.
+
+    One row per problem: the graph as recorded, after the reduction passes, and
+    after packing. This is the evidence for section 5.2 -- what the passes
+    change -- and it doubles as the table describing the applications."""
+    try:
+        from appspecs import APPS
+    except ImportError:
+        APPS = {}
+
+    cg = _cg_by_tag(cgstats_path) if Path(cgstats_path).exists() else {}
+
+    # One row per problem, taken from its largest unroll -- the same recording the
+    # cost table and the figure report. Collected into a dict first: appending as
+    # rows arrive would emit one row per unroll.
+    best = {}
+    for r in rows:
+        if canon_pipeline(r["config"]) != canon_pipeline(full_pipeline):
+            continue
+        if not cg.get(r["run_id"]):
+            continue
+        k = (r["app"], r.get("variant", ""), r.get("size", ""))
+        u = fnum(r.get("unroll")) or 1
+        if k not in best or u > (fnum(best[k].get("unroll")) or 1):
+            best[k] = r
+
+    body = []
+    for k in sorted(best, key=lambda k: (k[0], k[1], int(k[2] or 0))):
+        r = best[k]
+        passes = cg[r["run_id"]]
+
+        def before(p, m): return fnum(passes.get(p, {}).get(m + "_before"))
+        def after(p, m):  return fnum(passes.get(p, {}).get(m + "_after"))
+
+        # Every command graph is bracketed by a virtual entry and exit node --
+        # an implementation convenience that gives each dependence a single
+        # attachment point, not work the device performs. Reporting them would
+        # put a floor of two on every count and make a fully packed graph read as
+        # three nodes instead of one, so they are subtracted here.
+        def user_nodes(v): return None if v is None else max(v - 2, 0)
+
+        first = next((p for p in PASS_ORDER if p in passes), None)
+        v0, e0 = user_nodes(before(first, "nodes")), before(first, "edges")
+        v1 = user_nodes(after("transitive-reduction", "nodes")
+                        or after("reduce-node", "nodes"))
+        e1 = after("transitive-reduction", "edges") or after("reduce-node", "edges")
+        vp = user_nodes(after("batch", "nodes") or after("sequence", "nodes"))
+
+        spec = APPS.get(r["app"])
+        body.append([
+            (getattr(spec, "pretty", None) or r["app"])
+            + (f" {r['variant']}" if r.get("variant") else ""),
+            getattr(spec, "klass", "") or "",
+            str(r.get("size", "")),
+            f"{_fmt(v0)}/{_fmt(e0)}",
+            f"{_fmt(v1)}/{_fmt(e1)}",
+            _fmt(vp),
+        ])
+
+    _emit_table(
+        "Applications, and what the passes do to the command graph recorded for "
+        "one iteration. Nodes are given before any pass, after the two reduction "
+        "steps, and after packing; the virtual entry and exit nodes that bracket "
+        "every graph are excluded, so a fully packed graph is one node.",
+        "tbl:apps", "@{}l l r r r r@{}",
+        ["Application", "Class", "Size", "$|V|/|E|$", "after \\code{reduce}",
+         "after \\code{packing}"],
+        body, out)
+
+
+def latex_table_cost(rows, cgstats_path, jitstats_path, baseline, baseline_tag,
+                     full_pipeline, cached_tag, out):
+    """What the passes cost, and how many replays repay it.
+
+    Two break-even columns. `cold` is what a run pays when nothing has been
+    compiled before; `cached` is what every later run of the same application
+    pays, once the JIT's on-disk cache holds the compiled kernels. They differ by
+    orders of magnitude because JIT dominates the cost, so reporting only one of
+    them would misrepresent the system in one direction or the other."""
+    try:
+        from appspecs import APPS
+    except ImportError:
+        APPS = {}
+
+    cold   = _cost_rows(rows, cgstats_path, jitstats_path, baseline, baseline_tag,
+                        full_pipeline, "")
+    cached = _cost_rows(rows, cgstats_path, jitstats_path, baseline, baseline_tag,
+                        full_pipeline, cached_tag)
+    if not cached:
+        print(f"  no runs tagged '{cached_tag}': the cached break-even column will "
+              f"be empty (see --cached-tag)", file=sys.stderr)
+
+    body = []
+    for k in sorted(cold, key=lambda k: (k[0], k[1], int(k[2] or 0))):
+        c = cold[k]
+        w = cached.get(k)
+        spec = APPS.get(k[0])
+        body.append([
+            (getattr(spec, "pretty", None) or k[0]) + (f" {k[1]}" if k[1] else ""),
+            str(k[2]),
+            _fmt(c["reduce"], 1),
+            _fmt(c["prog-fuse"], 1),
+            _fmt(c["JIT"], 1),
+            _fmt(c["packing"], 1),
+            _fmt(c["total"] / 1000.0, 2),
+            _fmt(c["replay"], 3),
+            _fmt(c["breakeven"]),
+            _fmt(w["breakeven"]) if w else "--",
+        ])
+
+    _emit_table(
+        "Cost of one run of the pipeline, per pass and in total, next to the time "
+        "of the single replay it is optimizing, and the number of replays that "
+        "repays it against \\texttt{no-taskgraph}. Per-pass times and one replay "
+        "are in milliseconds. The break-even column is a first run, which compiles "
+        "every kernel; \\emph{cached} is any later run of the same application, "
+        "served from the JIT's on-disk cache.",
+        "tbl:cost", "@{}l r r r r r r r r r@{}",
+        ["Application", "Size", "\\code{reduce}", "\\code{prog-fuse}",
+         "\\code{JIT}", "\\code{packing}", "total (s)", "one replay",
+         "break-even", "\\;cached"],
+        body, out)
 
 def _save(fig, figdir, name, dpi, fmt, show):
     import matplotlib.pyplot as plt
@@ -1188,9 +1318,20 @@ def main():
     ap.add_argument("--paper-figsize", default="", metavar="W,H",
                     help="override the paper figure size in inches (default: "
                     "2.8 per panel x 3.1)")
-    ap.add_argument("--latex-table", default="", metavar="PATH",
-                    help="write the paper's statistics table as LaTeX to PATH "
-                    "('-' for stdout). Joins runs.csv with cgstats.csv/jitstats.csv")
+    ap.add_argument("--latex-tables", default="", metavar="DIR",
+                    help="write the paper's two LaTeX tables into DIR: "
+                    "generated-table-graph.tex (what the passes do to the graph) and "
+                    "generated-table-cost.tex (what they cost, and the replays that "
+                    "repay it). Joins runs.csv with cgstats.csv/jitstats.csv")
+    ap.add_argument("--baseline-tag", default="",
+                    help="runs.csv `tag` whose --baseline rows are used as THE baseline "
+                    "for every regime (default: the untagged main sweep). Pinning it "
+                    "keeps the cost table's columns comparable when several sweeps "
+                    "measured the same reference")
+    ap.add_argument("--cached-tag", default="jit-disk-warm",
+                    help="runs.csv `tag` identifying the warm on-disk-JIT-cache sweep, "
+                    "which supplies the cost table's cached break-even column. Absent "
+                    "from the input, that column is left empty")
     ap.add_argument("--pipeline",
                     default="taskgraph:reduce-node,transitive-reduction,jit,prog-fuse,"
                             "sequence,batch",
@@ -1218,7 +1359,7 @@ def main():
     allrows = load_runs(runs_csv)
     if not allrows:
         ap.error(f"{runs_csv} is empty")
-    rows = report_coverage(allrows)
+    rows = select_evaluated(report_coverage(allrows))
     if not any(r.get("avg_ms", "") != "" for r in rows):
         ap.error("no plottable rows (see the coverage report above)")
 
@@ -1239,12 +1380,17 @@ def main():
             ap.error(f"no cgstats.csv at {cgstats_csv} (it is written by "
                      f"evaluate.py unless --no-stats)")
 
-    if args.latex_table:
+    if args.latex_tables:
         if not cgstats_csv.exists():
-            ap.error(f"--latex-table needs {cgstats_csv} (written by evaluate.py "
+            ap.error(f"--latex-tables needs {cgstats_csv} (written by evaluate.py "
                      f"unless --no-stats)")
-        latex_table(rows, cgstats_csv, jitstats_csv, args.baseline, args.pipeline,
-                    args.latex_table)
+        d = Path(args.latex_tables)
+        d.mkdir(parents=True, exist_ok=True)
+        latex_table_graph(rows, cgstats_csv, args.pipeline,
+                          str(d / "generated-table-graph.tex"))
+        latex_table_cost(rows, cgstats_csv, jitstats_csv, args.baseline,
+                         args.baseline_tag, args.pipeline, args.cached_tag,
+                         str(d / "generated-table-cost.tex"))
 
     if args.no_figures:
         return

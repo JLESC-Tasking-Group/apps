@@ -45,7 +45,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from appspecs import (APPS, BACKENDS, CGIR_PASSES, DEFAULT_OPTS,  # noqa: E402
-                       default_configs)
+                       REFERENCE_CONFIGS, default_configs)
 
 APPS_OPENMP = Path(__file__).resolve().parent.parent
 
@@ -188,6 +188,14 @@ def main():
                     "-- which is how the JIT cache regimes are swept, e.g. "
                     "--env CGIR_JIT_CACHE=0 (cold) or --env CGIR_JIT_CACHE_DIR=/tmp/jitc "
                     "(persistent). Recorded in the `env` column of runs.csv.")
+    ap.add_argument("--omit", default="", metavar="LIST",
+                    help="comma list of reference configurations NOT to run, from "
+                    + ", ".join(REFERENCE_CONFIGS) + ". None of them runs a CGIR pass, "
+                    "so a follow-up sweep that only varies the passes need not measure "
+                    "them again -- and re-running them leaves a second copy of each in "
+                    "the results. Omitting 'no-taskgraph' means this sweep carries no "
+                    "baseline of its own, so the analysis has to take one from another "
+                    "sweep of the same problems (plot.py --baseline-tag)")
     ap.add_argument("--tag", default="", help="free-form string written to the `tag` column "
                     "of runs.csv, to mark a sweep (e.g. 'jit-cold') so several sweeps can "
                     "share one results file and still be told apart")
@@ -247,7 +255,16 @@ def main():
     for a in grain_by_app:
         if a not in APPS:
             ap.error(f"unknown app '{a}' in --grain (known: {', '.join(APPS)})")
-    configs = default_configs(_parse_opts(args.opts, ap))
+    omit = [o.strip() for o in args.omit.split(",") if o.strip()]
+    for o in omit:
+        if o not in REFERENCE_CONFIGS:
+            ap.error(f"--omit: '{o}' is not a reference configuration "
+                     f"(known: {', '.join(REFERENCE_CONFIGS)})")
+    if "no-taskgraph" in omit:
+        print("[note ] --omit no-taskgraph: this sweep records no baseline, so "
+              "speedups and break-even must be computed against another sweep "
+              "(plot.py --baseline-tag)", file=sys.stderr)
+    configs = default_configs(_parse_opts(args.opts, ap), omit)
     backend = BACKENDS[args.target]
     backend_vars = dict(backend.build)
     if args.no_taskgraphloop:

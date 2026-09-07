@@ -38,26 +38,24 @@
  *
  * Pinned rather than left to the OpenMP runtime, which picks 32 threads per
  * block here: that is 7 blocks per SM, 224 of the 2048 threads an SM can hold,
- * and it turns a 65536-element tile into a 2048-block launch. Both are bad on
- * their own terms, and the second also puts the kernel out of reach of device
- * fusion -- a fused kernel is a single launch ordered by a grid-wide barrier,
- * which only completes if every block is resident, so CGIR declines to fuse a
- * grid larger than the device co-schedules (~924 blocks on a GH200). At 256
- * threads the same tile is 256 blocks and fits.
+ * and it turns a 65536-element tile into a 2048-block launch. Pinning it is
+ * worth 1.26x on CG on its own. LULESH already pins its geometry the same way
+ * (lulesh.cc: THREADS 256); this brings Krylov to the same footing.
  *
- * LULESH pins its geometry the same way (lulesh.cc: THREADS 256); this brings
- * Krylov to the same footing. GPU-only: OMP_TILE drops its `mp` argument on the
- * host backends, so this never reaches a CPU or OmpSs-2 build.
+ * The size is 512 rather than 256 because it also decides whether these kernels
+ * can be fused. A fused device kernel is one launch ordered by a grid-wide
+ * barrier, which completes only if every block is resident, so CGIR fuses only
+ * a grid it can guarantee -- one block per multiprocessor. A GH200 has 132, and
+ * a 65536-element tile is 256 blocks at 256 threads (just over) but 128 at 512
+ * (just under). The two sizes measure the same on their own, 0.335 ms either
+ * way on CG, so nothing is given up to land on the fusible side.
  *
- * Overridable (-DKR_THREADS=...) because it also decides whether these kernels
- * can be fused. A fused device kernel is ordered by a grid-wide barrier and so
- * may launch no more blocks than the device is guaranteed to hold resident, one
- * per multiprocessor; at 256 threads a 65536-element tile is 256 blocks and a
- * GH200 has 132 multiprocessors, so it just misses, while at 512 it is 128 and
- * fits. That is a device-specific threshold, so it is a knob and not a
- * constant. */
+ * That threshold is a property of the device, not of the program, hence a knob
+ * (-DKR_THREADS=...) and not a constant. GPU-only: OMP_TILE drops its `mp`
+ * argument on the host backends, so none of this reaches a CPU or OmpSs-2
+ * build. */
 #ifndef KR_THREADS
-# define KR_THREADS 256
+# define KR_THREADS 512
 #endif
 #define KR_LAUNCH(begin, end)                                                  \
     num_teams((int) (((end) - (begin) + KR_THREADS - 1) / KR_THREADS))         \

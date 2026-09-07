@@ -47,8 +47,18 @@
  *
  * LULESH pins its geometry the same way (lulesh.cc: THREADS 256); this brings
  * Krylov to the same footing. GPU-only: OMP_TILE drops its `mp` argument on the
- * host backends, so this never reaches a CPU or OmpSs-2 build. */
-#define KR_THREADS 256
+ * host backends, so this never reaches a CPU or OmpSs-2 build.
+ *
+ * Overridable (-DKR_THREADS=...) because it also decides whether these kernels
+ * can be fused. A fused device kernel is ordered by a grid-wide barrier and so
+ * may launch no more blocks than the device is guaranteed to hold resident, one
+ * per multiprocessor; at 256 threads a 65536-element tile is 256 blocks and a
+ * GH200 has 132 multiprocessors, so it just misses, while at 512 it is 128 and
+ * fits. That is a device-specific threshold, so it is a knob and not a
+ * constant. */
+#ifndef KR_THREADS
+# define KR_THREADS 256
+#endif
 #define KR_LAUNCH(begin, end)                                                  \
     num_teams((int) (((end) - (begin) + KR_THREADS - 1) / KR_THREADS))         \
     thread_limit(KR_THREADS)

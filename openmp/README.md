@@ -117,6 +117,15 @@ a pass apart from the machine; `plot.py` reduces them to a median and draws the
 extremes as whiskers. Repeats are interleaved, not consecutive, so machine drift
 is spread across configurations instead of landing on one.
 
+Each configuration is still built once. Because every app cleans its whole
+directory before building -- krylov's `clean` is `rm -f *.x`, which takes all
+four solvers -- the binary is copied to `results/.binstash/` as soon as it is
+built, and later repeats run that copy; the in-tree one is gone by then. The
+stash is removed when the sweep finishes, and kept if any run failed. This is
+also why `--skip-build` is refused with `--repeat > 1`: nothing is built, so
+nothing is stashed, and the tree holds only the last binary of each app.
+`scripts/test_repeat.py` covers it with a fake app and needs no compiler.
+
 `--grain` is what makes these graphs parallel -- four tasks per Krylov vector
 operation, and a task count per LULESH size. It also removes every fusible chain,
 which is why `prog-fuse` is flat in the results; a run at `krylov=0:0` (one task

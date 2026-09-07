@@ -34,10 +34,12 @@ LD_LIBRARY_PATH). Use --dry-run to inspect the plan first.
 import argparse
 import csv
 import datetime
+import hashlib
 import itertools
 import math
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -90,6 +92,50 @@ def build_cmd(app, variant, cfg, size, iters, backend_vars, grain, unroll):
         g = None if cfg.grain1 else grain
         argv += app.build_defs(size, iters, g, unroll)
     return argv
+
+
+def build_key(app, variant, cfg, target, size, grain, unroll):
+    """Identity of a built binary: two runs with the same key can share one.
+
+    Kept out of do_build() because the run site needs the same key to find the
+    binary that build produced -- see stash_binary()."""
+    key = (app.name, variant, cfg.label, target)
+    if app.rebuild_per_size:
+        # size, grain (GRAN_TMP/...) and unroll (UNROLL) are all compile-time for
+        # such an app, so each combination is its own binary; tuple() to stay
+        # hashable. iters is compiled in too, but it is a pure function of
+        # (size, unroll) here, so it needs no key of its own.
+        key = key + (size, tuple(grain) if grain else None, unroll)
+    return key
+
+
+def stash_binary(app, variant, key, outdir):
+    """Copy a freshly built binary somewhere the next `make clean` cannot reach.
+
+    Every app cleans its whole directory before building -- krylov's clean is
+    `rm -f *.x`, which takes all four solvers -- so the next configuration built
+    there destroys this one's binary. That is invisible while each build is
+    followed straight away by its own run, and fatal as soon as runs are
+    repeated: the second pass rebuilds nothing (same key, already built) and
+    finds the binary gone.
+
+    So the binary is copied out from under the build, into results/ rather than
+    into the app tree, where no clean target can reach it however they change.
+    copy2 keeps the executable bit. Returns the absolute path, or None if the
+    binary is not where the AppSpec says -- in which case the caller falls back
+    to the in-tree path and the run reports its own failure."""
+    src = (APPS_OPENMP / app.directory / app.binary(variant)).resolve()
+    if not src.is_file():
+        return None
+    # The key holds paths and None; hash it for a name that is stable, unique
+    # and a valid directory, and prefix it with something a human can read.
+    tag = sanitize(f"{app.name}-{variant}-{key[2]}")[:48]
+    h = hashlib.sha1(repr(key).encode()).hexdigest()[:12]
+    dst_dir = Path(outdir) / ".binstash" / f"{tag}-{h}"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / src.name
+    shutil.copy2(src, dst)
+    return dst
 
 
 def parse_env(items, ap):
@@ -265,6 +311,14 @@ def main():
             ap.error(f"unknown app '{a}' in --grain (known: {', '.join(APPS)})")
     if args.repeat < 1:
         ap.error(f"--repeat: {args.repeat} is not a positive run count")
+    if args.repeat > 1 and args.skip_build:
+        # Nothing gets built, so nothing gets stashed, and the app directories
+        # hold at most the last binary built in each -- every earlier
+        # configuration's is already gone.
+        ap.error("--skip-build with --repeat > 1: repeats replay every "
+                 "configuration, but each build cleans its app directory, so "
+                 "only the last binary of each still exists. Build them in the "
+                 "same run (drop --skip-build) or use --repeat 1")
     omit = [o.strip() for o in args.omit.split(",") if o.strip()]
     for o in omit:
         if o not in REFERENCE_CONFIGS:
@@ -313,17 +367,12 @@ def main():
             writer.writeheader()
 
     built = {}
+    stashed = {}    # build key -> binary copied out of reach of `make clean`
     n_ok = n_fail = 0
     fail_by_app = {}   # app_name -> failed run count
 
     def do_build(app, variant, cfg, size, iters, grain, unroll):
-        key = (app.name, variant, cfg.label, args.target)
-        if app.rebuild_per_size:
-            # size, grain (GRAN_TMP/...) and unroll (UNROLL) are all compile-time
-            # for such an app, so each combination is its own binary; tuple()
-            # to stay hashable. iters is compiled in too, but it is a pure
-            # function of (size, unroll) here, so it needs no key of its own.
-            key = key + (size, tuple(grain) if grain else None, unroll)
+        key = build_key(app, variant, cfg, args.target, size, grain, unroll)
         if key in built:
             return built[key]
         cmd = build_cmd(app, variant, cfg, size, iters, backend_vars, grain, unroll)
@@ -337,6 +386,10 @@ def main():
         if not ok:
             sys.stderr.write(p.stdout[-2000:] + "\n")
         built[key] = ok
+        # Only repeats need it: with one pass, every build is followed by its own
+        # run before anything else can clean the directory.
+        if ok and args.repeat > 1:
+            stashed[key] = stash_binary(app, variant, key, outdir)
         return ok
 
     # Repeats are round-robin (every configuration once, then all of them
@@ -381,6 +434,8 @@ def main():
                         eff_iters = effective_iters(variant_iters(app, variant, iters),
                                                     unroll)
                         ok = do_build(app, variant, cfg, size, eff_iters, grain, unroll)
+                        bkey = build_key(app, variant, cfg, args.target, size,
+                                         grain, unroll)
                         work, work_label = app.work(size)
                         vtag = f"-{variant}" if variant else ""
                         disp = f"{app_name}/{variant}" if variant else app_name
@@ -395,7 +450,13 @@ def main():
                         reppart = f"-r{rep}" if args.repeat > 1 else ""
                         run_id = sanitize(f"{app_name}{vtag}-{args.target}-{cfg.label}"
                                           f"-n{size}-u{unroll}{tagpart}{reppart}-{ts_run}")
-                        argv = [app.binary(variant)] + list(
+                        # The stashed copy when there is one, because the in-tree
+                        # binary may already have been cleaned away by a later
+                        # build. Absolute, so it runs with cwd still set to the app
+                        # directory -- which the run args rely on for their relative
+                        # data paths.
+                        exe = stashed.get(bkey) or app.binary(variant)
+                        argv = [str(exe)] + list(
                             app.run_args(variant, size, eff_iters, cfg, grain, unroll))
                         workdir = APPS_OPENMP / app.directory
 
@@ -525,6 +586,15 @@ def main():
 
     if fh:
         fh.close()
+    if stashed:
+        stash_dir = outdir / ".binstash"
+        if n_fail == 0:
+            shutil.rmtree(stash_dir, ignore_errors=True)
+        else:
+            # A failed sweep is the one whose binaries you want to keep: the
+            # in-tree copies have been cleaned away by later builds.
+            print(f"kept {stash_dir} ({len(stashed)} binaries) for the failed runs",
+                  file=sys.stderr)
     print("", file=sys.stderr)
     print(f"ok={n_ok} fail={n_fail}", file=sys.stderr)
     if fail_by_app:

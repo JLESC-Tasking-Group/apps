@@ -64,7 +64,10 @@ DEFAULT_OPTS = [
     "reduce-node,transitive-reduction",
     "reduce-node,transitive-reduction,jit",
     "reduce-node,transitive-reduction,jit,prog-fuse",
-    "reduce-node,transitive-reduction,jit,prog-fuse,sequence,batch",
+    # `sequence` is not here: measured on all three applications it batched
+    # nothing (no same-device chain survives `batch`), so it only lengthened the
+    # pipeline. `packing` is `batch` alone.
+    "reduce-node,transitive-reduction,jit,prog-fuse,batch",
 ]
 
 # Short legend label for each pipeline, keyed by the LAST pass added. Keeps the

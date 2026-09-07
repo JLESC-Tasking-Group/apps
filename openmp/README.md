@@ -84,7 +84,7 @@ Three artifacts, five sweeps. `$OPTS` is the incremental pipeline (the default o
 OPTS='reduce-node,transitive-reduction'
 OPTS="$OPTS;reduce-node,transitive-reduction,jit"
 OPTS="$OPTS;reduce-node,transitive-reduction,jit,prog-fuse"
-OPTS="$OPTS;reduce-node,transitive-reduction,jit,prog-fuse,sequence,batch"
+OPTS="$OPTS;reduce-node,transitive-reduction,jit,prog-fuse,batch"
 ```
 
 Note the absence of `\` line continuations: inside single quotes a backslash is
@@ -182,7 +182,7 @@ first run at all. The second pass uses `r`, so it measures against a cache it
 does not modify and can be repeated. `plot.py --cached-tag` reads the second.
 
 ```sh
-FULL='reduce-node,transitive-reduction,jit,prog-fuse,sequence,batch'
+FULL='reduce-node,transitive-reduction,jit,prog-fuse,batch'
 D=$PWD/results/jitcache && rm -rf $D
 run () {   # $1 = cache mode, $2 = tag
   ./scripts/evaluate.py --target gpu --apps krylov,lulesh,mnmg --opts "$FULL" \
@@ -195,7 +195,7 @@ run r jit-disk-warm      # reads it, writes nothing: the measurement
 
 Add `--omit synchronous,no-taskgraph` to both if sweep 1 already measured them on
 the same problems: they run no CGIR pass, so re-running them only produces a
-second copy of each, and `plot.py --baseline-tag` then has to be told which one
+second copy of each, and `plot.py --main-tag` then has to be told which one
 to use. The cost table's *cold* column comes from sweep 1 rather than from
 `jit-disk-cold`, so that it excludes the cost of writing the cache out.
 
@@ -208,14 +208,22 @@ Check it worked in `results/jitstats.csv`: the `jit-disk-cold` rows must have
 passes the same pass names through `NODES_TASKITER_CGIR_OPT`.
 
 Run both host backends, not just OmpSs-2: the same application and the same
-passes under two runtimes is the paired comparison, and it is the only place the
-`sequence` pass (host super-tasks) is exercised at all.
+passes under two runtimes is the paired comparison.
+
+`sequence` is added back for this sweep only. It groups a same-device chain into
+one serial BATCH the runtime replays as a single super-task, which is a host
+construct: on the GPU graphs it batched nothing (measured, on all three
+applications), which is why it is not in `$OPTS`, but the host backends are what
+it was written for and the only place it can pay. Dropping it from the default
+should not also drop the one sweep that can show it working.
 
 ```sh
 export OMPSS_CC=<ompss-2 clang++>
+HOST_OPTS="$OPTS;reduce-node,transitive-reduction,jit,prog-fuse,sequence,batch"
 for T in cpu ompss; do
   ./scripts/evaluate.py --target $T --apps krylov --variants cg \
-      --opts "$OPTS" --unroll 1,8 --sizes 'krylov=64' --iters 'krylov=200'
+      --opts "$HOST_OPTS" --unroll 1,8 --sizes 'krylov=64' --iters 'krylov=200' \
+      --repeat 5
 done
 ```
 
@@ -240,8 +248,8 @@ EOF
 
 ```sh
 ./scripts/plot.py --paper --latex-tables ../../paper/sections \
-                  --pipeline 'taskgraph:reduce-node,transitive-reduction,jit,prog-fuse,sequence,batch' \
-                  --baseline-tag '' --cached-tag jit-disk-warm
+                  --pipeline "taskgraph:$FULL" \
+                  --main-tag '' --cached-tag jit-disk-warm
 ./scripts/plot.py --paper-unroll-figure --unroll-tag unroll
 ```
 
@@ -249,7 +257,10 @@ That writes `figures/paper-speedup.pdf` (copy it to `paper/figures/eval-speedup.
 `figures/paper-unroll.pdf` (-> `paper/figures/eval-unroll.pdf`) and the section's
 two tables: `generated-table-graph.tex` (what the passes do to the graph) and
 `generated-table-cost.tex` (what they cost, and the replays that repay it).
-`--pipeline` must name the pipeline actually swept.
+`--pipeline` must name the pipeline actually swept -- including `sequence` if the
+results predate its removal from the default (the CSVs shipped here do; it cost
+0.1 ms and batched nothing, so the measurements are unaffected and `plot.py`
+labels both spellings `+packing`).
 
 Bars are medians over `--repeat` runs and whiskers span the extreme ratios --
 fastest baseline over slowest replay, and the reverse -- so a bar clears 1.0

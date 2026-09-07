@@ -98,6 +98,21 @@ HATCHES = ["", "//", "\\\\", "xx", "..", "oo", "++", "--", "||", "OO"]
 # visible on the fill) plus four extras.
 COLORS = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9",
           "#F0E442", "#999999", "#6A3D9A", "#B15928", "#7FBC41", "#DE77AE"]
+# Squared RGB distance below which two palette entries read as the same color in
+# a bar chart. The palette has exactly one offending pair -- the pinks #CC79A7
+# and #DE77AE, at 377 -- and the next closest pair is at 2921, so anything in
+# between rejects that pair and keeps every other. 1500 sits in the middle.
+_COLOR_MIN_DIST = 1500
+
+
+def _color_distance(a, b):
+    """Squared RGB distance between two "#rrggbb" strings. Crude next to a real
+    perceptual metric, but it only has to separate a 12-entry palette."""
+    ai = int(a[1:], 16)
+    bi = int(b[1:], 16)
+    return sum((((ai >> k) & 0xFF) - ((bi >> k) & 0xFF)) ** 2 for k in (0, 8, 16))
+
+
 BAR_EDGE = dict(edgecolor="black", linewidth=0.6)
 ERR_KW = dict(elinewidth=1.0, ecolor="black")
 
@@ -206,7 +221,7 @@ def _canon_passes(label):
     return "taskgraph:" + ",".join(passes)
 
 
-def assign_styles(labels, salt=0):
+def assign_styles(labels, salt=0, priority=()):
     """Map every configuration label to a stable {color, hatch}, keyed by name.
 
     Each key hashes to a base (color, hatch) slot; a key whose base color is
@@ -220,14 +235,46 @@ def assign_styles(labels, salt=0):
     from one run share one assignment and are coherent by construction. zlib.crc32
     is used rather than hash(), which is per-process randomized by PYTHONHASHSEED
     and would restyle the figures on every invocation.
+
+    `priority` names the keys that must get a distinct color if any do. Colors
+    run out before labels do -- a results file with an unroll sweep in it holds
+    several times more configurations than there are colors -- and past that
+    point only the (color, hatch) pair stays unique. Assigning these first is
+    what keeps the paper figure's series, which are few, from being the ones
+    left to be told apart by hatch alone.
     """
     nc, nh = len(COLORS), len(HATCHES)
     styles, used_color, used_pair = {}, set(), set()
-    for key in sorted({canon_config(x) for x in labels}):
+    prio = {canon_config(x) for x in priority}
+    prio_colors = set()
+    keys = sorted({canon_config(x) for x in labels})
+    for key in sorted(prio.intersection(keys)) + [k for k in keys if k not in prio]:
         h = zlib.crc32(("%d\0%s" % (salt, key)).encode("utf-8"))
         base_c, base_h = h % nc, (h // nc) % nh
         slot = None
+        # A free color is not enough for the series drawn side by side: the
+        # palette holds near-duplicates (#CC79A7 and #DE77AE are both pink), and
+        # two bars in one group separated only by a hue nobody can name are not
+        # distinguishable. For a priority key, take the first free color that is
+        # also far enough from the ones the other priority keys already hold;
+        # fall back to any free color when the palette cannot do better.
+        if key in prio:
+            for min_d in (_COLOR_MIN_DIST, 0):
+                for j in range(nc):
+                    c = (base_c + j) % nc
+                    if c in used_color:
+                        continue
+                    if all(_color_distance(COLORS[c], COLORS[u]) >= min_d
+                           for u in prio_colors):
+                        slot = (c, base_h)
+                        break
+                if slot is not None:
+                    break
+            if slot is not None:
+                prio_colors.add(slot[0])
         for j in range(nc):                 # prefer a color nobody else uses
+            if slot is not None:
+                break
             c = (base_c + j) % nc
             if c not in used_color:
                 slot = (c, base_h)
@@ -327,6 +374,23 @@ def select_evaluated(rows):
         print(f"  {name} is no longer in the app registry: {n} row(s) omitted",
               file=sys.stderr)
     return kept
+
+
+def rows_of_sweep(rows, tag, what):
+    """The rows of one sweep, by `tag` ("" = the untagged main sweep).
+
+    A results file accumulates sweeps -- the main one, the unroll sweep, the JIT
+    cache regimes -- and they measure the same configurations under different
+    conditions. Anything that describes "the evaluation" therefore has to say
+    which sweep it means: without this, the unroll sweep's u=16 rows join the
+    main figure (it draws the largest unroll it can find) and its doubled graphs
+    land in the structure table, which then reports a Krylov iteration as twice
+    the size it is."""
+    out = [r for r in rows if (r.get("tag") or "") == tag]
+    if not out:
+        print(f"  no runs tagged '{tag or '(untagged)'}': {what} will be empty "
+              f"(see --main-tag)", file=sys.stderr)
+    return out
 
 
 def aggregate_repeats(rows):
@@ -789,6 +853,12 @@ PAPER_LABELS = {
     "taskgraph:reduce-node,transitive-reduction,prog-fuse,jit":      "+prog-fuse",
     "taskgraph:reduce-node,transitive-reduction,prog-fuse,jit,sequence,batch":
                                                                      "+packing",
+    # `sequence` was dropped from the default pipeline once it was measured to
+    # batch nothing on any application here (it groups same-device chains, and
+    # these graphs have none that `batch` does not already take). Both spellings
+    # are the same step of the evaluation, so both carry the same label -- older
+    # results stay readable without being re-run.
+    "taskgraph:reduce-node,transitive-reduction,prog-fuse,jit,batch": "+packing",
 }
 
 # Configurations drawn as point markers rather than bars: they are references,
@@ -903,7 +973,7 @@ EXTERNAL_LEGEND = "hand-written CUDA"
 
 def plot_paper_speedup(rows, figdir, dpi, fmt, show, styles, baseline,
                        external, panel_size, apps_order, figsize=None,
-                       unroll=None):
+                       unroll=None, tag=""):
     """The end-to-end figure: one panel per app, speedup over `baseline`.
 
     Speedup rather than time because the four apps differ by two orders of
@@ -918,6 +988,10 @@ def plot_paper_speedup(rows, figdir, dpi, fmt, show, styles, baseline,
     reported in the table instead.
     """
     import matplotlib.pyplot as plt
+
+    rows = rows_of_sweep(rows, tag, "the paper figure")
+    if not rows:
+        return
 
     # load_runs() folded the unroll into the config label; undo that selection
     # here rather than plumb a second key through _panel_series().
@@ -1293,7 +1367,7 @@ COST_PASSES = [
 ]
 
 
-def _cost_rows(rows, cgstats_path, jitstats_path, baseline, baseline_tag,
+def _cost_rows(rows, cgstats_path, jitstats_path, baseline, main_tag,
                full_pipeline, tag):
     """Per-problem cost and amortization for the runs of `full_pipeline` tagged
     `tag` (an empty tag matches the untagged main sweep).
@@ -1303,7 +1377,7 @@ def _cost_rows(rows, cgstats_path, jitstats_path, baseline, baseline_tag,
     `baseline`. Split out so the same computation serves the main sweep and the
     warm-cache sweep, which differ only in which rows they read.
 
-    The baseline is taken from `baseline_tag` alone, not from whichever matching
+    The baseline is taken from `main_tag` alone, not from whichever matching
     row happens to come last. It does not run a CGIR pass, so every sweep that
     includes it measures the same thing -- but not to the same digits, and using
     a different one per regime would put run-to-run noise into the difference
@@ -1316,12 +1390,12 @@ def _cost_rows(rows, cgstats_path, jitstats_path, baseline, baseline_tag,
     base = {}
     for r in rows:
         if (canon_pipeline(r["config"]) == canon_pipeline(baseline)
-                and (r.get("tag") or "") == baseline_tag):
+                and (r.get("tag") or "") == main_tag):
             v = fnum(r.get("avg_ms"))
             if v:
                 base[key(r)] = v
     if not base:
-        print(f"  no '{baseline}' run tagged '{baseline_tag or '(untagged)'}': "
+        print(f"  no '{baseline}' run tagged '{main_tag or '(untagged)'}': "
               f"break-even cannot be computed (see --baseline-tag)", file=sys.stderr)
 
     out = {}
@@ -1391,7 +1465,7 @@ def _emit_table(caption, label, colspec, header, body, out):
         print(f"wrote {out}", file=sys.stderr)
 
 
-def latex_table_graph(rows, cgstats_path, full_pipeline, out):
+def latex_table_graph(rows, cgstats_path, full_pipeline, out, tag=""):
     """The applications and what the passes do to their command graph.
 
     One row per problem: the graph as recorded, after the reduction passes, and
@@ -1402,6 +1476,7 @@ def latex_table_graph(rows, cgstats_path, full_pipeline, out):
     except ImportError:
         APPS = {}
 
+    rows = rows_of_sweep(rows, tag, "the graph table")
     cg = _cg_by_tag(cgstats_path) if Path(cgstats_path).exists() else {}
 
     # One row per problem, taken from its largest unroll -- the same recording the
@@ -1462,7 +1537,7 @@ def latex_table_graph(rows, cgstats_path, full_pipeline, out):
         body, out)
 
 
-def latex_table_cost(rows, cgstats_path, jitstats_path, baseline, baseline_tag,
+def latex_table_cost(rows, cgstats_path, jitstats_path, baseline, main_tag,
                      full_pipeline, cached_tag, out):
     """What the passes cost, and how many replays repay it.
 
@@ -1476,9 +1551,9 @@ def latex_table_cost(rows, cgstats_path, jitstats_path, baseline, baseline_tag,
     except ImportError:
         APPS = {}
 
-    cold   = _cost_rows(rows, cgstats_path, jitstats_path, baseline, baseline_tag,
-                        full_pipeline, "")
-    cached = _cost_rows(rows, cgstats_path, jitstats_path, baseline, baseline_tag,
+    cold   = _cost_rows(rows, cgstats_path, jitstats_path, baseline, main_tag,
+                        full_pipeline, main_tag)
+    cached = _cost_rows(rows, cgstats_path, jitstats_path, baseline, main_tag,
                         full_pipeline, cached_tag)
     if not cached:
         print(f"  no runs tagged '{cached_tag}': the cached break-even column will "
@@ -1603,11 +1678,13 @@ def main():
                     "generated-table-graph.tex (what the passes do to the graph) and "
                     "generated-table-cost.tex (what they cost, and the replays that "
                     "repay it). Joins runs.csv with cgstats.csv/jitstats.csv")
-    ap.add_argument("--baseline-tag", default="",
-                    help="runs.csv `tag` whose --baseline rows are used as THE baseline "
-                    "for every regime (default: the untagged main sweep). Pinning it "
-                    "keeps the cost table's columns comparable when several sweeps "
-                    "measured the same reference")
+    ap.add_argument("--main-tag", default="",
+                    help="runs.csv `tag` of the sweep the paper describes (default: the "
+                    "untagged one). It selects the rows of the figure and the graph "
+                    "table, the cost table's cold column, and the --baseline rows every "
+                    "regime normalizes against. A results file holds several sweeps of "
+                    "the same configurations, so without this the unroll sweep's largest "
+                    "unroll silently takes over the figure")
     ap.add_argument("--cached-tag", default="jit-disk-warm",
                     help="runs.csv `tag` identifying the warm on-disk-JIT-cache sweep, "
                     "which supplies the cost table's cached break-even column. Absent "
@@ -1672,9 +1749,9 @@ def main():
         d = Path(args.latex_tables)
         d.mkdir(parents=True, exist_ok=True)
         latex_table_graph(rows, cgstats_csv, args.pipeline,
-                          str(d / "generated-table-graph.tex"))
+                          str(d / "generated-table-graph.tex"), args.main_tag)
         latex_table_cost(rows, cgstats_csv, jitstats_csv, args.baseline,
-                         args.baseline_tag, args.pipeline, args.cached_tag,
+                         args.main_tag, args.pipeline, args.cached_tag,
                          str(d / "generated-table-cost.tex"))
 
     if args.no_figures:
@@ -1690,7 +1767,13 @@ def main():
         if not Path(extra).exists():
             ap.error(f"--style-universe: no such file {extra}")
         universe += [r["config"] for r in load_runs(extra) if r.get("avg_ms", "")]
-    styles = assign_styles(universe, args.style_salt)
+    # The paper figure strips the unroll from its labels, so its series are the
+    # main sweep's configurations in canonical form; those are the ones that have
+    # to be distinguishable.
+    paper_series = [_UNROLL_SUFFIX.sub("", r["config"])
+                    for r in rows
+                    if (r.get("tag") or "") == args.main_tag and r.get("avg_ms", "")]
+    styles = assign_styles(universe, args.style_salt, paper_series)
     report_styles(styles)
 
     plot_time(rows, figdir, args.dpi, args.logy, args.format, args.show, styles)
@@ -1708,7 +1791,7 @@ def main():
         plot_paper_speedup(rows, figdir, args.dpi, args.format, args.show, styles,
                            args.baseline, external, args.panel_size,
                            [a.strip() for a in args.apps.split(",") if a.strip()],
-                           figsize, args.paper_unroll or None)
+                           figsize, args.paper_unroll or None, args.main_tag)
     if args.paper_unroll_figure and not args.no_figures:
         plot_paper_unroll(rows, figdir, args.dpi, args.format, args.show, styles,
                           args.baseline,

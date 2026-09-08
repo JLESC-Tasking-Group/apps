@@ -461,41 +461,20 @@ LULESH = AppSpec(
 # round 0 are set with the TC_WARMUP env var; the default of 3 is used here.)
 _MNMG_DATA = "MNMGDatalog-reference/data"
 
-# capacity_mult per dataset. The open-addressing result set holds
-# next_pow2(edges * mult) slots and MUST hold >= ~2x TC; below that it saturates,
-# every insert probes result_cap times before giving up, and the run aborts with
-# an overflow message. TC is a property of the graph, not of the edge count, so
-# this cannot be derived from `size` -- the values come from the measured closures
-# (see MNMGDatalog/README.md, "Capacity"):
+# No capacity_mult is passed: tc.x discovers the closure size itself on the first
+# run for a dataset (an untimed probe solve) and caches it in tc_capacity.cache,
+# so every later run in a sweep skips it. See MNMGDatalog/README.md, "Capacity is
+# discovered, not configured".
 #
-#   dataset              edges           TC   mult   result set
-#   OL.cedge             7,035      146,120     64        4 MiB
-#   TG.cedge            23,874      481,121     64       16 MiB
-#   p2p-Gnutella31     147,892  884,179,859   8192       16 GiB
-#   usroad             165,435  871,365,688   8192       16 GiB
-#   fe_ocean           409,593 1,669,750,513  8192       32 GiB
-#   vsp_finan          552,020  910,070,918   2048       16 GiB
-#   com-dblp         1,049,866 1,911,754,892  2048       32 GiB
-#
-# NOTE the old default of 4096 was NOT safe for p2p-Gnutella31 (82% load factor on
-# a linear-probing table); an unknown graph gets 8192 and should be added here
-# once its TC is known.
-_MNMG_MULT = {
-    7035:      64,
-    23874:     64,
-    147892:  8192,
-    165435:  8192,
-    409593:  8192,
-    552020:  2048,
-    1049866: 2048,
-}
-_MNMG_MULT_DEFAULT = 8192
+# The reference's hand-maintained per-dataset multipliers, kept for fidelity runs
+# (`./tc.x <data> <mult>` reproduces the CUDA sizing exactly):
+#   data_7035 64 | data_23874 64 | data_147892 12288 | data_165435 8192
+#   data_409593 8192 | vsp_finan 3456 | com-dblp 3800
 
 # -u also gates the convergence test, which is then only evaluated every `unroll`
 # rounds: the fixpoint may run up to unroll-1 extra (empty, harmless) rounds.
 def _mnmg_run(variant, size, iters, cfg, grain, unroll):
-    mult = _MNMG_MULT.get(size, _MNMG_MULT_DEFAULT)
-    return [f"{_MNMG_DATA}/data_{size}.bin", str(mult), "-u", str(unroll)]
+    return [f"{_MNMG_DATA}/data_{size}.bin", "-u", str(unroll)]
 
 MNMG = AppSpec(
     name="mnmg",

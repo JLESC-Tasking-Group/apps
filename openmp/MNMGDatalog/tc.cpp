@@ -516,6 +516,18 @@ struct TCContext {
     /* Monotonic round counter, TC_TRACE output only (warm-up rounds included). */
     int  trace_round     = 0;
 
+    /* ---- Capacity provenance (see tc_resolve_capacity) --------------------
+     * result_cap / frontier_cap cannot be derived from the input: the TC/edge
+     * ratio spans 21x (OL.cedge) to 5977x (p2p-Gnutella31). They are therefore
+     * DISCOVERED by an untimed, ungraphed probe solve, then cached. `max_node`
+     * bounds the probe's provisional table; sized_tc / sized_peak are what the
+     * probe found. */
+    int    max_node      = 0;    /* largest node id in the input               */
+    u64    sized_tc      = 0;    /* closure size the probe discovered          */
+    long   sized_peak    = 0;    /* peak per-round new_count the probe saw     */
+    enum { CAP_OVERRIDE, CAP_CACHED, CAP_DISCOVERED } cap_source = CAP_OVERRIDE;
+    double t_sizing      = 0.0;  /* wall time of the probe (0 if not run)      */
+
     double t_fileio = 0.0, t_h2d = 0.0, t_setup = 0.0, peak_mem_mb = 0.0;
 };
 
@@ -834,18 +846,27 @@ static double tc_now()
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-static int *tc_read_bin(const char *path, int *n_edges_out)
+/* Also reports the largest node id: tc_resolve_capacity uses (max_node+1)^2 as
+ * the trivial upper bound on the closure size when sizing the probe's table. One
+ * extra pass over data that is already hot in cache. */
+static int *tc_read_bin(const char *path, int *n_edges_out, int *max_node_out)
 {
     struct stat st{};
     if (stat(path, &st) != 0) { fprintf(stderr, "Cannot stat input file %s\n", path); exit(EXIT_FAILURE); }
     long n = st.st_size / (long)(sizeof(int) * 2);
     int *data = (int *)malloc((size_t)n * 2 * sizeof(int));
+    if (!data) { fprintf(stderr, "Out of host memory reading %s\n", path); exit(EXIT_FAILURE); }
     FILE *fp = fopen(path, "rb");
     if (!fp) { fprintf(stderr, "Cannot open %s\n", path); exit(EXIT_FAILURE); }
     size_t got = fread(data, sizeof(int), (size_t)n * 2, fp);
     fclose(fp);
     if (got != (size_t)(n * 2)) { fprintf(stderr, "Short read on %s\n", path); exit(EXIT_FAILURE); }
-    *n_edges_out = (int)n;
+
+    int hi = 0;
+    for (long i = 0; i < n * 2; i++) if (data[i] > hi) hi = data[i];
+
+    *n_edges_out  = (int)n;
+    *max_node_out = hi;
     return data;
 }
 
@@ -890,8 +911,13 @@ static void tc_verify_edge_table(TCContext &ctx, const char *stage, long expecte
     free(h);
 }
 
-static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
-                     long frontier_slots)
+/* ----------------------------------------------------------------------------
+ * Phase 1 of setup: everything that does NOT depend on the closure size --
+ * the input, the edge table, and the two pinned-host scalars. Runs outside the
+ * parallel region. The result set and frontiers are sized separately, because
+ * their size cannot be derived from the input (see tc_resolve_capacity).
+ * ------------------------------------------------------------------------- */
+static void tc_setup_input(TCContext &ctx, const char *input_file)
 {
 #if USE_TARGET
     g_dev  = omp_get_default_device();
@@ -901,7 +927,7 @@ static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
 #endif
 
     double t0 = tc_now();
-    int *edges_host = tc_read_bin(input_file, &ctx.n_edges);
+    int *edges_host = tc_read_bin(input_file, &ctx.n_edges, &ctx.max_node);
     ctx.input_rows = ctx.n_edges;
     ctx.t_fileio = tc_now() - t0;
 
@@ -917,11 +943,18 @@ static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
      * k_writeback then brings both back in one async D2H so the fixpoint can test
      * capacity every instance. Allocated up front because build_edges (below)
      * already needs it to report a full / uninitialised edge table. */
-    ctx.capacity_mult = capacity_mult;
     ctx.overflow = (int *)tc_dcheck(host_alloc(sizeof(int)), "overflow flag", sizeof(int));
     int *ov = ctx.overflow;
     ov[0] = 0;
     OMP_TARGET_ENTER_DATA(MAP(to: ov[0:1]))
+
+    /* new_count: pinned host memory (shared ../alloc.c) with a device copy
+     * created here, so the kernels reach it with map(present:) and k_writeback
+     * can refresh the host side with an in-graph async D2H. */
+    ctx.new_count = (int *)tc_dcheck(host_alloc(sizeof(int)), "new_count", sizeof(int));
+    int *new_count = ctx.new_count;
+    new_count[0] = 0;
+    OMP_TARGET_ENTER_DATA(MAP(alloc: new_count[0:1]))
 
     ctx.edge_cap = (int)tc_next_pow2((long)std::ceil(ctx.n_edges / 0.6));
     if (ctx.edge_cap < 2) ctx.edge_cap = 2;
@@ -934,16 +967,23 @@ static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
     tc_check_overflow(ctx, "edge table", -1);
     tc_verify_edge_table(ctx, "after build", ctx.n_edges);
 
-    long est = (long)ctx.n_edges * capacity_mult;
-    if (est < 4096) est = 4096;
-    ctx.result_cap = tc_next_pow2(est);
+    ctx.t_setup = tc_now() - t0;
+}
 
-    long fcap = (frontier_slots > 0) ? tc_next_pow2(frontier_slots) : (1L << 28);
-    if (fcap > ctx.result_cap) fcap = ctx.result_cap;
+/* ----------------------------------------------------------------------------
+ * Phase 2: the size-dependent buffers. Split out because the discovery probe
+ * allocates them at a provisional size, runs, and frees them again before the
+ * real ones are allocated. `try_only` returns false instead of aborting when an
+ * allocation fails, which is how the probe finds the largest table the device
+ * will give it.
+ * ------------------------------------------------------------------------- */
+static bool tc_alloc_fixpoint(TCContext &ctx, long rcap, long fcap, bool try_only)
+{
+    ctx.result_cap   = rcap;
     ctx.frontier_cap = (int)fcap;
 
-    /* Fixed grid-stride worker count of k_expand / k_promote. Resolved ONCE, here,
-     * so the recorded task graph replays with an identical launch (see
+    /* Fixed grid-stride worker count of k_expand / k_promote. Resolved here, so
+     * the recorded task graph replays with an identical launch (see
      * TC_WORKERS_DEFAULT). Never more workers than the frontier can ever hold. */
 #if USE_TARGET
     long nworkers = TC_WORKERS_DEFAULT;
@@ -956,29 +996,47 @@ static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
     ctx.n_workers = 1;              /* host task: the nest collapses to one loop */
 #endif
 
-    nb = (size_t)ctx.result_cap * sizeof(u64);
-    ctx.d_result_set    = (u64 *)tc_dcheck(dalloc(nb), "result set", nb);
-    fill_result_set(ctx.d_result_set, ctx.result_cap);
-    nb = (size_t)ctx.frontier_cap * sizeof(u64);
-    ctx.d_frontier      = (u64 *)tc_dcheck(dalloc(nb), "frontier", nb);
-    ctx.d_new_frontier  = (u64 *)tc_dcheck(dalloc(nb), "new frontier", nb);
-    ctx.d_frontier_size = (int *)tc_dcheck(dalloc(sizeof(int)),  "frontier size", sizeof(int));
-    ctx.d_result_count  = (u64 *)tc_dcheck(dalloc(sizeof(u64)),  "result count", sizeof(u64));
+    const size_t nb_set = (size_t)rcap * sizeof(u64);
+    const size_t nb_fr  = (size_t)fcap * sizeof(u64);
 
-    /* new_count: pinned host memory (shared ../alloc.c) with a device copy
-     * created here, so the kernels reach it with map(present:) and k_writeback
-     * can refresh the host side with an in-graph async D2H. */
-    ctx.new_count = (int *)tc_dcheck(host_alloc(sizeof(int)), "new_count", sizeof(int));
-    int *new_count = ctx.new_count;
-    new_count[0] = 0;
-    OMP_TARGET_ENTER_DATA(MAP(alloc: new_count[0:1]))
-    ctx.t_setup = tc_now() - t0;
+    ctx.d_result_set    = (u64 *)dalloc(nb_set);
+    ctx.d_frontier      = (u64 *)dalloc(nb_fr);
+    ctx.d_new_frontier  = (u64 *)dalloc(nb_fr);
+    ctx.d_frontier_size = (int *)dalloc(sizeof(int));
+    ctx.d_result_count  = (u64 *)dalloc(sizeof(u64));
+
+    const bool ok = ctx.d_result_set && ctx.d_frontier && ctx.d_new_frontier
+                 && ctx.d_frontier_size && ctx.d_result_count;
+    if (!ok) {
+        if (try_only) {
+            dfree(ctx.d_result_set);    ctx.d_result_set    = nullptr;
+            dfree(ctx.d_frontier);      ctx.d_frontier      = nullptr;
+            dfree(ctx.d_new_frontier);  ctx.d_new_frontier  = nullptr;
+            dfree(ctx.d_frontier_size); ctx.d_frontier_size = nullptr;
+            dfree(ctx.d_result_count);  ctx.d_result_count  = nullptr;
+            return false;
+        }
+        tc_dcheck(ctx.d_result_set,   "result set",    nb_set);
+        tc_dcheck(ctx.d_frontier,     "frontier",      nb_fr);
+        tc_dcheck(ctx.d_new_frontier, "new frontier",  nb_fr);
+        tc_dcheck(ctx.d_frontier_size,"frontier size", sizeof(int));
+        tc_dcheck(ctx.d_result_count, "result count",  sizeof(u64));
+    }
 
     ctx.peak_mem_mb = (double)((size_t)ctx.n_edges * 2 * sizeof(int)
                              + (size_t)ctx.edge_cap * sizeof(Entity)
-                             + (size_t)ctx.result_cap * sizeof(u64)
-                             + 2 * (size_t)ctx.frontier_cap * sizeof(u64))
+                             + nb_set + 2 * nb_fr)
                     / (1024.0 * 1024.0);
+    return true;
+}
+
+static void tc_free_fixpoint(TCContext &ctx)
+{
+    dfree(ctx.d_result_set);    ctx.d_result_set    = nullptr;
+    dfree(ctx.d_frontier);      ctx.d_frontier      = nullptr;
+    dfree(ctx.d_new_frontier);  ctx.d_new_frontier  = nullptr;
+    dfree(ctx.d_frontier_size); ctx.d_frontier_size = nullptr;
+    dfree(ctx.d_result_count);  ctx.d_result_count  = nullptr;
 }
 
 /* Re-seed the fixpoint state: once before the warm-up rounds, once before the
@@ -995,6 +1053,261 @@ static void tc_reset_state(TCContext &ctx)
     /* new_count needs no reset here: k_reset zeroes the device copy at the top
      * of every fixpoint round, and tc_run_fixpoint primes the host copy. */
     init_base(ctx);
+}
+
+/* ----------------------------------------------------------------------------
+ * Capacity: discovered, not configured.
+ *
+ * The result set is a fixed pre-allocated open-addressing table -- that is what
+ * makes the per-round kernel sequence loop-invariant and therefore replayable,
+ * and it is the whole point of the fused design (the original MNMGDatalog engine
+ * needs no capacity because it cudaMallocs and re-sorts the entire relation
+ * every round; see MNMGDatalog-reference/tc.cu, which is exactly the cost this
+ * design removes).
+ *
+ * A fixed table needs a size up front, and that size CANNOT be derived from the
+ * input: the TC/edge ratio spans 21x (OL.cedge) to 5977x (p2p-Gnutella31). The
+ * CUDA benchmark this is ported from resolves that with a hand-maintained
+ * per-dataset table (tc_benchmark/tests/benchmark.sh) and a mandatory
+ * capacity_mult argument. We instead DISCOVER it:
+ *
+ *   1. explicit capacity_mult (arg 2)  -> reference-compatible, no cache
+ *   2. cache hit                       -> sizes recomputed from a stored TC
+ *   3. otherwise                       -> probe solve, then cache
+ *
+ * The probe runs the real fixpoint once, untimed and UNGRAPHED, on a provisional
+ * table, and reports the exact closure size and the peak per-round new_count.
+ * It must run before the measured solve because the taskgraph records buffer
+ * pointers -- growing the table mid-solve would invalidate a recorded graph, and
+ * xkomp has no graph-reset (XKOMP_TASKGRAPH_FLAG_RESET is not supported).
+ * ------------------------------------------------------------------------- */
+
+/* Load factor bound: result_cap >= TC_LOAD_HEADROOM * TC, i.e. <= 50% full by
+ * default, which is what the reference targets ("must be >= ~2x TC"). */
+#ifndef TC_LOAD_HEADROOM
+# define TC_LOAD_HEADROOM 2
+#endif
+
+/* First table the probe tries, before the trial allocation shrinks it to what
+ * the device will actually give. 2^32 slots = 34 GiB covers every dataset in the
+ * README capacity table in a single attempt; smaller devices just shrink. */
+#ifndef TC_PROBE_MAX_SLOTS
+# define TC_PROBE_MAX_SLOTS (1L << 32)
+#endif
+
+static const char *tc_cache_path(void)
+{
+    const char *p = getenv("TC_CACHE");
+    return (p && p[0]) ? p : "tc_capacity.cache";
+}
+
+static const char *tc_basename(const char *path)
+{
+    const char *b = strrchr(path, '/');
+    return b ? b + 1 : path;
+}
+
+/* One line per dataset: "<basename> <edges> <tc> <peak_frontier>". Only the
+ * measured quantities are stored, never the derived capacities, so the
+ * derivation below can change without invalidating existing entries. */
+static bool tc_cache_lookup(const char *input_file, int n_edges, u64 *tc, long *peak)
+{
+    FILE *f = fopen(tc_cache_path(), "r");
+    if (!f) return false;
+
+    const char *want = tc_basename(input_file);
+    char line[512];
+    bool hit = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#') continue;
+        char name[256]; long e = 0, pk = 0; unsigned long long t = 0;
+        if (sscanf(line, "%255s %ld %llu %ld", name, &e, &t, &pk) != 4) continue;
+        if (strcmp(name, want) != 0 || e != (long)n_edges) continue;
+        *tc = (u64)t; *peak = pk; hit = true; break;
+    }
+    fclose(f);
+    return hit;
+}
+
+/* Best-effort: the cache is an optimisation, so a write failure is silent. */
+static void tc_cache_store(const char *input_file, int n_edges, u64 tc, long peak)
+{
+    const char *path = tc_cache_path();
+    const char *want = tc_basename(input_file);
+
+    /* Rewrite, dropping any stale entry for this dataset. */
+    char (*keep)[512] = nullptr; int nkeep = 0, cap = 0;
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            char name[256];
+            if (line[0] != '#' && sscanf(line, "%255s", name) == 1 && !strcmp(name, want))
+                continue;
+            if (nkeep == cap) {
+                cap = cap ? cap * 2 : 32;
+                keep = (char (*)[512])realloc(keep, (size_t)cap * 512);
+                if (!keep) { fclose(f); return; }
+            }
+            snprintf(keep[nkeep++], 512, "%s", line);
+        }
+        fclose(f);
+    }
+
+    f = fopen(path, "w");
+    if (!f) { free(keep); return; }
+    fprintf(f, "# tc.x discovered capacities -- safe to delete, it is only a cache.\n"
+               "# <dataset> <edges> <tc> <peak_frontier>\n");
+    for (int i = 0; i < nkeep; i++) fputs(keep[i], f);
+    fprintf(f, "%s %d %llu %ld\n", want, n_edges, tc, peak);
+    fclose(f);
+    free(keep);
+}
+
+/* The probe: run the fixpoint to convergence, ungraphed and untimed, recording
+ * the closure size and the largest per-round new_count. Returns false if the
+ * provisional table overflowed, in which case the caller retries bigger.
+ *
+ * Must be called from inside the enclosing single region: it creates tasks. It
+ * deliberately calls tc_round directly rather than tc_run_fixpoint, so that (a)
+ * no taskgraph is recorded and (b) every round's new_count is observed -- an
+ * unrolled taskgraph loop only samples the count every `unroll` rounds and would
+ * under-report the peak. */
+static bool tc_size_probe(TCContext &ctx, u64 *tc_out, long *peak_out)
+{
+    tc_reset_state(ctx);
+
+    int *nc = ctx.new_count; int *ov = ctx.overflow;
+    long peak = 0;
+    nc[0] = 1;
+    while (nc[0] > 0) {
+        tc_round(ctx);
+        #pragma omp taskwait
+        if (ov[0]) return false;
+        if (nc[0] > peak) peak = nc[0];
+    }
+    *tc_out  = tc_read_u64(ctx.d_result_count);
+    *peak_out = peak;
+    return true;
+}
+
+static long tc_cap_from_tc(u64 tc)
+{
+    long want = (long)(tc * (u64)TC_LOAD_HEADROOM);
+    if (want < 4096) want = 4096;
+    return tc_next_pow2(want);
+}
+
+static long tc_cap_from_peak(long peak, long result_cap)
+{
+    long want = peak * TC_LOAD_HEADROOM;
+    if (want < 4096) want = 4096;
+    long fcap = tc_next_pow2(want);
+    if (fcap > result_cap) fcap = result_cap;
+    return fcap;
+}
+
+/* Resolve result_cap / frontier_cap and leave the FINAL buffers allocated.
+ * Must be called from inside the enclosing single region (the probe runs tasks). */
+static void tc_resolve_capacity(TCContext &ctx, const char *input_file,
+                                long capacity_mult, long frontier_slots)
+{
+    /* --- 1. explicit override: reproduce the reference's sizing exactly ----- */
+    if (capacity_mult > 0) {
+        ctx.capacity_mult = capacity_mult;
+        ctx.cap_source    = TCContext::CAP_OVERRIDE;
+        long est = (long)ctx.n_edges * capacity_mult;
+        if (est < 4096) est = 4096;
+        long rcap = tc_next_pow2(est);
+        long fcap = (frontier_slots > 0) ? tc_next_pow2(frontier_slots) : (1L << 28);
+        if (fcap > rcap) fcap = rcap;
+        tc_alloc_fixpoint(ctx, rcap, fcap, false);
+        return;
+    }
+
+    /* --- 2. cache ---------------------------------------------------------- */
+    u64 tc = 0; long peak = 0;
+    if (tc_cache_lookup(input_file, ctx.n_edges, &tc, &peak)) {
+        ctx.cap_source = TCContext::CAP_CACHED;
+        ctx.sized_tc = tc; ctx.sized_peak = peak;
+        long rcap = tc_cap_from_tc(tc);
+        long fcap = (frontier_slots > 0) ? tc_next_pow2(frontier_slots)
+                                         : tc_cap_from_peak(peak, rcap);
+        if (fcap > rcap) fcap = rcap;
+        tc_alloc_fixpoint(ctx, rcap, fcap, false);
+        return;
+    }
+
+    /* --- 3. discovery ------------------------------------------------------ */
+    const double s0 = tc_now();
+
+    /* Two bounds on the probe's provisional table: (max_node+1)^2 is the trivial
+     * upper bound on the closure size, and TC_PROBE_MAX_SLOTS keeps the first
+     * attempt to something a GPU plausibly has (34 GiB by default, which covers
+     * every dataset in the README's capacity table in ONE attempt). The trial
+     * allocation below shrinks further if the device says no. */
+    const long nodes = (long)ctx.max_node + 1;
+    long vbound = (nodes < 3037000499L) ? tc_next_pow2(nodes * nodes) : TC_PROBE_MAX_SLOTS;
+    long floor_ = tc_next_pow2((long)ctx.n_edges * 64);
+    if (floor_ < 4096) floor_ = 4096;
+
+    long prov = vbound < TC_PROBE_MAX_SLOTS ? vbound : TC_PROBE_MAX_SLOTS;
+    if (prov < floor_) prov = floor_;
+
+    fprintf(stderr,
+        "# sizing pass: closure size unknown for %s -- probing (untimed, cached\n"
+        "#              in %s for later runs; pass capacity_mult to skip).\n",
+        tc_basename(input_file), tc_cache_path());
+    fflush(stderr);
+
+    /* Largest table already known to be TOO SMALL. If the trial allocation ever
+     * has to shrink back to it, the closure simply does not fit on this device --
+     * without this the loop could oscillate (grow x4, shrink /2) forever. */
+    long too_small = 0;
+
+    for (;;) {
+        long pf = prov < (1L << 28) ? prov : (1L << 28);
+        while (prov >= floor_ && !tc_alloc_fixpoint(ctx, prov, pf, /*try_only=*/true)) {
+            prov >>= 1;
+            pf = prov < (1L << 28) ? prov : (1L << 28);
+        }
+        if (prov < floor_ || prov <= too_small) {
+            fprintf(stderr,
+                "ERROR: cannot size %s -- the device cannot hold a table large\n"
+                "       enough for its transitive closure (largest that fits: %ld\n"
+                "       slots, known too small: %ld). Use a larger device, or pass\n"
+                "       an explicit capacity_mult to bypass the sizing pass.\n",
+                tc_basename(input_file), prov, too_small);
+            exit(2);
+        }
+
+        if (tc_size_probe(ctx, &tc, &peak))     /* tc_reset_state fills the table */
+            break;
+
+        /* Overflowed: the closure is bigger than this table. A failed probe is
+         * cheap -- it aborts as soon as the table fills. Grow and retry. */
+        tc_free_fixpoint(ctx);
+        too_small = prov;
+        prov <<= 2;
+    }
+    tc_free_fixpoint(ctx);
+
+    ctx.cap_source = TCContext::CAP_DISCOVERED;
+    ctx.sized_tc = tc; ctx.sized_peak = peak;
+
+    long rcap = tc_cap_from_tc(tc);
+    long fcap = (frontier_slots > 0) ? tc_next_pow2(frontier_slots)
+                                     : tc_cap_from_peak(peak, rcap);
+    if (fcap > rcap) fcap = rcap;
+    tc_alloc_fixpoint(ctx, rcap, fcap, false);
+
+    ctx.t_sizing = tc_now() - s0;
+    tc_cache_store(input_file, ctx.n_edges, tc, peak);
+
+    fprintf(stderr, "# sizing pass: TC=%llu, peak frontier=%ld  ->  result_cap=%ld, "
+                    "frontier_cap=%d  (%.3f s)\n",
+            tc, peak, ctx.result_cap, ctx.frontier_cap, ctx.t_sizing);
+    fflush(stderr);
 }
 
 static void tc_teardown(TCContext &ctx)
@@ -1141,7 +1454,9 @@ int main(int argc, char **argv)
     }
 
     const char *input_file = pos[0] ? pos[0] : "MNMGDatalog-reference/data/data_10.bin";
-    long capacity_mult  = pos[1] ? atol(pos[1]) : 64;
+    /* 0 = auto: discover the closure size and right-size the tables. A positive
+     * value reproduces the CUDA reference's next_pow2(edges*mult) sizing. */
+    long capacity_mult  = pos[1] ? atol(pos[1]) : 0;
     long frontier_slots = pos[2] ? atol(pos[2]) : 0;
 
     const char *ur = getenv("TC_UNROLL");
@@ -1154,7 +1469,7 @@ int main(int argc, char **argv)
     if (warmups < 0) warmups = 0;
 
     TCContext ctx;
-    tc_setup(ctx, input_file, capacity_mult, frontier_slots);
+    tc_setup_input(ctx, input_file);
 
     /* One enclosing parallel/single spans the warm-up AND the measured fixpoint.
      * The warm-up rounds run the same kernels with the taskgraph wrapper DISABLED,
@@ -1169,6 +1484,11 @@ int main(int argc, char **argv)
     #pragma omp parallel
     #pragma omp single
     {
+        /* Sizes the result set / frontiers. May run an untimed, ungraphed probe
+         * solve; it must happen HERE, before anything is recorded, because the
+         * taskgraph captures buffer pointers. */
+        tc_resolve_capacity(ctx, input_file, capacity_mult, frontier_slots);
+
         tc_reset_state(ctx);
         tc_warmup(ctx, warmups);
 
@@ -1236,6 +1556,17 @@ int main(int argc, char **argv)
 #endif
     printf("  %-11s: %d untimed round%s (ungraphed)\n",
            "warm-up", warmups, warmups == 1 ? "" : "s");
+    printf("  %-11s: result_cap=%ld slots (%.2f GiB), frontier_cap=%d (%.2f GiB each)\n",
+           "capacity", ctx.result_cap,
+           (double)ctx.result_cap * (double)sizeof(u64) / (1024.0 * 1024.0 * 1024.0),
+           ctx.frontier_cap,
+           (double)ctx.frontier_cap * (double)sizeof(u64) / (1024.0 * 1024.0 * 1024.0));
+    if (ctx.cap_source == TCContext::CAP_OVERRIDE)
+        printf("  %-11s  from capacity_mult=%ld (reference sizing)\n", "", ctx.capacity_mult);
+    else
+        printf("  %-11s  %s: TC=%llu, peak frontier=%ld\n", "",
+               ctx.cap_source == TCContext::CAP_CACHED ? "cached" : "discovered",
+               ctx.sized_tc, ctx.sized_peak);
     printf("  %-11s: %.2f MB\n", "peak memory", ctx.peak_mem_mb);
 
     printf("Statistics\n");
@@ -1245,6 +1576,9 @@ int main(int argc, char **argv)
     printf("  %-27s : %10.3f ms\n", "  setup",        ctx.t_setup * 1000.0);
     printf("  %-27s : %10.3f ms\n", "  compute",      compute_s   * 1000.0);
     printf("  %-27s : %10.3f ms\n", "  D2H transfer", d2h         * 1000.0);
+    if (ctx.t_sizing > 0.0)
+        printf("  %-27s : %10.3f ms   (once per dataset, cached; NOT in the total)\n",
+               "sizing pass", ctx.t_sizing * 1000.0);
 
     {
         char lbl[64];

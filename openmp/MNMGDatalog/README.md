@@ -77,11 +77,14 @@ make                                     # CPU tasks (default), for correctness
 make test                                # data_7035.bin (TC=146120, 64 rounds)
 ```
 
+`capacity_mult` is **optional** -- omit it and the closure size is discovered and
+cached automatically (see "Capacity is discovered, not configured").
+
 The fixpoint runs **once**; the number of rounds is determined by the dataset, not
 by a command-line knob.
 
-Environment: `TC_WARMUP=<n>` untimed, ungraphed warm-up rounds before round 0
-(default 3); `TC_WORKERS=<n>` overrides the GPU grid-stride worker count (see
+Environment: `TC_CACHE=<f>` capacity cache file (default `./tc_capacity.cache`);
+`TC_WARMUP=<n>` untimed, ungraphed warm-up rounds before round 0 (default 3); `TC_WORKERS=<n>` overrides the GPU grid-stride worker count (see
 below); `TC_VERIFY=1` reads the edge table back after the fill and after the
 build and reports the occupied-slot counts (a device-side sanity check, off by
 default); `TC_TRACE=1` prints one flushed stderr line per kernel dispatch (see
@@ -167,41 +170,74 @@ the body -- exactly the reference's fixed `<<<32*numSM, 512>>>` geometry with
 to `frontier_cap`. On the CPU backend it is 1 and the nest collapses to the plain
 loop.
 
-## Capacity -- read this before running anything but the two small graphs
+## Capacity is discovered, not configured
 
-The result set is sized `next_pow2(n_edges * capacity_mult)` and must hold
-**>= ~2x the TC size**. TC is a property of the *graph*, not of the edge count, so
-`capacity_mult` cannot be derived from the input size: the default of 64 is
-sufficient for `data_7035` and `data_23874` **and for nothing else**.
+The result set is a fixed pre-allocated open-addressing table -- that is what
+makes the per-round kernel sequence loop-invariant and therefore replayable, and
+it is the whole point of the fused design. The *original* MNMGDatalog engine
+(`MNMGDatalog-reference/tc.cu`) needs no capacity at all because it
+`cudaMalloc`s and re-sorts the entire relation every round -- precisely the cost
+this design removes.
 
-| dataset | file | edges | rounds | TC | TC/round | `capacity_mult` | result set |
-|---|---|---:|---:|---:|---:|---:|---:|
-| OL.cedge | `data_7035.bin` | 7 035 | 64 | 146 120 | 2 283 | **64** | 4 MiB |
-| TG.cedge | `data_23874.bin` | 23 874 | 58 | 481 121 | 8 295 | **64** | 16 MiB |
-| p2p-Gnutella31 | `data_147892.bin` | 147 892 | 31 | 884 179 859 | 28 522 576 | **8192** | 16 GiB |
-| usroad | `data_165435.bin` | 165 435 | 606 | 871 365 688 | 1 437 840 | **8192** | 16 GiB |
-| fe_ocean | `data_409593.bin` | 409 593 | 247 | 1 669 750 513 | 6 760 526 | **8192** | 32 GiB |
-| vsp_finan | `vsp_finan512_scagr7-2c_rlfddd.bin` | 552 020 | 520 | 910 070 918 | 1 750 136 | **2048** | 16 GiB |
-| com-dblp | `com-dblpungraph.bin` | 1 049 866 | 31 | 1 911 754 892 | 61 670 160 | **2048** | 32 GiB |
+A fixed table needs a size up front, and that size **cannot be derived from the
+input**: the TC/edge ratio spans 21x (`OL.cedge`) to 5977x (`p2p-Gnutella31`).
+The CUDA benchmark this is ported from resolves that with a hand-maintained
+per-dataset lookup table and a mandatory `capacity_mult` argument
+(`tc_benchmark/tests/benchmark.sh:42-67`). We discover it instead:
 
 ```shell
-./tc.x MNMGDatalog-reference/data/data_147892.bin 8192      # 16 GiB result set
+./tc.x MNMGDatalog-reference/data/data_147892.bin        # just works
 ```
 
-Undersizing is detected and reported, not silently wrong: every insert path sets
-a device-side overflow flag, `k_writeback` returns it to the host together with
-`new_count` in the same async D2H, and the fixpoint aborts on the next
-convergence test with the offending capacity printed. The frontier readers
-(`k_promote`, `k_set_sizes`) clamp to `frontier_cap`, so an overflowing round can
-no longer walk off the end of the frontier buffers -- which used to surface as
-`cuStreamSynchronize ... an illegal memory access was encountered`, because
-`new_count` counts *every* new fact while only the first `frontier_cap` are
-stored.
+On the first run for a dataset, an **untimed, ungraphed probe solve** runs the
+real fixpoint once on a provisional table, learns the exact closure size and the
+peak per-round frontier, then reallocates to
+`next_pow2(2*TC)` / `next_pow2(2*peak)` for the measured run:
 
-Frontier buffers are decoupled: `min(result_cap, 2^28)` slots each, i.e. 2 GiB
-apiece at the cap. `TC/round` above is the average; for com-dblp (61.7 M
-facts/round) the peak may approach the 2^28 default, in which case raise
-`frontier_slots` (arg 3).
+```
+# sizing pass: closure size unknown for data_147892.bin -- probing (untimed, cached
+#              in tc_capacity.cache for later runs; pass capacity_mult to skip).
+# sizing pass: TC=884179859, peak frontier=61234567 -> result_cap=2147483648, ...
+```
+
+The result is cached in `tc_capacity.cache` (override with `TC_CACHE=<file>`),
+keyed on dataset name and edge count, so every later run and every sweep skips
+the probe. Delete the file to re-discover. The probe reports its wall time as a
+separate `sizing pass` statistic and is **excluded** from
+`total time (end-to-end)`.
+
+The probe must run before anything is recorded, because the taskgraph captures
+buffer pointers -- growing the table mid-solve would invalidate a recorded graph,
+and xkomp has no graph reset.
+
+### Overriding
+
+Passing `capacity_mult` (arg 2) skips discovery entirely and reproduces the
+reference's `next_pow2(edges * mult)` sizing, for fidelity comparisons:
+
+| dataset | edges | rounds | TC | reference `capacity_mult` |
+|---|---:|---:|---:|---:|
+| OL.cedge (`data_7035`) | 7 035 | 64 | 146 120 | 64 |
+| TG.cedge (`data_23874`) | 23 874 | 58 | 481 121 | 64 |
+| p2p-Gnutella31 (`data_147892`) | 147 892 | 31 | 884 179 859 | 12288 |
+| usroad (`data_165435`) | 165 435 | 606 | 871 365 688 | 8192 |
+| fe_ocean (`data_409593`) | 409 593 | 247 | 1 669 750 513 | 8192 |
+| vsp_finan | 552 020 | 520 | 910 070 918 | 3456 |
+| com-dblp | 1 049 866 | 31 | 1 911 754 892 | 3800 |
+
+`frontier_slots` (arg 3) likewise overrides the discovered frontier size.
+
+Note that auto-sizing generally allocates **less** than the reference: the
+hardcoded mults over-provision on most datasets, and the frontier is sized from
+the observed peak rather than a flat `min(result_cap, 2^28)` (2 GiB each). That
+shrinks `setup` and the `compact` scan, which is folded into `compute`.
+
+Undersizing (only reachable via an explicit `capacity_mult`) is detected, not
+silently wrong: every insert path sets a device-side overflow flag, `k_writeback`
+returns it with `new_count` in the same async D2H, and the fixpoint aborts on the
+next convergence test with the offending capacity printed. The frontier readers
+(`k_promote`, `k_set_sizes`) clamp to `frontier_cap`, so an overflowing round
+cannot walk off the end of the frontier buffers.
 
 ## Correctness
 

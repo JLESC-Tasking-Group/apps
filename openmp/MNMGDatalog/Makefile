@@ -10,6 +10,11 @@
 #     make USE_SYNC=1               # synchronous blocking baseline
 #
 # Run: ./tc.x <data.bin> [capacity_mult] [frontier_slots]
+#   capacity_mult is OPTIONAL and defaults to auto: the closure size is
+#   discovered by an untimed probe solve and cached in tc_capacity.cache, so
+#   `./tc.x <data.bin>` just works. Pass a value to reproduce the CUDA
+#   reference's next_pow2(edges*mult) sizing instead.
+#   TC_CACHE=<f>   capacity cache file (default ./tc_capacity.cache)
 #   TC_WARMUP=<n>  untimed, ungraphed warm-up rounds before round 0 (default 3)
 #   TC_WORKERS=<n> grid-stride worker count of the GPU fixpoint kernels
 #   TC_VERIFY=1    read the edge table back and check the fill / build on device
@@ -41,7 +46,7 @@ CFLAGS += -DTC_MAPPED_MEM=$(TC_MAPPED_MEM)
 # Datasets live in the reference checkout inside this app directory.
 DATA_DIR ?= MNMGDatalog-reference/data
 DATA     ?= $(DATA_DIR)/data_7035.bin
-MULT     ?= 64
+MULT     ?=            # empty = auto-size (see tc_resolve_capacity in tc.cpp)
 
 program = tc.x
 

@@ -460,8 +460,36 @@ LULESH = AppSpec(
 # the synchronous 1-task/loop are irrelevant. (The untimed warm-up rounds before
 # round 0 are set with the TC_WARMUP env var; the default of 3 is used here.)
 _MNMG_DATA = "MNMGDatalog-reference/data"
-_MNMG_MULT = {7035: 64, 23874: 64}     # verified small graphs (TC 146120 / 481121)
-_MNMG_MULT_DEFAULT = 4096              # generous default; raise via a larger set
+
+# capacity_mult per dataset. The open-addressing result set holds
+# next_pow2(edges * mult) slots and MUST hold >= ~2x TC; below that it saturates,
+# every insert probes result_cap times before giving up, and the run aborts with
+# an overflow message. TC is a property of the graph, not of the edge count, so
+# this cannot be derived from `size` -- the values come from the measured closures
+# (see MNMGDatalog/README.md, "Capacity"):
+#
+#   dataset              edges           TC   mult   result set
+#   OL.cedge             7,035      146,120     64        4 MiB
+#   TG.cedge            23,874      481,121     64       16 MiB
+#   p2p-Gnutella31     147,892  884,179,859   8192       16 GiB
+#   usroad             165,435  871,365,688   8192       16 GiB
+#   fe_ocean           409,593 1,669,750,513  8192       32 GiB
+#   vsp_finan          552,020  910,070,918   2048       16 GiB
+#   com-dblp         1,049,866 1,911,754,892  2048       32 GiB
+#
+# NOTE the old default of 4096 was NOT safe for p2p-Gnutella31 (82% load factor on
+# a linear-probing table); an unknown graph gets 8192 and should be added here
+# once its TC is known.
+_MNMG_MULT = {
+    7035:      64,
+    23874:     64,
+    147892:  8192,
+    165435:  8192,
+    409593:  8192,
+    552020:  2048,
+    1049866: 2048,
+}
+_MNMG_MULT_DEFAULT = 8192
 
 # -u also gates the convergence test, which is then only evaluated every `unroll`
 # rounds: the fixpoint may run up to unroll-1 extra (empty, harmless) rounds.
@@ -478,7 +506,10 @@ MNMG = AppSpec(
     run_args=_mnmg_run,
     parse=_parse_mnmg,
     work=lambda n: (float(n), "edges"),
-    sizes=[7035, 23874],
+    # 147892 needs a 16 GiB result set (see _MNMG_MULT); the two small graphs are
+    # sub-100 MiB. The remaining datasets (165435, 409593, 552020, 1049866) are
+    # sized in _MNMG_MULT and can be added once the 16-32 GiB runs are budgeted.
+    sizes=[7035, 23874, 147892],
     iters=0,                           # unused: round count comes from the data
     pretty="MNMG",
     klass="Graph analytics",

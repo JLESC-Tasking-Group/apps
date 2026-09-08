@@ -210,8 +210,11 @@ static inline void tc_init_base_one(int i, const int *edges, u64 *set, long rcap
     int a = edges[i * 2], b = edges[i * 2 + 1];
     u64 p = tc_pack(a, b);
     if (tc_set_insert(set, rcap, p, overflow)) {
+        /* The counter is bumped for every new fact, so it can run past fcap (and,
+         * in the extreme, wrap negative) once the frontier is full: the unsigned
+         * compare covers both, and the append is skipped. */
         int w = tc_fetch_add_i32(fsize, 1);
-        if (w < fcap) frontier[w] = p; else *overflow = 1;
+        if ((unsigned)w < (unsigned)fcap) frontier[w] = p; else *overflow = 1;
         tc_fetch_add_u64(rcount, 1ULL);
     }
 }
@@ -232,8 +235,12 @@ static inline void tc_expand_one(int i, const Entity *edge_table, int edge_cap,
             int c = edge_table[pos].value;
             u64 np = tc_pack(a, c);
             if (tc_set_insert(set, rcap, np, overflow)) {
+                /* See tc_init_base_one: new_count counts every new fact, so it
+                 * overruns nfcap (and may wrap negative) once the frontier fills.
+                 * The unsigned compare keeps the append in bounds; k_promote and
+                 * k_set_sizes clamp the *readers* of new_count to nfcap. */
                 int w = tc_fetch_add_i32(new_count, 1);
-                if (w < nfcap) new_frontier[w] = np; else *overflow = 1;
+                if ((unsigned)w < (unsigned)nfcap) new_frontier[w] = np; else *overflow = 1;
                 tc_fetch_add_u64(rcount, 1ULL);
             }
         } else if (k == -1) {
@@ -304,7 +311,6 @@ static void fill_result_set(u64 *set, long cap)
 #endif
 }
 
-static inline int tc_read_i32(int *dev) { int h;  from_dev(&h, dev, sizeof(int)); return h; }
 static inline u64 tc_read_u64(u64 *dev) { u64 h;  from_dev(&h, dev, sizeof(u64)); return h; }
 
 /* Abort on a failed allocation instead of letting the NULL reach a kernel. On the
@@ -351,18 +357,56 @@ struct TCContext {
     int  n_workers      = 1;
 
     int *d_frontier_size = nullptr;
-    /* new_count is the ONE scalar the host reads every iteration (the fixpoint
-     * convergence test), so unlike the other buffers it is pinned HOST memory
-     * (host_alloc) mapped onto the device with map(alloc:)/map(present:), as the
-     * Krylov solvers do for their scalars. k_writeback then refreshes the host
-     * copy with an in-graph async D2H, so no blocking omp_target_memcpy is
-     * needed inside the timed loop. */
+    /* new_count and overflow are the TWO scalars the host reads every instance
+     * (the fixpoint convergence test and the capacity check), so unlike the other
+     * buffers they are pinned HOST memory (host_alloc) mapped onto the device with
+     * map(alloc:)/map(present:), as the Krylov solvers do for their scalars.
+     * k_writeback refreshes both with a single in-graph async D2H, so no blocking
+     * omp_target_memcpy is needed inside the timed loop. */
     int *new_count       = nullptr;
+    int *overflow        = nullptr;
     u64 *d_result_count  = nullptr;
-    int *d_overflow      = nullptr;
+
+    /* Kept for the overflow diagnostic: it names the knob to raise. */
+    long capacity_mult   = 0;
 
     double t_fileio = 0.0, t_h2d = 0.0, t_setup = 0.0, peak_mem_mb = 0.0;
 };
+
+/* The overflow flag is a benign store from every insert path: the edge table
+ * (build_edges), the result set and the frontiers (init_base / k_expand). It is
+ * pinned host memory mapped onto the device, and k_writeback refreshes it once
+ * per instance, so an undersized run is caught within milliseconds instead of
+ * grinding through a saturated open-addressing table (every insert into a full
+ * table probes result_cap times before giving up).
+ *
+ * `instance` is the fixpoint instance that tripped it, or -1 during setup. */
+static void tc_check_overflow(TCContext &ctx, const char *what, int instance)
+{
+    if (!ctx.overflow || !ctx.overflow[0]) return;
+
+    fprintf(stderr, "\nERROR: %s overflow", what);
+    if (instance >= 0) fprintf(stderr, " at instance %d", instance);
+    fprintf(stderr, ".\n");
+
+    if (ctx.result_cap > 0)
+        fprintf(stderr,
+            "       %d edges, capacity_mult=%ld  ->  result_cap=%ld slots (%.2f GB),\n"
+            "       frontier_cap=%d slots (%.2f GB each).\n"
+            "       The transitive closure does not fit: the result set must hold\n"
+            "       >= ~2x TC. Re-run with a larger capacity_mult (arg 2); see the\n"
+            "       capacity table in README.md for the per-dataset values.\n",
+            ctx.input_rows, ctx.capacity_mult, ctx.result_cap,
+            (double)ctx.result_cap * (double)sizeof(u64) / (1024.0 * 1024.0 * 1024.0),
+            ctx.frontier_cap,
+            (double)ctx.frontier_cap * (double)sizeof(u64) / (1024.0 * 1024.0 * 1024.0));
+    else
+        fprintf(stderr,
+            "       %d edges, edge_cap=%d slots. The edge table could not absorb the\n"
+            "       input: it was either full or never initialised to the -1 marker.\n",
+            ctx.input_rows, ctx.edge_cap);
+    exit(2);
+}
 
 /* ------------------------------------------------------------------------- */
 /* Setup / finalize kernels (blocking; NOT part of the recorded task graph).  */
@@ -370,9 +414,9 @@ struct TCContext {
 static void build_edges(TCContext &ctx)
 {
     int n = ctx.n_edges, cap = ctx.edge_cap;
-    int *edges = ctx.d_edges; Entity *table = ctx.d_edge_table; int *ov = ctx.d_overflow;
+    int *edges = ctx.d_edges; Entity *table = ctx.d_edge_table; int *ov = ctx.overflow;
 #if USE_TARGET
-    #pragma omp target teams distribute parallel for is_device_ptr(edges, table, ov)
+    #pragma omp target teams distribute parallel for is_device_ptr(edges, table) map(present: ov[0:1])
     for (int i = 0; i < n; i++) tc_build_one(i, edges, table, cap, ov);
 #else
     #pragma omp parallel for
@@ -385,9 +429,9 @@ static void init_base(TCContext &ctx)
     int n = ctx.n_edges, fcap = ctx.frontier_cap; long rcap = ctx.result_cap;
     int *edges = ctx.d_edges; u64 *set = ctx.d_result_set;
     u64 *fr = ctx.d_frontier; int *fs = ctx.d_frontier_size;
-    u64 *rc = ctx.d_result_count; int *ov = ctx.d_overflow;
+    u64 *rc = ctx.d_result_count; int *ov = ctx.overflow;
 #if USE_TARGET
-    #pragma omp target teams distribute parallel for is_device_ptr(edges, set, fr, fs, rc, ov)
+    #pragma omp target teams distribute parallel for is_device_ptr(edges, set, fr, fs, rc) map(present: ov[0:1])
     for (int i = 0; i < n; i++) tc_init_base_one(i, edges, set, rcap, fr, fcap, fs, rc, ov);
 #else
     #pragma omp parallel for
@@ -454,15 +498,15 @@ static void k_expand(TCContext &ctx)
     u64 *fr = ctx.d_frontier; int *fs = ctx.d_frontier_size;
     u64 *rs = ctx.d_result_set; long rc = ctx.result_cap;
     u64 *nf = ctx.d_new_frontier; int nfc = ctx.frontier_cap;
-    int *ncnt = ctx.new_count; u64 *rcnt = ctx.d_result_count; int *ov = ctx.d_overflow;
+    int *ncnt = ctx.new_count; u64 *rcnt = ctx.d_result_count; int *ov = ctx.overflow;
     int nw = ctx.n_workers;
     /* GPU: is_device_ptr (mp slot) carries the device-only buffers and
-     * map(present:) the pinned-host new_count; CPU: default(none) firstprivate
-     * (fp slot) captures the pointers/scalars. The OpenMP bound is the host
-     * constant nw; the frontier size fs[0] is read on the DEVICE by every worker,
-     * so replay uses the current frontier size. */
+     * map(present:) the two pinned-host scalars (new_count, overflow); CPU:
+     * default(none) firstprivate (fp slot) captures the pointers/scalars. The
+     * OpenMP bound is the host constant nw; the frontier size fs[0] is read on the
+     * DEVICE by every worker, so replay uses the current frontier size. */
     OMP_TILE(DEPEND(in, fs[0], fr[0]) DEPEND(inout, rs[0], ncnt[0], rcnt[0], ov[0]) DEPEND(out, nf[0]),
-             is_device_ptr(et, fr, fs, rs, nf, rcnt, ov) MAP(present: ncnt[0:1]),
+             is_device_ptr(et, fr, fs, rs, nf, rcnt) MAP(present: ncnt[0:1], ov[0:1]),
              DEFAULT_NONE firstprivate(et, ec, fr, fs, rs, rc, nf, nfc, ncnt, rcnt, ov, nw))
     for (int t = 0; t < nw; t++) {
         const int n = fs[0];
@@ -471,43 +515,52 @@ static void k_expand(TCContext &ctx)
     }
 }
 
+/* new_count counts every new fact of the round, so it can exceed frontier_cap
+ * when the result set / frontier is undersized for the graph (see the capacity
+ * table in the README). Only the first frontier_cap facts were actually stored,
+ * so BOTH readers of new_count clamp to frontier_cap -- otherwise they would walk
+ * off the end of the frontier buffers, which is an illegal access on the device,
+ * not merely a wrong answer. The overflow flag is already set in that case and
+ * the fixpoint aborts on the next convergence test. */
 static void k_promote(TCContext &ctx)
 {
     u64 *fr = ctx.d_frontier; u64 *nf = ctx.d_new_frontier; int *nc = ctx.new_count;
-    int nw = ctx.n_workers;
+    int nw = ctx.n_workers; int nfc = ctx.frontier_cap;
     /* Same grid-stride shape as k_expand: nc[0] is the DEVICE copy of new_count
      * (map(present:)), read inside the body. Reading it as the OpenMP bound would
      * take the host copy, which still holds the PREVIOUS round's count. */
     OMP_TILE(DEPEND(in, nc[0], nf[0]) DEPEND(out, fr[0]),
              is_device_ptr(fr, nf) MAP(present: nc[0:1]),
-             DEFAULT_NONE firstprivate(fr, nf, nc, nw))
+             DEFAULT_NONE firstprivate(fr, nf, nc, nw, nfc))
     for (int t = 0; t < nw; t++) {
-        const int n = nc[0];
+        const int n = nc[0] < nfc ? nc[0] : nfc;
         for (int i = t; i < n; i += nw) fr[i] = nf[i];
     }
 }
 
 static void k_set_sizes(TCContext &ctx)
 {
-    int *fs = ctx.d_frontier_size; int *nc = ctx.new_count;
+    int *fs = ctx.d_frontier_size; int *nc = ctx.new_count; int nfc = ctx.frontier_cap;
 #if USE_TARGET
     OMP_TARGET_TASK(DEPEND(in, nc[0]) DEPEND(out, fs[0]) is_device_ptr(fs) MAP(present: nc[0:1]))
-    { fs[0] = nc[0]; }
+    { fs[0] = nc[0] < nfc ? nc[0] : nfc; }
 #else
-    OMP_TASK(DEFAULT_NONE firstprivate(fs, nc) DEPEND(in, nc[0]) DEPEND(out, fs[0]))
-    { fs[0] = nc[0]; }
+    OMP_TASK(DEFAULT_NONE firstprivate(fs, nc, nfc) DEPEND(in, nc[0]) DEPEND(out, fs[0]))
+    { fs[0] = nc[0] < nfc ? nc[0] : nfc; }
 #endif
 }
 
-/* Refresh the HOST copy of new_count so the fixpoint loop can test convergence.
- * This is an async D2H recorded INSIDE the taskgraph (depend-ordered after the
- * kernels that update it), i.e. one more replayed command -- the same shape as
- * the Krylov residual read-back (cg.cpp) and xkomp's taskgraph_dot_target test.
- * On the host backend it vanishes: new_count already IS the host memory. */
+/* Refresh the HOST copies of new_count (convergence test) and overflow (capacity
+ * check) so the fixpoint loop can act on both. This is ONE async D2H recorded
+ * INSIDE the taskgraph (depend-ordered after the kernels that update them), i.e.
+ * one more replayed command -- the same shape as the Krylov residual read-back
+ * (cg.cpp) and xkomp's taskgraph_dot_target test. On the host backend it
+ * vanishes: both already ARE the host memory. */
 static void k_writeback(TCContext &ctx)
 {
-    int *nc = ctx.new_count;
-    OMP_TARGET_UPDATE(from(nc[0:1]) NOWAIT DEPEND(in, nc[0]))
+    int *nc = ctx.new_count; int *ov = ctx.overflow;
+    (void) nc; (void) ov;      /* the directive vanishes on the host backend */
+    OMP_TARGET_UPDATE(from(nc[0:1], ov[0:1]) NOWAIT DEPEND(in, nc[0], ov[0]))
 }
 
 /* The loop-invariant per-round kernel sequence -- the body that is recorded once
@@ -549,6 +602,9 @@ static void tc_warmup(TCContext &ctx, int nrounds)
     {
         tc_round(ctx);
         #pragma omp taskwait
+        /* Catch an undersized capacity here rather than letting the warm-up churn
+         * through a saturated hash set for minutes before the measured run. */
+        tc_check_overflow(ctx, "result set / frontier (warm-up)", i);
     }
 }
 
@@ -592,11 +648,15 @@ static int tc_run_fixpoint(TCContext &ctx, TCTimes *times, int unroll)
         [&] (size_t done) { (void) done; return nc[0] > 0; },
         [&] (size_t inst, size_t done)
     {
-        (void) inst; (void) done;
+        (void) done;
         TASKWAIT
         const double now = omp_get_wtime();
         tc_times_push(times, (now - r0) / (double) unroll);
         r0 = now;
+        /* k_writeback brought the flag back with new_count in the same D2H, so
+         * an undersized run aborts here -- before it can produce wrong results
+         * or spend minutes probing a full table. */
+        tc_check_overflow(ctx, "result set / frontier", (int) inst);
     })
     {
         tc_round(ctx);
@@ -643,22 +703,6 @@ static void tc_mean_std(const double *v, int n, double *mean, double *sd)
 /* ------------------------------------------------------------------------- */
 /* Setup / reset / teardown.                                                  */
 /* ------------------------------------------------------------------------- */
-
-/* The device-side overflow flag is a benign store from the insert paths: the
- * edge table (build_edges), the result set and the frontiers (init_base /
- * k_expand). `what` names the table so the message points at the right knob. */
-static void tc_check_overflow(TCContext &ctx, const char *what)
-{
-    if (tc_read_i32(ctx.d_overflow)) {
-        fprintf(stderr,
-            "ERROR: %s overflow (capacity too small, or the table was not\n"
-            "       initialised to the empty marker).\n"
-            "       edge_cap=%d slots, result_cap=%ld slots, frontier_cap=%d slots.\n"
-            "       Raise capacity_mult (arg 2) if the result set is the one that filled.\n",
-            what, ctx.edge_cap, ctx.result_cap, ctx.frontier_cap);
-        exit(2);
-    }
-}
 
 /* TC_VERIFY=1: read the edge table back and count the occupied slots. Off by
  * default. Run once after fill_edge_table (expect 0 occupied -- every slot must
@@ -710,11 +754,15 @@ static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
     free(edges_host);
 
     t0 = tc_now();
-    /* The overflow flag is allocated up front: build_edges (below) already needs
-     * it to report a full / uninitialised edge table instead of spinning. */
-    int z = 0;
-    ctx.d_overflow = (int *)tc_dcheck(dalloc(sizeof(int)), "overflow flag", sizeof(int));
-    to_dev(ctx.d_overflow, &z, sizeof(int));
+    /* The overflow flag is pinned host memory with a device copy, like new_count:
+     * k_writeback then brings both back in one async D2H so the fixpoint can test
+     * capacity every instance. Allocated up front because build_edges (below)
+     * already needs it to report a full / uninitialised edge table. */
+    ctx.capacity_mult = capacity_mult;
+    ctx.overflow = (int *)tc_dcheck(host_alloc(sizeof(int)), "overflow flag", sizeof(int));
+    int *ov = ctx.overflow;
+    ov[0] = 0;
+    OMP_TARGET_ENTER_DATA(MAP(to: ov[0:1]))
 
     ctx.edge_cap = (int)tc_next_pow2((long)std::ceil(ctx.n_edges / 0.6));
     if (ctx.edge_cap < 2) ctx.edge_cap = 2;
@@ -723,7 +771,8 @@ static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
     fill_edge_table(ctx.d_edge_table, ctx.edge_cap);
     tc_verify_edge_table(ctx, "after fill", 0);
     build_edges(ctx);
-    tc_check_overflow(ctx, "edge table");
+    OMP_TARGET_UPDATE(from(ov[0:1]))        /* build_edges is synchronous */
+    tc_check_overflow(ctx, "edge table", -1);
     tc_verify_edge_table(ctx, "after build", ctx.n_edges);
 
     long est = (long)ctx.n_edges * capacity_mult;
@@ -778,11 +827,12 @@ static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
  * Buffer addresses stay stable, so a recorded task graph stays valid. */
 static void tc_reset_state(TCContext &ctx)
 {
-    int z = 0; u64 z64 = 0;
+    int z = 0; u64 z64 = 0; int *ov = ctx.overflow;
     fill_result_set(ctx.d_result_set, ctx.result_cap);
     to_dev(ctx.d_frontier_size, &z, sizeof(int));
     to_dev(ctx.d_result_count,  &z64, sizeof(u64));
-    to_dev(ctx.d_overflow,      &z, sizeof(int));
+    ov[0] = 0;
+    OMP_TARGET_UPDATE(to(ov[0:1]))
     /* new_count needs no reset here: k_reset zeroes the device copy at the top
      * of every fixpoint round, and tc_run_fixpoint primes the host copy. */
     init_base(ctx);
@@ -793,13 +843,20 @@ static void tc_teardown(TCContext &ctx)
     dfree(ctx.d_edges);       dfree(ctx.d_edge_table);   dfree(ctx.d_result_set);
     dfree(ctx.d_frontier);    dfree(ctx.d_new_frontier);
     dfree(ctx.d_frontier_size);
-    dfree(ctx.d_result_count);  dfree(ctx.d_overflow);
+    dfree(ctx.d_result_count);
 
     int *new_count = ctx.new_count;
     if (new_count) {
         OMP_TARGET_EXIT_DATA(MAP(release: new_count[0:1]))
         host_free(new_count);
         ctx.new_count = nullptr;
+    }
+
+    int *ov = ctx.overflow;
+    if (ov) {
+        OMP_TARGET_EXIT_DATA(MAP(release: ov[0:1]))
+        host_free(ov);
+        ctx.overflow = nullptr;
     }
 }
 
@@ -961,7 +1018,7 @@ int main(int argc, char **argv)
         rounds = tc_run_fixpoint(ctx, &times, unroll);
         fixpoint_s = omp_get_wtime() - f0;
     }
-    tc_check_overflow(ctx, "result set / frontier");
+    tc_check_overflow(ctx, "result set / frontier", -1);
     u64 tc = tc_read_u64(ctx.d_result_count);
 
     /* Free the frontier buffers to make room for the compact result buffer. */

@@ -165,17 +165,46 @@ the body -- exactly the reference's fixed `<<<32*numSM, 512>>>` geometry with
 to `frontier_cap`. On the CPU backend it is 1 and the nest collapses to the plain
 loop.
 
-## Capacity
+## Capacity -- read this before running anything but the two small graphs
 
-The result set is sized `next_pow2(n_edges * capacity_mult)` and must be
-**>= ~2x the TC size**, or the run aborts fast with an overflow message (raise
-`capacity_mult`, arg 2). Frontier buffers are decoupled (`min(result_cap, 2^28)`
-slots each), so only the set grows with TC.
+The result set is sized `next_pow2(n_edges * capacity_mult)` and must hold
+**>= ~2x the TC size**. TC is a property of the *graph*, not of the edge count, so
+`capacity_mult` cannot be derived from the input size: the default of 64 is
+sufficient for `data_7035` and `data_23874` **and for nothing else**.
+
+| dataset | file | edges | rounds | TC | TC/round | `capacity_mult` | result set |
+|---|---|---:|---:|---:|---:|---:|---:|
+| OL.cedge | `data_7035.bin` | 7 035 | 64 | 146 120 | 2 283 | **64** | 4 MiB |
+| TG.cedge | `data_23874.bin` | 23 874 | 58 | 481 121 | 8 295 | **64** | 16 MiB |
+| p2p-Gnutella31 | `data_147892.bin` | 147 892 | 31 | 884 179 859 | 28 522 576 | **8192** | 16 GiB |
+| usroad | `data_165435.bin` | 165 435 | 606 | 871 365 688 | 1 437 840 | **8192** | 16 GiB |
+| fe_ocean | `data_409593.bin` | 409 593 | 247 | 1 669 750 513 | 6 760 526 | **8192** | 32 GiB |
+| vsp_finan | `vsp_finan512_scagr7-2c_rlfddd.bin` | 552 020 | 520 | 910 070 918 | 1 750 136 | **2048** | 16 GiB |
+| com-dblp | `com-dblpungraph.bin` | 1 049 866 | 31 | 1 911 754 892 | 61 670 160 | **2048** | 32 GiB |
+
+```shell
+./tc.x MNMGDatalog-reference/data/data_147892.bin 8192      # 16 GiB result set
+```
+
+Undersizing is detected and reported, not silently wrong: every insert path sets
+a device-side overflow flag, `k_writeback` returns it to the host together with
+`new_count` in the same async D2H, and the fixpoint aborts on the next
+convergence test with the offending capacity printed. The frontier readers
+(`k_promote`, `k_set_sizes`) clamp to `frontier_cap`, so an overflowing round can
+no longer walk off the end of the frontier buffers -- which used to surface as
+`cuStreamSynchronize ... an illegal memory access was encountered`, because
+`new_count` counts *every* new fact while only the first `frontier_cap` are
+stored.
+
+Frontier buffers are decoupled: `min(result_cap, 2^28)` slots each, i.e. 2 GiB
+apiece at the cap. `TC/round` above is the average; for com-dblp (61.7 M
+facts/round) the peak may approach the 2^28 default, in which case raise
+`frontier_slots` (arg 3).
 
 ## Correctness
 
-Known reference sizes (from the reference README): `data_10` -> TC 18 / 3 rounds,
-`data_7035` -> 146120 / 64, `data_23874` -> 481121 / 58. A build with
+Known reference sizes: `data_10` -> TC 18 / 3 rounds, `data_7035` -> 146 120 / 64,
+`data_23874` -> 481 121 / 58, and the table above for the rest. A build with
 `USE_TASKGRAPH=0` and one with `USE_TASKGRAPH=1` must produce the identical TC
 size, round count, and (via `TC_DUMP`) tuple set.
 
@@ -183,7 +212,8 @@ size, round count, and (via `TC_DUMP`) tuple set.
 
 Registered as app `mnmg` in `../scripts/appspecs.py`; datasets are `data_<N>.bin`
 where `N` = edge count, so `evaluate.py --apps mnmg --sizes 7035,23874` maps sizes
-to files. `--iters` is ignored for `mnmg` (the round count comes from the data;
+to files. The per-dataset `capacity_mult` lives in `_MNMG_MULT` there and must be
+kept in sync with the table above. `--iters` is ignored for `mnmg` (the round count comes from the data;
 use `TC_WARMUP` for the warm-up rounds). `avg_ms`/`stddev_ms` come from the
 steady-state rounds, `iter0_ms` from round 0 (the record round) and `elapsed_s`
 from the end-to-end total. `evaluate.py` sweeps the synchronous / no-taskgraph /

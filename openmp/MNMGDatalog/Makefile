@@ -12,6 +12,7 @@
 # Run: ./tc.x <data.bin> [capacity_mult] [frontier_slots]
 #   TC_WARMUP=<n>  untimed, ungraphed warm-up rounds before round 0 (default 3)
 #   TC_WORKERS=<n> grid-stride worker count of the GPU fixpoint kernels
+#   TC_VERIFY=1    read the edge table back and check the fill / build on device
 #   TC_WRITE=1 writes <input>_<version>_tc.bin ; TC_CSV=<f> writes the metric row.
 #
 # The fixpoint runs ONCE and each round is timed: round 0 (record) / round 1 (1st

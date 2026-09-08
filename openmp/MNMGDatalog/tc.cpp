@@ -186,16 +186,20 @@ static inline bool tc_set_insert(u64 *set, long cap, u64 key, int *overflow)
 
 /* Build one edge into the edge table: claim the first empty slot (duplicate
  * edges land in separate slots; only produces duplicate candidates the result
- * set dedups). */
-static inline void tc_build_one(int i, const int *edges, Entity *table, int cap)
+ * set dedups). Bounded by capacity exactly like tc_set_insert: a table that is
+ * full -- or that was never initialised to the -1 empty marker -- sets *overflow
+ * instead of spinning forever, so the failure is reported rather than hung. */
+static inline void tc_build_one(int i, const int *edges, Entity *table, int cap,
+                                int *overflow)
 {
     int key = edges[i * 2], value = edges[i * 2 + 1];
     int pos = tc_get_position(key, cap);
-    while (true) {
+    for (int probes = 0; probes < cap; probes++) {
         int existing = tc_cas_i32(&table[pos].key, -1, key);
-        if (existing == -1) { table[pos].value = value; break; }
+        if (existing == -1) { table[pos].value = value; return; }
         pos = (pos + 1) & (cap - 1);
     }
+    *overflow = 1;                             /* table full (benign store) */
 }
 
 /* Seed the fixpoint with the base facts: path(a,b) :- edge(a,b), deduped. */
@@ -272,15 +276,31 @@ static inline void  to_dev(void *d, const void *s, size_t b)   { memcpy(d, s, b)
 static inline void  from_dev(void *d, const void *s, size_t b) { memcpy(d, s, b); }
 #endif
 
-/* Byte-wise fill of a device (or host) buffer -- mirrors cudaMemset. */
-static void dmemset(void *p, int byte, size_t bytes)
+/* Typed fills of the two open-addressing tables with their empty marker -- the
+ * analog of the reference's cudaMemset(..., 0xFF, ...), but one store per SLOT
+ * instead of one per byte: 8x fewer iterations and coalesced. (The byte-wise
+ * form cost 268 M single-byte stores just to clear the result set of a 410 K-edge
+ * graph, and tens of GB of them on the paper's billion-pair graphs.) The bit
+ * patterns are identical: -1 == 0xFFFFFFFF, TC_EMPTY64 == 0xFFFF...FF. */
+static void fill_edge_table(Entity *table, int cap)
 {
 #if USE_TARGET
-    char *c = (char *)p;
-    #pragma omp target teams distribute parallel for is_device_ptr(c)
-    for (long long i = 0; i < (long long)bytes; i++) c[i] = (char)byte;
+    #pragma omp target teams distribute parallel for is_device_ptr(table)
+    for (int i = 0; i < cap; i++) { table[i].key = -1; table[i].value = -1; }
 #else
-    memset(p, byte, bytes);
+    #pragma omp parallel for
+    for (int i = 0; i < cap; i++) { table[i].key = -1; table[i].value = -1; }
+#endif
+}
+
+static void fill_result_set(u64 *set, long cap)
+{
+#if USE_TARGET
+    #pragma omp target teams distribute parallel for is_device_ptr(set)
+    for (long i = 0; i < cap; i++) set[i] = TC_EMPTY64;
+#else
+    #pragma omp parallel for
+    for (long i = 0; i < cap; i++) set[i] = TC_EMPTY64;
 #endif
 }
 
@@ -350,13 +370,13 @@ struct TCContext {
 static void build_edges(TCContext &ctx)
 {
     int n = ctx.n_edges, cap = ctx.edge_cap;
-    int *edges = ctx.d_edges; Entity *table = ctx.d_edge_table;
+    int *edges = ctx.d_edges; Entity *table = ctx.d_edge_table; int *ov = ctx.d_overflow;
 #if USE_TARGET
-    #pragma omp target teams distribute parallel for is_device_ptr(edges, table)
-    for (int i = 0; i < n; i++) tc_build_one(i, edges, table, cap);
+    #pragma omp target teams distribute parallel for is_device_ptr(edges, table, ov)
+    for (int i = 0; i < n; i++) tc_build_one(i, edges, table, cap, ov);
 #else
     #pragma omp parallel for
-    for (int i = 0; i < n; i++) tc_build_one(i, edges, table, cap);
+    for (int i = 0; i < n; i++) tc_build_one(i, edges, table, cap, ov);
 #endif
 }
 
@@ -623,6 +643,50 @@ static void tc_mean_std(const double *v, int n, double *mean, double *sd)
 /* ------------------------------------------------------------------------- */
 /* Setup / reset / teardown.                                                  */
 /* ------------------------------------------------------------------------- */
+
+/* The device-side overflow flag is a benign store from the insert paths: the
+ * edge table (build_edges), the result set and the frontiers (init_base /
+ * k_expand). `what` names the table so the message points at the right knob. */
+static void tc_check_overflow(TCContext &ctx, const char *what)
+{
+    if (tc_read_i32(ctx.d_overflow)) {
+        fprintf(stderr,
+            "ERROR: %s overflow (capacity too small, or the table was not\n"
+            "       initialised to the empty marker).\n"
+            "       edge_cap=%d slots, result_cap=%ld slots, frontier_cap=%d slots.\n"
+            "       Raise capacity_mult (arg 2) if the result set is the one that filled.\n",
+            what, ctx.edge_cap, ctx.result_cap, ctx.frontier_cap);
+        exit(2);
+    }
+}
+
+/* TC_VERIFY=1: read the edge table back and count the occupied slots. Off by
+ * default. Run once after fill_edge_table (expect 0 occupied -- every slot must
+ * carry the -1 empty marker) and once after build_edges (expect exactly n_edges,
+ * since duplicate edges each claim their own slot). This separates "the fill
+ * kernel did not cover the whole table" from "the CAS insert is wrong" from
+ * "the pointers/capacity are wrong" without a debugger. */
+static void tc_verify_edge_table(TCContext &ctx, const char *stage, long expected)
+{
+    const char *v = getenv("TC_VERIFY");
+    if (!(v && v[0] && v[0] != '0')) return;
+
+    const size_t nb = (size_t)ctx.edge_cap * sizeof(Entity);
+    Entity *h = (Entity *)malloc(nb);
+    if (!h) { fprintf(stderr, "# TC_VERIFY [%s]: out of host memory, skipped\n", stage); return; }
+    from_dev(h, ctx.d_edge_table, nb);
+
+    long occupied = 0, first = -1;
+    for (int i = 0; i < ctx.edge_cap; i++)
+        if (h[i].key != -1) { occupied++; if (first < 0) first = i; }
+
+    fprintf(stderr, "# TC_VERIFY [%-11s]: edge_cap=%d occupied=%ld expected=%ld  %s"
+                    "  (first occupied slot %ld)\n",
+            stage, ctx.edge_cap, occupied, expected,
+            occupied == expected ? "OK" : "*** MISMATCH ***", first);
+    free(h);
+}
+
 static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
                      long frontier_slots)
 {
@@ -646,12 +710,21 @@ static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
     free(edges_host);
 
     t0 = tc_now();
+    /* The overflow flag is allocated up front: build_edges (below) already needs
+     * it to report a full / uninitialised edge table instead of spinning. */
+    int z = 0;
+    ctx.d_overflow = (int *)tc_dcheck(dalloc(sizeof(int)), "overflow flag", sizeof(int));
+    to_dev(ctx.d_overflow, &z, sizeof(int));
+
     ctx.edge_cap = (int)tc_next_pow2((long)std::ceil(ctx.n_edges / 0.6));
     if (ctx.edge_cap < 2) ctx.edge_cap = 2;
     nb = (size_t)ctx.edge_cap * sizeof(Entity);
     ctx.d_edge_table = (Entity *)tc_dcheck(dalloc(nb), "edge table", nb);
-    dmemset(ctx.d_edge_table, 0xFF, nb);
+    fill_edge_table(ctx.d_edge_table, ctx.edge_cap);
+    tc_verify_edge_table(ctx, "after fill", 0);
     build_edges(ctx);
+    tc_check_overflow(ctx, "edge table");
+    tc_verify_edge_table(ctx, "after build", ctx.n_edges);
 
     long est = (long)ctx.n_edges * capacity_mult;
     if (est < 4096) est = 4096;
@@ -677,13 +750,12 @@ static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
 
     nb = (size_t)ctx.result_cap * sizeof(u64);
     ctx.d_result_set    = (u64 *)tc_dcheck(dalloc(nb), "result set", nb);
-    dmemset(ctx.d_result_set, 0xFF, nb);
+    fill_result_set(ctx.d_result_set, ctx.result_cap);
     nb = (size_t)ctx.frontier_cap * sizeof(u64);
     ctx.d_frontier      = (u64 *)tc_dcheck(dalloc(nb), "frontier", nb);
     ctx.d_new_frontier  = (u64 *)tc_dcheck(dalloc(nb), "new frontier", nb);
     ctx.d_frontier_size = (int *)tc_dcheck(dalloc(sizeof(int)),  "frontier size", sizeof(int));
     ctx.d_result_count  = (u64 *)tc_dcheck(dalloc(sizeof(u64)),  "result count", sizeof(u64));
-    ctx.d_overflow      = (int *)tc_dcheck(dalloc(sizeof(int)),  "overflow flag", sizeof(int));
 
     /* new_count: pinned host memory (shared ../alloc.c) with a device copy
      * created here, so the kernels reach it with map(present:) and k_writeback
@@ -707,24 +779,13 @@ static void tc_setup(TCContext &ctx, const char *input_file, long capacity_mult,
 static void tc_reset_state(TCContext &ctx)
 {
     int z = 0; u64 z64 = 0;
-    dmemset(ctx.d_result_set, 0xFF, ctx.result_cap * sizeof(u64));
+    fill_result_set(ctx.d_result_set, ctx.result_cap);
     to_dev(ctx.d_frontier_size, &z, sizeof(int));
     to_dev(ctx.d_result_count,  &z64, sizeof(u64));
     to_dev(ctx.d_overflow,      &z, sizeof(int));
     /* new_count needs no reset here: k_reset zeroes the device copy at the top
      * of every fixpoint round, and tc_run_fixpoint primes the host copy. */
     init_base(ctx);
-}
-
-static void tc_check_overflow(TCContext &ctx)
-{
-    if (tc_read_i32(ctx.d_overflow)) {
-        fprintf(stderr,
-            "ERROR: result set / frontier overflow (capacity too small).\n"
-            "       Increase capacity_mult (arg 2). Current result_cap=%ld slots.\n",
-            ctx.result_cap);
-        exit(2);
-    }
 }
 
 static void tc_teardown(TCContext &ctx)
@@ -900,7 +961,7 @@ int main(int argc, char **argv)
         rounds = tc_run_fixpoint(ctx, &times, unroll);
         fixpoint_s = omp_get_wtime() - f0;
     }
-    tc_check_overflow(ctx);
+    tc_check_overflow(ctx, "result set / frontier");
     u64 tc = tc_read_u64(ctx.d_result_count);
 
     /* Free the frontier buffers to make room for the compact result buffer. */

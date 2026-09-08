@@ -81,9 +81,11 @@ by a command-line knob.
 
 Environment: `TC_WARMUP=<n>` untimed, ungraphed warm-up rounds before round 0
 (default 3); `TC_WORKERS=<n>` overrides the GPU grid-stride worker count (see
-below); `TC_WRITE=1` writes `<input>_<version>_tc.bin` (off by default so sweeps
-stay clean); `TC_DUMP=<f>` writes a `src dst` text dump; `TC_CSV=<f>` writes the
-reference's 15-column metric row.
+below); `TC_VERIFY=1` reads the edge table back after the fill and after the
+build and reports the occupied-slot counts (a device-side sanity check, off by
+default); `TC_WRITE=1` writes `<input>_<version>_tc.bin` (off by default so
+sweeps stay clean); `TC_DUMP=<f>` writes a `src dst` text dump; `TC_CSV=<f>`
+writes the reference's 15-column metric row.
 
 ## Metrics
 

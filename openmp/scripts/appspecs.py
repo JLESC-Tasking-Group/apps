@@ -455,7 +455,8 @@ LULESH = AppSpec(
 # the result set (next_pow2(edges * mult); must be >= ~2x TC or the run aborts
 # with an overflow message).
 # `iters` is NOT a knob here: the fixpoint runs until it converges, so the number
-# of rounds is determined by the dataset (data_7035 -> 64, data_23874 -> 58) and
+# of rounds is determined by the dataset (23874 -> 58, 165435 -> 608, 552020 ->
+# 520; see MNMGDatalog/README.md) and
 # each round is timed individually. Likewise TC has no task-count knob, so grain /
 # the synchronous 1-task/loop are irrelevant. (The untimed warm-up rounds before
 # round 0 are set with the TC_WARMUP env var; the default of 3 is used here.)
@@ -471,10 +472,20 @@ _MNMG_DATA = "MNMGDatalog-reference/data"
 #   data_7035 64 | data_23874 64 | data_147892 12288 | data_165435 8192
 #   data_409593 8192 | vsp_finan 3456 | com-dblp 3800
 
+# Datasets whose file is not named data_<edges>.bin. The size in `sizes` is the
+# edge count, which is what the tables report and what the file name normally
+# carries; these two are named after their origin instead, so the mapping has to
+# be written down rather than derived.
+_MNMG_FILE = {
+    552020:  "vsp_finan512_scagr7-2c_rlfddd.bin",
+    1049866: "com-dblpungraph.bin",
+}
+
 # -u also gates the convergence test, which is then only evaluated every `unroll`
 # rounds: the fixpoint may run up to unroll-1 extra (empty, harmless) rounds.
 def _mnmg_run(variant, size, iters, cfg, grain, unroll):
-    return [f"{_MNMG_DATA}/data_{size}.bin", "-u", str(unroll)]
+    name = _MNMG_FILE.get(size, f"data_{size}.bin")
+    return [f"{_MNMG_DATA}/{name}", "-u", str(unroll)]
 
 MNMG = AppSpec(
     name="mnmg",
@@ -485,10 +496,14 @@ MNMG = AppSpec(
     run_args=_mnmg_run,
     parse=_parse_mnmg,
     work=lambda n: (float(n), "edges"),
-    # 147892 needs a 16 GiB result set (see _MNMG_MULT); the two small graphs are
-    # sub-100 MiB. The remaining datasets (165435, 409593, 552020, 1049866) are
-    # sized in _MNMG_MULT and can be added once the 16-32 GiB runs are budgeted.
-    sizes=[7035, 23874, 147892],
+    # One small graph and two large ones. 23874 converges in 58 rounds of ~8k new
+    # facts and fits in 16 MiB, so a round is almost pure launch overhead; the
+    # other two run 606 and 520 rounds of ~1.5M facts into a 16 GiB result set,
+    # where that overhead is a small share of real work. The pair is what makes
+    # the gain a trend rather than a single point. The other datasets of
+    # MNMGDatalog/README.md (147892, 409593, 1049866) are larger still and are
+    # left out only for sweep time.
+    sizes=[23874, 165435, 552020],
     iters=0,                           # unused: round count comes from the data
     pretty="MNMG",
     klass="Graph analytics",

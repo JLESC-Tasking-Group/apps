@@ -101,7 +101,7 @@ fatal, so the same mistake fails loudly instead.
 costs of the table. `cgstats.csv` / `jitstats.csv` are written automatically.
 
 ```sh
-SZ='krylov=64;lulesh=16,60,100;mnmg=7035,23874'
+SZ='krylov=64;lulesh=16,60,100;mnmg=23874,165435,552020'
 IT='krylov=200;lulesh=208'
 GR='krylov=4:4;lulesh=1,4,8'
 ./scripts/evaluate.py --target gpu --apps krylov,lulesh,mnmg \
@@ -241,7 +241,7 @@ figure overlays:
 make -C MNMGDatalog/MNMGDatalog-reference tc_benchmark   # v1_baseline, v2_cudagraph
 cat > results/external.csv <<'EOF'
 app,variant,size,label,avg_ms
-mnmg,,7035,CUDA graph (hand-written),<measured>
+mnmg,,23874,CUDA graph (hand-written),<measured>
 mnmg,,23874,CUDA graph (hand-written),<measured>
 EOF
 ```

@@ -43,8 +43,32 @@ USE_REPLAYABLE ?= 0     # mark task-generating constructs replayable(1)
 # -I.. makes the shared apps/openmp/tasking.h resolvable as #include "tasking.h"
 # from each app's build dir (one level below apps/openmp).
 CFLAGS += -I..
-CFLAGS += -O3
-#CFLAGS += -O0 -g
+
+# ---- Optimization level ----------------------------------------------------
+# Override with e.g. `make OPT="-O0 -g"`.
+#
+# WARNING: -O0 BREAKS GPU OFFLOAD on this toolchain (clang fork + xkomp/xkrt,
+# NVPTX sm_90). A `target teams distribute parallel for` whose body makes device
+# function calls -- i.e. anything the optimizer would otherwise have inlined --
+# faults with CUDA_ERROR_ILLEGAL_ADDRESS (700) once roughly 10^5 threads are
+# concurrently inside the call chain. It is NOT a stack-size problem
+# (LIBOMPTARGET_STACK_SIZE up to 256 KiB changes nothing) and NOT an application
+# bug: MNMGDatalog/tc_repro.cpp reproduces it with no atomics, no tasking and
+# provably in-bounds indexing, and the same binary passes at -O3.
+# See MNMGDatalog/REPRODUCER.md for the full matrix.
+#
+# Use `-O0 -g` for CPU debugging (USE_TARGET=0) only.
+OPT ?= -O3
+CFLAGS += $(OPT)
+
+ifeq ($(USE_TARGET),1)
+  ifneq ($(filter -O0,$(OPT)),)
+    $(warning *** -O0 with USE_TARGET=1 is known to fault on this toolchain.)
+    $(warning *** Device kernels that call non-inlined helpers hit)
+    $(warning *** CUDA_ERROR_ILLEGAL_ADDRESS. See MNMGDatalog/REPRODUCER.md.)
+  endif
+endif
+
 CFLAGS += -DUSE_TARGET=$(USE_TARGET)
 CFLAGS += -DUSE_TASKGRAPH=$(USE_TASKGRAPH)
 CFLAGS += -DUSE_TASKGRAPHLOOP=$(USE_TASKGRAPHLOOP)

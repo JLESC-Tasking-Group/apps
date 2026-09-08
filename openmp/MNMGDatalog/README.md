@@ -71,6 +71,7 @@ what `v3_conditional` would do on the GPU.
 make USE_TARGET=1 USE_TASKGRAPH=1        # GPU, replayed graph (v2_cudagraph)
 make USE_TARGET=1 USE_TASKGRAPH=0        # GPU, host loop      (v1_baseline)
 make                                     # CPU tasks (default), for correctness
+# GPU builds must be -O3 (the ../common.mk default) -- see "Debugging".
 
 ./tc.x <data.bin> [capacity_mult] [frontier_slots]
 make test                                # data_7035.bin (TC=146120, 64 rounds)
@@ -209,56 +210,58 @@ Known reference sizes: `data_10` -> TC 18 / 3 rounds, `data_7035` -> 146 120 / 6
 `USE_TASKGRAPH=0` and one with `USE_TASKGRAPH=1` must produce the identical TC
 size, round count, and (via `TC_DUMP`) tuple set.
 
-## Debugging: the open GPU fault on inputs above ~24 K edges
+Verified on GH200 (sm_90, CUDA 13.3.1) at `-O3`, both taskgraph settings:
 
-**Status: unresolved.** `data_7035` and `data_23874` complete on the GPU; every
-larger dataset aborts with
-`cuStreamSynchronize / cuEventSynchronize failed with an illegal memory access
-was encountered (700)` (and, at `-O3`, `Invalid access of peer GPU memory over
-nvlink (226)`). The CPU backend is correct on every input. This section records
-what has already been ruled out so it is not re-derived.
+| dataset | edges | rounds | TC |
+|---|---:|---:|---:|
+| `data_7035.bin` (OL.cedge) | 7 035 | 64 | 146 120 |
+| `data_23874.bin` (TG.cedge) | 23 874 | 58 | 481 121 |
+| `data_147892.bin` (p2p-Gnutella31) | 147 892 | 31 | 884 179 859 |
 
-### Ruled out
+## Debugging
 
-| hypothesis | how it was eliminated |
-|---|---|
-| taskgraph record/replay | fails with `USE_TASKGRAPH=0` |
-| async nowait target tasks, xkrt command queue | fails with `USE_SYNC=1` (no tasks at all) |
-| `depend` clauses / dependence tracking | `USE_SYNC=1` emits none |
-| `-O0` device codegen, device stack | fails at `-O3` too |
-| allocator / `omp_target_alloc` | a 16 GiB `fill_result_set` completes and reads back correctly |
-| edge table construction | `TC_VERIFY=1` reports fill -> 0 occupied, build -> exactly `n_edges` |
-| result-set / frontier capacity | fails at `capacity_mult=8192` (set >= 2x TC), and the overflow flag never trips |
-| **buffer size** | `./tc.x data_49152.bin 16` -> every buffer **2^20**, smaller than the working `data_23874` run at 2^21, still faults |
-| algorithm | CPU backend produces the correct TC |
+### GPU builds must be `-O3`
 
-### The one live lead
+`-O0` **breaks GPU offload** on this toolchain. A `target teams distribute
+parallel for` whose body makes device function calls -- anything the optimizer
+would otherwise have inlined -- faults with `CUDA_ERROR_ILLEGAL_ADDRESS` (700)
+once roughly 10^5 threads are concurrently inside the call chain. It is not a
+stack-size problem (`LIBOMPTARGET_STACK_SIZE` up to 256 KiB changes nothing) and
+not an application bug: [`tc_repro.cpp`](tc_repro.cpp) reproduces it with no
+atomics, no tasking and provably in-bounds indexing, and the same source passes
+at `-O3`. Full matrix and filing notes in [REPRODUCER.md](REPRODUCER.md).
 
-`TC_WORKERS=4096 ./tc.x data_147892.bin 8192` **progresses**, where the default
-`TC_WORKERS` (2^21) faults. `n_workers` feeds only `k_expand` and `k_promote`, so
-the fault is in one of those two and scales with the grid-stride worker count --
-*not* with the buffer sizes. Note `data_23874` works at the same 2^21 workers, so
-it is an interaction between worker count and the amount of work per round, not
-either alone.
+Two mitigations are in place, so this should not bite again:
+
+* every `declare target` helper in `tc.cpp` is `TC_DEVFN`
+  (`static inline __attribute__((always_inline))`), so no device call chain
+  survives to codegen at any `-O` level;
+* `../common.mk` defaults to `OPT ?= -O3` and warns if `-O0` is combined with
+  `USE_TARGET=1`.
+
+This cost weeks of misdiagnosis, because at `-O0` the fault looks exactly like an
+application memory bug: it is input-size dependent (only kernels with call chains
+fault, and only once the frontier is large enough), it moves between kernels as
+the code changes, and `compute-sanitizer` reports nothing.
 
 ### Tools
 
 ```shell
-# name the faulting kernel: blocking launches + a flushed line per dispatch,
-# so the LAST line printed is the kernel that faulted
+# TC_TRACE: one flushed stderr line per kernel dispatch. With USE_SYNC=1 every
+# launch is blocking, so after an abort the LAST line names the faulting kernel.
 make USE_TARGET=1 USE_SYNC=1
 TC_TRACE=1 ./tc.x MNMGDatalog-reference/data/data_49152.bin 16
 
-# check the edge table really was built on the device
+# TC_VERIFY: read the edge table back and check the fill / build ran on device
 TC_VERIFY=1 ./tc.x ...
 
-# sweep the worker count (the live lead)
+# TC_WORKERS: grid-stride worker count of k_expand / k_promote
 for w in 4096 65536 1048576 2097152; do TC_WORKERS=$w ./tc.x ... ; done
 
-# memory-model A/B: pinned host + map(present:), i.e. what krylov/lulesh do.
-# tc.cpp is the only app here using omp_target_alloc + is_device_ptr, and the
-# only one that faults. Diagnostic only -- it mirrors every buffer on the host,
-# so use it on a small configuration (e.g. data_49152 with capacity_mult 16).
+# TC_MAPPED_MEM: memory-model A/B. tc.cpp is the only app here using
+# omp_target_alloc + is_device_ptr; this switches every buffer to pinned host +
+# map(present:), i.e. what krylov/lulesh/HPCCG do. Diagnostic only -- it mirrors
+# every buffer on the host, so use a small configuration.
 make USE_TARGET=1 TC_MAPPED_MEM=1
 ```
 
@@ -273,16 +276,14 @@ grid-stride shape, with no `tasking.h`, no `alloc.h` and no xkomp:
 make repro USE_TARGET=1
 ./tc_repro.x [keys] [slots] [workers] [mode] [rounds]
 
-# the two sweeps that matter
 for w in 4096 65536 1048576 2097152; do ./tc_repro.x 1000000 4194304 $w; done
-for m in 0 1 2 3; do ./tc_repro.x 1000000 4194304 2097152 $m; done   # bisect the atomics
-make repro-mapped USE_TARGET=1 && ./tc_repro_mapped.x                # memory-model A/B
+for m in 0 1 2 3; do ./tc_repro.x 1000000 4194304 2097152 $m; done
+make repro-mapped USE_TARGET=1 && ./tc_repro_mapped.x
+make OPT="-O0 -g" repro USE_TARGET=1     # the failing variant
 ```
 
 `mode` is a bitmask: bit 0 = atomic CAS insert, bit 1 = atomic fetch-add append,
-`0` = plain stores. If the reproducer faults it is a self-contained toolchain bug
-report; if it does not, the difference from `k_expand` is the next thing to look
-at.
+`0` = plain stores.
 
 ## Evaluation harness
 

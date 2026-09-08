@@ -69,12 +69,19 @@ typedef unsigned long long u64;
 
 #define REPRO_EMPTY 0xFFFFFFFFFFFFFFFFULL
 
-/* ------------------------------------------------------------------------- */
-/* Device-callable helpers -- the same shapes as tc.cpp's.                     */
-/* ------------------------------------------------------------------------- */
-#pragma omp declare target
+/* ----------------------------------------------------------------------------
+ * Device-callable helpers -- the same shapes as tc.cpp's.
+ *
+ * RP_DEVFN forces inlining. That is the point of the -O level axis in this
+ * reproducer: at -O0 these stay real NVPTX calls and the expand kernel faults;
+ * at -O3 they are inlined and it does not. Build with
+ * `make OPT="-O0 -g" repro` to get the failing variant back.
+ * ------------------------------------------------------------------------- */
+#define RP_DEVFN static inline __attribute__((always_inline))
 
-static inline u64 repro_hash(u64 k, long cap)
+#pragma omp begin declare target
+
+RP_DEVFN u64 repro_hash(u64 k, long cap)
 {
     k ^= k >> 30; k *= 0xbf58476d1ce4e5b9ULL;
     k ^= k >> 27; k *= 0x94d049bb133111ebULL;
@@ -83,7 +90,7 @@ static inline u64 repro_hash(u64 k, long cap)
 }
 
 /* #pragma omp atomic compare capture (OpenMP 5.1) -- tc.cpp's tc_cas_u64. */
-static inline u64 repro_cas(u64 *addr, u64 expected, u64 desired)
+RP_DEVFN u64 repro_cas(u64 *addr, u64 expected, u64 desired)
 {
     u64 old;
     #pragma omp atomic compare capture
@@ -92,7 +99,7 @@ static inline u64 repro_cas(u64 *addr, u64 expected, u64 desired)
 }
 
 /* #pragma omp atomic capture -- tc.cpp's tc_fetch_add_i32. */
-static inline int repro_fetch_add(int *addr, int v)
+RP_DEVFN int repro_fetch_add(int *addr, int v)
 {
     int old;
     #pragma omp atomic capture
@@ -102,7 +109,7 @@ static inline int repro_fetch_add(int *addr, int v)
 
 /* Bounded open-addressing insert; returns true iff the key was newly inserted.
  * Mirrors tc_set_insert, including the probe bound and the overflow flag. */
-static inline bool repro_insert(u64 *set, long cap, u64 key, int *flag, int mode)
+RP_DEVFN bool repro_insert(u64 *set, long cap, u64 key, int *flag, int mode)
 {
     const u64 mask = (u64)(cap - 1);
     u64 pos = repro_hash(key, cap);
@@ -124,7 +131,7 @@ static inline bool repro_insert(u64 *set, long cap, u64 key, int *flag, int mode
 /* One "fact": derive a key from the index, insert it, append it if new.
  * The append is exactly tc_expand_one's, unsigned-compared so an overrunning
  * counter cannot index out of bounds. */
-static inline void repro_one(int i, u64 *set, long cap, u64 *out, int ocap,
+RP_DEVFN void repro_one(int i, u64 *set, long cap, u64 *out, int ocap,
                              int *cnt, int *flag, int mode)
 {
     /* |1 keeps the key away from the REPRO_EMPTY marker. */
@@ -276,8 +283,11 @@ int main(int argc, char **argv)
         omp_target_memcpy(&h_cnt, cnt, sizeof(int), 0, 0, host, dev);
         omp_target_memcpy(&h_flg, flg, sizeof(int), 0, 0, host, dev);
 #endif
-        printf("-> inserted=%d overflow=%d %s\n", h_cnt, h_flg,
-               (mode & 2) ? ((h_cnt == (int)keys) ? "OK" : "*** WRONG COUNT ***") : "");
+        if (mode & 2)
+            printf("-> appended=%d overflow=%d %s\n", h_cnt, h_flg,
+                   (h_cnt == (int)keys) ? "OK" : "*** WRONG COUNT ***");
+        else
+            printf("-> overflow=%d (no append counter in this mode)\n", h_flg);
         fflush(stdout);
     }
 

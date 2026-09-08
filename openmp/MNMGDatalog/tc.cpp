@@ -108,13 +108,27 @@ struct Entity { int key; int value; };
 
 /* ------------------------------------------------------------------------- */
 /* Device-callable helpers (hashing + atomics). declare target only on GPU.   */
+/*                                                                            */
+/* Every one of them is marked always_inline, and that is load-bearing, not    */
+/* cosmetic: on this toolchain a `target teams distribute parallel for` whose   */
+/* body makes real device function CALLS faults with                          */
+/* CUDA_ERROR_ILLEGAL_ADDRESS once ~10^5 threads are concurrently inside the   */
+/* call chain. -O3 inlines these anyway and is unaffected, but a plain         */
+/* `static inline` leaves them as calls at -O0, which is exactly how the bug   */
+/* was hit for weeks (only k_expand / build_edges / init_base -- the kernels    */
+/* with call chains -- ever faulted; k_promote and the fills, whose bodies are  */
+/* inline, never did). Forcing the inline here keeps -O0 -g GPU builds usable.  */
+/* Not a stack-size problem: LIBOMPTARGET_STACK_SIZE up to 256 KiB changes      */
+/* nothing. See REPRODUCER.md and ../common.mk's OPT warning.                   */
 /* ------------------------------------------------------------------------- */
+#define TC_DEVFN static inline __attribute__((always_inline))
+
 #if USE_TARGET
 # pragma omp begin declare target
 #endif
 
 /* Murmur3 finalizer (mirrors get_position in the codebase). */
-static inline int tc_get_position(int key, int cap)
+TC_DEVFN int tc_get_position(int key, int cap)
 {
     key ^= key >> 16;
     key *= 0x85ebca6b;
@@ -125,7 +139,7 @@ static inline int tc_get_position(int key, int cap)
 }
 
 /* splitmix64 finalizer -> slot in [0, cap). */
-static inline u64 tc_hash64(u64 k, long cap)
+TC_DEVFN u64 tc_hash64(u64 k, long cap)
 {
     k ^= k >> 30; k *= 0xbf58476d1ce4e5b9ULL;
     k ^= k >> 27; k *= 0x94d049bb133111ebULL;
@@ -133,13 +147,13 @@ static inline u64 tc_hash64(u64 k, long cap)
     return k & (u64)(cap - 1);
 }
 
-static inline u64 tc_pack(int a, int b)
+TC_DEVFN u64 tc_pack(int a, int b)
 {
     return (((u64)(unsigned)a) << 32) | (unsigned)b;
 }
 
 /* CAS: atomically set *addr = desired iff *addr == expected; return old value. */
-static inline u64 tc_cas_u64(u64 *addr, u64 expected, u64 desired)
+TC_DEVFN u64 tc_cas_u64(u64 *addr, u64 expected, u64 desired)
 {
     u64 old;
     #pragma omp atomic compare capture
@@ -147,7 +161,7 @@ static inline u64 tc_cas_u64(u64 *addr, u64 expected, u64 desired)
     return old;
 }
 
-static inline int tc_cas_i32(int *addr, int expected, int desired)
+TC_DEVFN int tc_cas_i32(int *addr, int expected, int desired)
 {
     int old;
     #pragma omp atomic compare capture
@@ -156,7 +170,7 @@ static inline int tc_cas_i32(int *addr, int expected, int desired)
 }
 
 /* Fetch-add: return the old value, then *addr += v (the append/index pattern). */
-static inline int tc_fetch_add_i32(int *addr, int v)
+TC_DEVFN int tc_fetch_add_i32(int *addr, int v)
 {
     int old;
     #pragma omp atomic capture
@@ -164,7 +178,7 @@ static inline int tc_fetch_add_i32(int *addr, int v)
     return old;
 }
 
-static inline u64 tc_fetch_add_u64(u64 *addr, u64 v)
+TC_DEVFN u64 tc_fetch_add_u64(u64 *addr, u64 v)
 {
     u64 old;
     #pragma omp atomic capture
@@ -175,7 +189,7 @@ static inline u64 tc_fetch_add_u64(u64 *addr, u64 v)
 /* Insert key into the open-addressing result set. Returns true iff newly
  * inserted (won an empty slot) -- i.e. this is a genuinely new fact. Bounded by
  * capacity: if the set is full we set *overflow and return false (no hang). */
-static inline bool tc_set_insert(u64 *set, long cap, u64 key, int *overflow)
+TC_DEVFN bool tc_set_insert(u64 *set, long cap, u64 key, int *overflow)
 {
     u64 mask = (u64)(cap - 1);
     u64 pos  = tc_hash64(key, cap);
@@ -196,7 +210,7 @@ static inline bool tc_set_insert(u64 *set, long cap, u64 key, int *overflow)
  * set dedups). Bounded by capacity exactly like tc_set_insert: a table that is
  * full -- or that was never initialised to the -1 empty marker -- sets *overflow
  * instead of spinning forever, so the failure is reported rather than hung. */
-static inline void tc_build_one(int i, const int *edges, Entity *table, int cap,
+TC_DEVFN void tc_build_one(int i, const int *edges, Entity *table, int cap,
                                 int *overflow)
 {
     int key = edges[i * 2], value = edges[i * 2 + 1];
@@ -210,7 +224,7 @@ static inline void tc_build_one(int i, const int *edges, Entity *table, int cap,
 }
 
 /* Seed the fixpoint with the base facts: path(a,b) :- edge(a,b), deduped. */
-static inline void tc_init_base_one(int i, const int *edges, u64 *set, long rcap,
+TC_DEVFN void tc_init_base_one(int i, const int *edges, u64 *set, long rcap,
                                     u64 *frontier, int fcap, int *fsize,
                                     u64 *rcount, int *overflow)
 {
@@ -227,7 +241,7 @@ static inline void tc_init_base_one(int i, const int *edges, u64 *set, long rcap
 }
 
 /* Expand one frontier fact path(a,b): for every edge(b,c), try path(a,c). */
-static inline void tc_expand_one(int i, const Entity *edge_table, int edge_cap,
+TC_DEVFN void tc_expand_one(int i, const Entity *edge_table, int edge_cap,
                                  const u64 *frontier, u64 *set, long rcap,
                                  u64 *new_frontier, int nfcap, int *new_count,
                                  u64 *rcount, int *overflow)
@@ -258,7 +272,7 @@ static inline void tc_expand_one(int i, const Entity *edge_table, int edge_cap,
 }
 
 /* Stream-compact one result-set slot into the dense output array. */
-static inline void tc_compact_one(long i, const u64 *set, u64 *out, u64 *out_count)
+TC_DEVFN void tc_compact_one(long i, const u64 *set, u64 *out, u64 *out_count)
 {
     u64 s = set[i];
     if (s != TC_EMPTY64) {

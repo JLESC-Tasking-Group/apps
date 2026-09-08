@@ -847,7 +847,7 @@ def plot_graph_stats(rows, cgstats_path, figdir, dpi, fmt, show):
 # The figure has four bars per group and no room for a pass list in each; the
 # `opt` column of runs.csv stays the ground truth.
 PAPER_LABELS = {
-    "taskgraph:none":                                                "record/replay",
+    "taskgraph:none":                                                "taskgraph",
     "taskgraph:reduce-node,transitive-reduction":                    "+reduce",
     "taskgraph:reduce-node,transitive-reduction,jit":                "+jit",
     "taskgraph:reduce-node,transitive-reduction,prog-fuse,jit":      "+prog-fuse",
@@ -863,12 +863,12 @@ PAPER_LABELS = {
 
 # Configurations drawn as point markers rather than bars: they are references,
 # not steps of the pipeline, and a bar each would double the width of the figure.
-MARKERS = {
-    "synchronous": dict(marker="x", color="black", s=42, zorder=5,
-                        label="synchronous"),
-    "no-taskgraph": dict(marker="_", color="black", s=64, zorder=5,
-                         label="no-taskgraph (=1)"),
-}
+# Configurations drawn as point markers rather than bars. Empty: the figure
+# normalizes against `synchronous`, which is therefore the y=1 line and needs no
+# mark of its own, and `no-taskgraph` reads better as a bar -- it is the first
+# step of the progression the other bars continue, not a reference off to one
+# side.
+MARKERS = {}
 
 
 def paper_label(config):
@@ -940,13 +940,14 @@ def _panel_series(grp, xkey):
 def _speedup_err(heights, xs, cfg, data, spread, ref, ref_spread):
     """Asymmetric yerr for a row of speedup bars, or None if nothing varied.
 
-    A speedup is a ratio of two measured times, so its uncertainty comes from
-    both: the widest ratio consistent with the repeats is the fastest baseline
-    over the slowest pipeline run, and the narrowest is the reverse. Taking the
-    extremes of both is deliberately conservative -- it is the range of
-    speedups you could have reported by pairing any baseline repeat with any
-    pipeline repeat, so a bar whose interval clears 1.0 clears it under every
-    pairing, not just the flattering one.
+    The interval is the configuration's own spread over the repeats, divided by
+    the baseline's median -- not the corner-to-corner range of both. Every bar in
+    a panel is normalized by the same baseline, so that baseline's own spread
+    scales the whole panel at once; charging it to each bar separately would draw
+    it as though the bars could move independently, which is exactly what it
+    cannot make them do. What the figure is read for is the step from one bar to
+    the next, and the baseline cancels there. The caption says that the reference
+    carries a spread of its own.
 
     Returns None when every interval has zero width (no repeats anywhere), so a
     single-sample figure draws no bars rather than a row of degenerate ticks
@@ -957,9 +958,8 @@ def _speedup_err(heights, xs, cfg, data, spread, ref, ref_spread):
             lo_err.append(0.0); hi_err.append(0.0)
             continue
         t_lo, t_hi = spread.get(cfg, {}).get(x, (data[cfg][x], data[cfg][x]))
-        r_lo, r_hi = ref_spread.get(x, (ref[x], ref[x]))
-        s_lo, s_hi = r_lo / t_hi, r_hi / t_lo
-        if t_hi > t_lo or r_hi > r_lo:
+        s_lo, s_hi = ref[x] / t_hi, ref[x] / t_lo
+        if t_hi > t_lo:
             any_spread = True
         # Clamp: the median ratio need not sit inside the corner-to-corner
         # range, and a negative yerr would draw the bar inside out.
@@ -1196,8 +1196,14 @@ def plot_paper_speedup(rows, figdir, dpi, fmt, show, styles, baseline,
 
 
 def plot_paper_unroll(rows, figdir, dpi, fmt, show, styles, baseline,
-                      apps_order, tag=None, figsize=None):
+                      apps_order, tag=None, figsize=None, only_pipeline=None):
     """Speedup against `baseline` as a function of the unroll, one panel per app.
+
+    `only_pipeline` restricts the panel to one configuration. The point the
+    figure makes -- that a recorded region does not beat the un-recorded one
+    until several iterations share an instance -- is a property of the instance
+    barrier, not of any particular pass, so one fully optimized curve makes it
+    and five overlapping ones only crowd it.
 
     A taskgraph instance ends in a taskwait: every task it recorded must finish
     before the next instance starts. The un-recorded program has no such point
@@ -1266,8 +1272,11 @@ def plot_paper_unroll(rows, figdir, dpi, fmt, show, styles, baseline,
     except ImportError:
         APPS = {}
 
+    # A single panel is sized for one column of the two-column layout; several
+    # still need the full width.
+    default_size = (3.4, 2.3) if len(panels) == 1 else (2.9 * len(panels), 2.9)
     fig, axes = plt.subplots(1, len(panels),
-                             figsize=(figsize or (2.9 * len(panels), 2.9)),
+                             figsize=(figsize or default_size),
                              squeeze=False)
     axes = axes[0]
     handles = {}
@@ -1289,6 +1298,9 @@ def plot_paper_unroll(rows, figdir, dpi, fmt, show, styles, baseline,
             # "curve" through their single point would suggest they were measured
             # across the axis and found flat.
             if pipe in MARKERS:
+                continue
+            if (only_pipeline is not None
+                    and pipe != canon_pipeline(only_pipeline)):
                 continue
             series[pipe][run_unroll(r)] = (v, lo, hi)
         if ref is None:
@@ -1324,8 +1336,12 @@ def plot_paper_unroll(rows, figdir, dpi, fmt, show, styles, baseline,
         ax.set_axisbelow(True)
 
     axes[0].set_ylabel(f"speedup over\n{baseline}")
-    fig.legend(handles.values(), handles.keys(), loc="upper center",
-               bbox_to_anchor=(0.5, 0.0), ncol=min(len(handles), 4), frameon=False)
+    # A legend of one entry names a curve the caption already names, and costs a
+    # third of the height of a single-column figure to do it.
+    if len(handles) > 1:
+        fig.legend(handles.values(), handles.keys(), loc="upper center",
+                   bbox_to_anchor=(0.5, 0.0), ncol=min(len(handles), 4),
+                   frameon=False)
     fig.tight_layout()
     _save(fig, figdir, "paper-unroll", dpi, fmt, show)
 
@@ -1350,10 +1366,32 @@ def _jit_by_tag(jitstats_path):
     return out
 
 
-def _fmt(v, prec=0):
+def _size_cell(size, parens=False):
+    """A problem size, written `s=64`.
+
+    One symbol for every application on purpose: the applications scale along
+    different things -- a grid edge, zones per side, a graph -- and a letter
+    borrowed from any one of them would read as a claim about the others. `s` is
+    the generic size parameter the paper uses throughout. A bare 64 next to a
+    bare 7035 would also invite a comparison that is not there."""
+    if size == "" or size is None:
+        return ""
+    txt = f"{int(size):,}" if str(size).isdigit() else str(size)
+    cell = f"$s\\!=\\!{txt}$"
+    return f" ({cell})" if parens else cell
+
+
+def _fmt(v, prec=0, group=False):
+    """A number for a table cell, or an em-dash when there is none.
+
+    `group` inserts thousands separators. Off by default because the graph table
+    sits in a single column and its $|V|/|E|$ cells are already the widest thing
+    in it; on where the numbers are large and read as quantities -- a break-even
+    of 13,015 replays is a figure one takes in at a glance, 13015 is not."""
     if v is None:
         return "--"
-    return f"{v:.{prec}f}" if prec else f"{int(round(v))}"
+    spec = f",.{prec}f" if group else f".{prec}f"
+    return f"{v:{spec}}" if prec else f"{int(round(v)):,}" if group else f"{int(round(v))}"
 
 
 # The canonical order the library applies passes in, and the label each gets in
@@ -1442,21 +1480,55 @@ def _cost_rows(rows, cgstats_path, jitstats_path, baseline, main_tag,
     return out
 
 
-def _emit_table(caption, label, colspec, header, body, out):
+def _emit_table(caption, label, colspec, header, body, out, wide=True,
+                groups=()):
+    """Write a booktabs table. `wide` picks table* (both columns) over table;
+    a table narrow enough for one column should use one, so the page keeps the
+    text flowing around it.
+
+    `groups` spans several columns under one heading, as (label, first, last)
+    with 1-based inclusive bounds. It adds a row above the header and a
+    \\cmidrule beneath each span, which is what lets two columns share a name
+    and be told apart by a sub-heading rather than by repeating the name."""
+    env = "table*" if wide else "table"
     lines = [
         "% Generated by scripts/plot.py. Do not edit by hand.",
-        "\\begin{table*}[t]",
+        "\\begin{" + env + "}[t]",
         "  \\centering",
         "  \\caption{" + caption + "}",
         "  \\label{" + label + "}",
         "  {\\footnotesize",
+    ]
+    if not wide:
+        # A single-column table has ~240pt to work with; the default 6pt of
+        # padding either side of five columns is 60pt of it.
+        lines.append("  \\setlength{\\tabcolsep}{3.5pt}")
+    lines += [
         "  \\begin{tabular}{" + colspec + "}",
         "    \\toprule",
+    ]
+    if groups:
+        spanned = {}
+        for lbl, a, b in groups:
+            spanned[a] = (lbl, b)
+        top, col = [], 1
+        while col <= len(header):
+            if col in spanned:
+                lbl, b = spanned[col]
+                top.append(f"\\multicolumn{{{b - col + 1}}}{{c}}{{\\textbf{{{lbl}}}}}")
+                col = b + 1
+            else:
+                top.append("")
+                col += 1
+        lines.append("    " + " & ".join(top) + " \\\\")
+        lines.append("    " + " ".join(f"\\cmidrule(lr){{{a}-{b}}}"
+                                       for _, a, b in groups))
+    lines += [
         "    " + " & ".join(f"\\textbf{{{h}}}" for h in header) + " \\\\",
         "    \\midrule",
     ]
     lines += ["    " + " & ".join(c) + " \\\\" for c in body]
-    lines += ["    \\bottomrule", "  \\end{tabular}}", "\\end{table*}"]
+    lines += ["    \\bottomrule", "  \\end{tabular}}", "\\end{" + env + "}"]
     text = "\n".join(lines) + "\n"
     if out == "-":
         print(text)
@@ -1513,28 +1585,31 @@ def latex_table_graph(rows, cgstats_path, full_pipeline, out, tag=""):
         v1 = user_nodes(after("transitive-reduction", "nodes")
                         or after("reduce-node", "nodes"))
         e1 = after("transitive-reduction", "edges") or after("reduce-node", "edges")
+        vf = user_nodes(after("prog-fuse", "nodes"))
         vp = user_nodes(after("batch", "nodes") or after("sequence", "nodes"))
 
         spec = APPS.get(r["app"])
+        # Name and size in one cell: the class of each application is given in
+        # the text, and dropping it with the size folded in is what lets the
+        # table sit in a single column.
+        name = ((getattr(spec, "pretty", None) or r["app"])
+                + (f" {r['variant']}" if r.get("variant") else "")
+                + _size_cell(r.get("size", ""), parens=True))
         body.append([
-            (getattr(spec, "pretty", None) or r["app"])
-            + (f" {r['variant']}" if r.get("variant") else ""),
-            getattr(spec, "klass", "") or "",
-            str(r.get("size", "")),
+            name,
             f"{_fmt(v0)}/{_fmt(e0)}",
             f"{_fmt(v1)}/{_fmt(e1)}",
+            _fmt(vf),
             _fmt(vp),
         ])
 
     _emit_table(
-        "Applications, and what the passes do to the command graph recorded for "
-        "one iteration. Nodes are given before any pass, after the two reduction "
-        "steps, and after packing; the virtual entry and exit nodes that bracket "
-        "every graph are excluded, so a fully packed graph is one node.",
-        "tbl:apps", "@{}l l r r r r@{}",
-        ["Application", "Class", "Size", "$|V|/|E|$", "after \\code{reduce}",
-         "after \\code{packing}"],
-        body, out)
+        "Applications, size parameters, and how optimization passes "
+        "incrementally reduces the number of nodes and edges.",
+        "tbl:apps", "@{}l r r r r@{}",
+        ["Application", "\#node/\#edge", "\\code{reduce}", "\\code{prog-fuse}",
+         "\\code{packing}"],
+        body, out, wide=False)
 
 
 def latex_table_cost(rows, cgstats_path, jitstats_path, baseline, main_tag,
@@ -1566,29 +1641,28 @@ def latex_table_cost(rows, cgstats_path, jitstats_path, baseline, main_tag,
         spec = APPS.get(k[0])
         body.append([
             (getattr(spec, "pretty", None) or k[0]) + (f" {k[1]}" if k[1] else ""),
-            str(k[2]),
-            _fmt(c["reduce"], 1),
-            _fmt(c["prog-fuse"], 1),
-            _fmt(c["JIT"], 1),
-            _fmt(c["packing"], 1),
-            _fmt(c["total"] / 1000.0, 2),
-            _fmt(c["replay"], 3),
-            _fmt(c["breakeven"]),
-            _fmt(w["breakeven"]) if w else "--",
+            _size_cell(k[2]),
+            _fmt(c["reduce"], 1, True),
+            _fmt(c["prog-fuse"], 1, True),
+            _fmt(c["JIT"], 1, True),
+            _fmt(w["JIT"], 1, True) if w else "--",
+            _fmt(c["packing"], 1, True),
+            _fmt(c["total"], 1, True),
+            _fmt(c["replay"], 3, True),
+            _fmt(c["breakeven"], 0, True),
+            _fmt(w["breakeven"], 0, True) if w else "--",
         ])
 
     _emit_table(
-        "Cost of one run of the pipeline, per pass and in total, next to the time "
-        "of the single replay it is optimizing, and the number of replays that "
-        "repays it against \\texttt{no-taskgraph}. Per-pass times and one replay "
-        "are in milliseconds. The break-even column is a first run, which compiles "
-        "every kernel; \\emph{cached} is any later run of the same application, "
-        "served from the JIT's on-disk cache.",
-        "tbl:cost", "@{}l r r r r r r r r r@{}",
+        "Replay time of an instance, and cost of each pass (additive, left to right). "
+        "Times are in milliseconds. We report both cold (no ondisk cache) and "
+        "warm (with ondisk cache) times for the JIT pass, and the resulting break-even.",
+        "tbl:cost", "@{}l r r r r r r r r r r@{}",
         ["Application", "Size", "\\code{reduce}", "\\code{prog-fuse}",
-         "\\code{JIT}", "\\code{packing}", "total (s)", "one replay",
-         "break-even", "\\;cached"],
-        body, out)
+         "cold", "cached", "\\code{packing}", "total", "one replay",
+         "cold", "cached"],
+        body, out,
+        groups=[("\\code{JIT}", 6, 7), ("break-even", 10, 11)])
 
 def _save(fig, figdir, name, dpi, fmt, show):
     import matplotlib.pyplot as plt
@@ -1651,14 +1725,27 @@ def main():
                     "where the curve crosses 1.0 that says whether recording a "
                     "graph pays for that barrier. Needs evaluate.py --unroll with "
                     "more than one value")
+    ap.add_argument("--unroll-pipeline", default="", metavar="CONFIG",
+                    help="draw only this configuration in the unroll figure (e.g. the "
+                    "full pipeline). The figure is about the instance barrier, which "
+                    "no pass removes, so one curve states it and several only overlap")
     ap.add_argument("--unroll-tag", default=None, metavar="TAG",
                     help="runs.csv `tag` the unroll figure reads, to keep it to the "
                     "one sweep that varied the unroll (\"\" selects the untagged "
                     "main sweep). Without it the figure spans every sweep and two "
                     "runs at the same unroll collide")
-    ap.add_argument("--baseline", default="no-taskgraph",
-                    help="configuration the paper figure and the break-even column "
-                    "normalize against (default: no-taskgraph)")
+    ap.add_argument("--baseline", default="synchronous",
+                    help="what the paper figure normalizes against (default: "
+                    "synchronous, one kernel per loop with no tasking). Every other "
+                    "configuration is then a bar, and the figure reads as one "
+                    "progression from the simplest execution to the fully optimized "
+                    "one")
+    ap.add_argument("--async-baseline", default="no-taskgraph",
+                    help="the same program asynchronously, without record/replay "
+                    "(default: no-taskgraph). Two things measure against it rather "
+                    "than against --baseline, because both ask whether recording a "
+                    "graph is worth it at all: the unroll figure, whose crossing of "
+                    "1.0 is exactly that question, and the break-even column")
     ap.add_argument("--panel-size", type=int, default=0,
                     help="problem size at which an app whose panel varies the variant "
                     "(krylov) is compared; default: its largest size")
@@ -1750,7 +1837,7 @@ def main():
         d.mkdir(parents=True, exist_ok=True)
         latex_table_graph(rows, cgstats_csv, args.pipeline,
                           str(d / "generated-table-graph.tex"), args.main_tag)
-        latex_table_cost(rows, cgstats_csv, jitstats_csv, args.baseline,
+        latex_table_cost(rows, cgstats_csv, jitstats_csv, args.async_baseline,
                          args.main_tag, args.pipeline, args.cached_tag,
                          str(d / "generated-table-cost.tex"))
 
@@ -1794,9 +1881,9 @@ def main():
                            figsize, args.paper_unroll or None, args.main_tag)
     if args.paper_unroll_figure and not args.no_figures:
         plot_paper_unroll(rows, figdir, args.dpi, args.format, args.show, styles,
-                          args.baseline,
+                          args.async_baseline,
                           [a.strip() for a in args.apps.split(",") if a.strip()],
-                          args.unroll_tag)
+                          args.unroll_tag, None, args.unroll_pipeline or None)
     if cgstats_csv.exists():
         plot_graph_stats(rows, cgstats_csv, figdir, args.dpi, args.format, args.show)
     else:

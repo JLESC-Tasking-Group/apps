@@ -77,7 +77,9 @@ what the pre-`--repeat` numbers came from and it still replots with
 `--outdir results/sweep1-single`. It is not the paper's data: one run per
 configuration cannot separate a pass from the machine (see `--repeat` below).
 
-Three artifacts, five sweeps. `$OPTS` is the incremental pipeline (the default of
+Three artifacts, three sweeps. Sweeps 4 and 5 below are not part of the paper:
+the OmpSs-2/CPU integration is preliminary and appears only as future work, and
+the hand-written baselines are deferred. `$OPTS` is the incremental pipeline (the default of
 `appspecs.py`, spelled out here so a sweep is self-describing):
 
 ```sh
@@ -203,7 +205,7 @@ Check it worked in `results/jitstats.csv`: the `jit-disk-cold` rows must have
 `device_disk_reuse = 0` (it read nothing) and the `jit-disk-warm` rows must have
 `device_compiled = 0` (it compiled nothing).
 
-**4. OmpSs-2 / NODES, CPU** -- the second runtime. Needs a NODES built
+**4. OmpSs-2 / NODES, CPU** (not in the paper) -- the second runtime. Needs a NODES built
 `--with-cgir`; the harness turns the CGIR path on (`taskiter.opt.use_cgir`) and
 passes the same pass names through `NODES_TASKITER_CGIR_OPT`.
 
@@ -231,7 +233,7 @@ On this backend `tasking.h` records through `#pragma oss taskiter`, and `--unrol
 keeps its meaning -- iterations per recorded instance -- so the same value is
 comparable across the two runtimes.
 
-**5. Hand-written references** -- built and run by hand (different sources and
+**5. Hand-written references** (not in the paper) -- built and run by hand (different sources and
 toolchains, so not part of the sweep), then written into a small CSV that the
 figure overlays:
 

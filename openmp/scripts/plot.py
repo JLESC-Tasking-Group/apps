@@ -1502,7 +1502,7 @@ def _emit_table(caption, label, colspec, header, body, out, wide=True,
     if not wide:
         # A single-column table has ~240pt to work with; the default 6pt of
         # padding either side of five columns is 60pt of it.
-        lines.append("  \\setlength{\\tabcolsep}{3.5pt}")
+        lines.append("  \\setlength{\\tabcolsep}{2.5pt}")
     lines += [
         "  \\begin{tabular}{" + colspec + "}",
         "    \\toprule",
@@ -1607,7 +1607,7 @@ def latex_table_graph(rows, cgstats_path, full_pipeline, out, tag=""):
         "Applications, size parameters, and how optimization passes "
         "incrementally reduces the number of nodes and edges.",
         "tbl:apps", "@{}l r r r r@{}",
-        ["Application", "\#node/\#edge", "\\code{reduce}", "\\code{prog-fuse}",
+        ["Application", "\\#node/\\#edge", "\\code{reduce}", "\\code{prog-fuse}",
          "\\code{packing}"],
         body, out, wide=False)
 
@@ -1642,13 +1642,14 @@ def latex_table_cost(rows, cgstats_path, jitstats_path, baseline, main_tag,
         body.append([
             (getattr(spec, "pretty", None) or k[0]) + (f" {k[1]}" if k[1] else ""),
             _size_cell(k[2]),
+            _fmt(c["replay"], 3, True),
             _fmt(c["reduce"], 1, True),
             _fmt(c["prog-fuse"], 1, True),
             _fmt(c["JIT"], 1, True),
             _fmt(w["JIT"], 1, True) if w else "--",
             _fmt(c["packing"], 1, True),
             _fmt(c["total"], 1, True),
-            _fmt(c["replay"], 3, True),
+            _fmt(w["total"], 1, True) if w else "--",
             _fmt(c["breakeven"], 0, True),
             _fmt(w["breakeven"], 0, True) if w else "--",
         ])
@@ -1656,13 +1657,16 @@ def latex_table_cost(rows, cgstats_path, jitstats_path, baseline, main_tag,
     _emit_table(
         "Replay time of an instance, and cost of each pass (additive, left to right). "
         "Times are in milliseconds. We report both cold (no ondisk cache) and "
-        "warm (with ondisk cache) times for the JIT pass, and the resulting break-even.",
-        "tbl:cost", "@{}l r r r r r r r r r r@{}",
-        ["Application", "Size", "\\code{reduce}", "\\code{prog-fuse}",
-         "cold", "cached", "\\code{packing}", "total", "one replay",
-         "cold", "cached"],
+        "warm (with ondisk cache) times for the JIT pass, and the resulting total "
+        "and break-even. \\code{JIT} is the only cached pass, so it is the only "
+        "one whose two columns differ.",
+        "tbl:cost", "@{}l r r r r r r r r r r r@{}",
+        ["Application", "Size", "one replay", "\\code{reduce}",
+         "\\code{prog-fuse}", "cold", "cached", "\\code{packing}",
+         "cold", "cached", "cold", "cached"],
         body, out,
-        groups=[("\\code{JIT}", 6, 7), ("break-even", 10, 11)])
+        groups=[("\\code{JIT}", 6, 7), ("total", 9, 10),
+                ("break-even", 11, 12)])
 
 def _save(fig, figdir, name, dpi, fmt, show):
     import matplotlib.pyplot as plt

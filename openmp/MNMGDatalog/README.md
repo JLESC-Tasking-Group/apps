@@ -83,7 +83,8 @@ Environment: `TC_WARMUP=<n>` untimed, ungraphed warm-up rounds before round 0
 (default 3); `TC_WORKERS=<n>` overrides the GPU grid-stride worker count (see
 below); `TC_VERIFY=1` reads the edge table back after the fill and after the
 build and reports the occupied-slot counts (a device-side sanity check, off by
-default); `TC_WRITE=1` writes `<input>_<version>_tc.bin` (off by default so
+default); `TC_TRACE=1` prints one flushed stderr line per kernel dispatch (see
+"Debugging"); `TC_WRITE=1` writes `<input>_<version>_tc.bin` (off by default so
 sweeps stay clean); `TC_DUMP=<f>` writes a `src dst` text dump; `TC_CSV=<f>`
 writes the reference's 15-column metric row.
 
@@ -207,6 +208,81 @@ Known reference sizes: `data_10` -> TC 18 / 3 rounds, `data_7035` -> 146 120 / 6
 `data_23874` -> 481 121 / 58, and the table above for the rest. A build with
 `USE_TASKGRAPH=0` and one with `USE_TASKGRAPH=1` must produce the identical TC
 size, round count, and (via `TC_DUMP`) tuple set.
+
+## Debugging: the open GPU fault on inputs above ~24 K edges
+
+**Status: unresolved.** `data_7035` and `data_23874` complete on the GPU; every
+larger dataset aborts with
+`cuStreamSynchronize / cuEventSynchronize failed with an illegal memory access
+was encountered (700)` (and, at `-O3`, `Invalid access of peer GPU memory over
+nvlink (226)`). The CPU backend is correct on every input. This section records
+what has already been ruled out so it is not re-derived.
+
+### Ruled out
+
+| hypothesis | how it was eliminated |
+|---|---|
+| taskgraph record/replay | fails with `USE_TASKGRAPH=0` |
+| async nowait target tasks, xkrt command queue | fails with `USE_SYNC=1` (no tasks at all) |
+| `depend` clauses / dependence tracking | `USE_SYNC=1` emits none |
+| `-O0` device codegen, device stack | fails at `-O3` too |
+| allocator / `omp_target_alloc` | a 16 GiB `fill_result_set` completes and reads back correctly |
+| edge table construction | `TC_VERIFY=1` reports fill -> 0 occupied, build -> exactly `n_edges` |
+| result-set / frontier capacity | fails at `capacity_mult=8192` (set >= 2x TC), and the overflow flag never trips |
+| **buffer size** | `./tc.x data_49152.bin 16` -> every buffer **2^20**, smaller than the working `data_23874` run at 2^21, still faults |
+| algorithm | CPU backend produces the correct TC |
+
+### The one live lead
+
+`TC_WORKERS=4096 ./tc.x data_147892.bin 8192` **progresses**, where the default
+`TC_WORKERS` (2^21) faults. `n_workers` feeds only `k_expand` and `k_promote`, so
+the fault is in one of those two and scales with the grid-stride worker count --
+*not* with the buffer sizes. Note `data_23874` works at the same 2^21 workers, so
+it is an interaction between worker count and the amount of work per round, not
+either alone.
+
+### Tools
+
+```shell
+# name the faulting kernel: blocking launches + a flushed line per dispatch,
+# so the LAST line printed is the kernel that faulted
+make USE_TARGET=1 USE_SYNC=1
+TC_TRACE=1 ./tc.x MNMGDatalog-reference/data/data_49152.bin 16
+
+# check the edge table really was built on the device
+TC_VERIFY=1 ./tc.x ...
+
+# sweep the worker count (the live lead)
+for w in 4096 65536 1048576 2097152; do TC_WORKERS=$w ./tc.x ... ; done
+
+# memory-model A/B: pinned host + map(present:), i.e. what krylov/lulesh do.
+# tc.cpp is the only app here using omp_target_alloc + is_device_ptr, and the
+# only one that faults. Diagnostic only -- it mirrors every buffer on the host,
+# so use it on a small configuration (e.g. data_49152 with capacity_mult 16).
+make USE_TARGET=1 TC_MAPPED_MEM=1
+```
+
+### Standalone reproducer
+
+`tc_repro.cpp` isolates the three constructs used by tc.cpp and by no other app
+in `apps/openmp` (`omp_target_alloc`+`is_device_ptr`, device
+`omp atomic compare capture`, device `omp atomic capture`) in `k_expand`'s
+grid-stride shape, with no `tasking.h`, no `alloc.h` and no xkomp:
+
+```shell
+make repro USE_TARGET=1
+./tc_repro.x [keys] [slots] [workers] [mode] [rounds]
+
+# the two sweeps that matter
+for w in 4096 65536 1048576 2097152; do ./tc_repro.x 1000000 4194304 $w; done
+for m in 0 1 2 3; do ./tc_repro.x 1000000 4194304 2097152 $m; done   # bisect the atomics
+make repro-mapped USE_TARGET=1 && ./tc_repro_mapped.x                # memory-model A/B
+```
+
+`mode` is a bitmask: bit 0 = atomic CAS insert, bit 1 = atomic fetch-add append,
+`0` = plain stores. If the reproducer faults it is a self-contained toolchain bug
+report; if it does not, the difference from `k_expand` is the next thing to look
+at.
 
 ## Evaluation harness
 

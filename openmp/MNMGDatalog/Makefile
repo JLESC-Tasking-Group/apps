@@ -13,7 +13,14 @@
 #   TC_WARMUP=<n>  untimed, ungraphed warm-up rounds before round 0 (default 3)
 #   TC_WORKERS=<n> grid-stride worker count of the GPU fixpoint kernels
 #   TC_VERIFY=1    read the edge table back and check the fill / build on device
+#   TC_TRACE=1     one flushed stderr line per kernel dispatch (use with USE_SYNC=1
+#                  to name a faulting kernel; see README "Debugging")
 #   TC_WRITE=1 writes <input>_<version>_tc.bin ; TC_CSV=<f> writes the metric row.
+#
+# Debug builds:
+#     make USE_TARGET=1 USE_SYNC=1                # blocking launches, no tasking
+#     make USE_TARGET=1 TC_MAPPED_MEM=1           # krylov/lulesh memory model
+#     make repro USE_TARGET=1                     # standalone reproducer
 #
 # The fixpoint runs ONCE and each round is timed: round 0 (record) / round 1 (1st
 # replay) / rounds 2..N-1 (avg, stddev), the same shape the Krylov drivers use for
@@ -24,6 +31,12 @@
 include ../common.mk
 
 CFLAGS += -Wall -Wextra
+
+# Memory model A/B (see README "Debugging"). 0: device-only buffers via
+# omp_target_alloc + is_device_ptr (default, mirrors the CUDA reference).
+# 1: pinned host buffers + map(present:), i.e. what krylov/lulesh/HPCCG do.
+TC_MAPPED_MEM ?= 0
+CFLAGS += -DTC_MAPPED_MEM=$(TC_MAPPED_MEM)
 
 # Datasets live in the reference checkout inside this app directory.
 DATA_DIR ?= MNMGDatalog-reference/data
@@ -41,7 +54,17 @@ tc: tc.cpp ../tasking.h ../alloc.h ../alloc.c
 test run: tc
 	./$(program) $(DATA) $(MULT)
 
-clean:
-	rm -f $(program) *.o
+# Standalone minimal reproducer: omp_target_alloc + is_device_ptr + device
+# atomics in k_expand's grid-stride shape, with every dimension on argv. Builds
+# and runs without tasking.h / alloc.h / xkomp. See the header of tc_repro.cpp.
+repro: tc_repro.cpp
+	$(CC) $(CFLAGS) tc_repro.cpp -o tc_repro.x $(LDFLAGS)
 
-.PHONY: all tc test run clean
+# Same reproducer against the krylov/lulesh memory model.
+repro-mapped: tc_repro.cpp
+	$(CC) $(CFLAGS) -DREPRO_MAPPED tc_repro.cpp -o tc_repro_mapped.x $(LDFLAGS)
+
+clean:
+	rm -f $(program) tc_repro.x tc_repro_mapped.x *.o
+
+.PHONY: all tc test run repro repro-mapped clean

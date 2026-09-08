@@ -87,6 +87,13 @@ typedef unsigned long long u64;
 # define TC_WORKERS_DEFAULT (1L << 21)
 #endif
 
+/* Memory-model A/B toggle, see the "Host <-> device memory abstraction" block.
+ * 0 (default): device-only buffers via omp_target_alloc + is_device_ptr.
+ * 1          : pinned host buffers + map(present:), as krylov/lulesh do. */
+#ifndef TC_MAPPED_MEM
+# define TC_MAPPED_MEM 0
+#endif
+
 /* Edge slot for the open-addressing edge table (key = source, value = dest). */
 struct Entity { int key; int value; };
 
@@ -266,22 +273,142 @@ static inline void tc_compact_one(long i, const u64 *set, u64 *out, u64 *out_cou
 
 /* ------------------------------------------------------------------------- */
 /* Host <-> device memory abstraction.                                        */
-/*   GPU (USE_TARGET==1): omp_target_alloc + omp_target_memcpy (device-only). */
-/*   CPU (USE_TARGET==0): plain malloc / memcpy (host memory).                */
+/*                                                                            */
+/*   CPU (USE_TARGET==0):                 plain malloc / memcpy.              */
+/*   GPU, TC_MAPPED_MEM==0 (default):     omp_target_alloc + omp_target_memcpy */
+/*                                        (device-only, reached with           */
+/*                                        is_device_ptr) -- the direct analog  */
+/*                                        of the reference's cudaMalloc, with  */
+/*                                        no host mirror of a multi-GB set.    */
+/*   GPU, TC_MAPPED_MEM==1:               pinned host buffers + map(present:), */
+/*                                        i.e. the model krylov / lulesh /     */
+/*                                        HPCCG use. Strictly a DIAGNOSTIC     */
+/*                                        A/B: it doubles the footprint (a     */
+/*                                        host mirror of every buffer) and is  */
+/*                                        only practical on small inputs. It   */
+/*                                        exists because tc.cpp is the only    */
+/*                                        app here using the is_device_ptr     */
+/*                                        model, and the only one that faults. */
 /* ------------------------------------------------------------------------- */
 #if USE_TARGET
 static int g_dev  = 0;
 static int g_host = 0;
+#endif
+
+#if USE_TARGET && TC_MAPPED_MEM
+
+/* Every buffer is host memory with a device copy created at allocation, so the
+ * kernels reach it with map(present:) exactly like the Krylov solvers. The
+ * host side is kept as the master copy; to_dev / from_dev are target updates. */
+static inline void *dalloc(size_t b)
+{
+    char *p = (char *)host_alloc(b);
+    if (p) {
+        #pragma omp target enter data map(alloc: p[0:b])
+    }
+    return p;
+}
+static inline void dfree(void *vp)
+{
+    char *p = (char *)vp;
+    if (p) {
+        #pragma omp target exit data map(release: p[0:1])
+        host_free(p);
+    }
+}
+static inline void to_dev(void *d, const void *s, size_t b)
+{
+    char *p = (char *)d;
+    memcpy(p, s, b);
+    #pragma omp target update to(p[0:b])
+}
+static inline void from_dev(void *d, const void *s, size_t b)
+{
+    char *p = (char *)s;
+    #pragma omp target update from(p[0:b])
+    memcpy(d, p, b);
+}
+
+#elif USE_TARGET
+
 static inline void *dalloc(size_t b)            { return omp_target_alloc(b, g_dev); }
 static inline void  dfree(void *p)              { if (p) omp_target_free(p, g_dev); }
 static inline void  to_dev(void *d, const void *s, size_t b)   { omp_target_memcpy(d, (void *)s, b, 0, 0, g_dev, g_host); }
 static inline void  from_dev(void *d, const void *s, size_t b) { omp_target_memcpy(d, (void *)s, b, 0, 0, g_host, g_dev); }
+
 #else
+
 static inline void *dalloc(size_t b)            { return malloc(b); }
 static inline void  dfree(void *p)              { free(p); }
 static inline void  to_dev(void *d, const void *s, size_t b)   { memcpy(d, s, b); }
 static inline void  from_dev(void *d, const void *s, size_t b) { memcpy(d, s, b); }
+
 #endif
+
+/* ----------------------------------------------------------------------------
+ * Per-kernel device-memory clauses. The ONLY place the two memory models differ
+ * in the kernels: TC_MAPPED_MEM==0 passes the device-only buffers by value with
+ * is_device_ptr, TC_MAPPED_MEM==1 asserts their mapped presence instead. The two
+ * spellings need different syntax (bare pointers vs array sections), so they
+ * cannot be folded into one macro -- hence one macro per kernel, all here.
+ * new_count and overflow are pinned-host + mapped in BOTH models.
+ * ------------------------------------------------------------------------- */
+#if USE_TARGET && TC_MAPPED_MEM
+# define TC_MEM_FILL_TABLE  map(present: table[0:cap])
+# define TC_MEM_FILL_SET    map(present: set[0:cap])
+# define TC_MEM_BUILD       map(present: edges[0:2*n], table[0:cap], ov[0:1])
+# define TC_MEM_INIT_BASE   map(present: edges[0:2*n], set[0:rcap], fr[0:fcap], \
+                                         fs[0:1], rc[0:1], ov[0:1])
+# define TC_MEM_COMPACT     map(present: set[0:cap], out[0:1], out_count[0:1])
+# define TC_MEM_EXPAND      MAP(present: et[0:ec], fr[0:nfc], fs[0:1], rs[0:rc], \
+                                         nf[0:nfc], rcnt[0:1], ncnt[0:1], ov[0:1])
+# define TC_MEM_PROMOTE     MAP(present: fr[0:nfc], nf[0:nfc], nc[0:1])
+# define TC_MEM_SET_SIZES   map(present: fs[0:1], nc[0:1])
+#elif USE_TARGET
+# define TC_MEM_FILL_TABLE  is_device_ptr(table)
+# define TC_MEM_FILL_SET    is_device_ptr(set)
+# define TC_MEM_BUILD       is_device_ptr(edges, table) map(present: ov[0:1])
+# define TC_MEM_INIT_BASE   is_device_ptr(edges, set, fr, fs, rc) map(present: ov[0:1])
+# define TC_MEM_COMPACT     is_device_ptr(set, out, out_count)
+# define TC_MEM_EXPAND      is_device_ptr(et, fr, fs, rs, nf, rcnt) \
+                            MAP(present: ncnt[0:1], ov[0:1])
+# define TC_MEM_PROMOTE     is_device_ptr(fr, nf) MAP(present: nc[0:1])
+# define TC_MEM_SET_SIZES   is_device_ptr(fs) map(present: nc[0:1])
+#else
+# define TC_MEM_EXPAND
+# define TC_MEM_PROMOTE
+#endif
+
+/* ------------------------------------------------------------------------- */
+/* TC_TRACE=1: one flushed stderr line per kernel dispatch, printed BEFORE the  */
+/* launch, naming the kernel and the sizes it was given.                       */
+/*                                                                             */
+/* Under USE_SYNC=1 every launch is blocking, so after an abort the LAST line   */
+/* printed names the kernel that faulted -- which the CUDA error alone does not */
+/* tell you (xkrt reports the stream sync, not the kernel). Under the           */
+/* asynchronous schedules the lines mark task CREATION, not execution, so they  */
+/* bound the failure but do not pinpoint it; debug with USE_SYNC=1.             */
+/*                                                                             */
+/* Off by default: one cached getenv and a predictable branch per dispatch.     */
+/* ------------------------------------------------------------------------- */
+static int g_trace = -1;
+
+static inline bool tc_tracing(void)
+{
+    if (g_trace < 0) {
+        const char *v = getenv("TC_TRACE");
+        g_trace = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return g_trace != 0;
+}
+
+#define TC_TRACE_K(fmt, ...)                                                   \
+    do {                                                                       \
+        if (tc_tracing()) {                                                    \
+            fprintf(stderr, "# TC_TRACE " fmt "\n" __VA_OPT__(,) __VA_ARGS__); \
+            fflush(stderr);                                                    \
+        }                                                                      \
+    } while (0)
 
 /* Typed fills of the two open-addressing tables with their empty marker -- the
  * analog of the reference's cudaMemset(..., 0xFF, ...), but one store per SLOT
@@ -291,8 +418,9 @@ static inline void  from_dev(void *d, const void *s, size_t b) { memcpy(d, s, b)
  * patterns are identical: -1 == 0xFFFFFFFF, TC_EMPTY64 == 0xFFFF...FF. */
 static void fill_edge_table(Entity *table, int cap)
 {
+    TC_TRACE_K("-> fill_edge_table  cap=%d", cap);
 #if USE_TARGET
-    #pragma omp target teams distribute parallel for is_device_ptr(table)
+    #pragma omp target teams distribute parallel for TC_MEM_FILL_TABLE
     for (int i = 0; i < cap; i++) { table[i].key = -1; table[i].value = -1; }
 #else
     #pragma omp parallel for
@@ -302,8 +430,9 @@ static void fill_edge_table(Entity *table, int cap)
 
 static void fill_result_set(u64 *set, long cap)
 {
+    TC_TRACE_K("-> fill_result_set  cap=%ld", cap);
 #if USE_TARGET
-    #pragma omp target teams distribute parallel for is_device_ptr(set)
+    #pragma omp target teams distribute parallel for TC_MEM_FILL_SET
     for (long i = 0; i < cap; i++) set[i] = TC_EMPTY64;
 #else
     #pragma omp parallel for
@@ -370,6 +499,9 @@ struct TCContext {
     /* Kept for the overflow diagnostic: it names the knob to raise. */
     long capacity_mult   = 0;
 
+    /* Monotonic round counter, TC_TRACE output only (warm-up rounds included). */
+    int  trace_round     = 0;
+
     double t_fileio = 0.0, t_h2d = 0.0, t_setup = 0.0, peak_mem_mb = 0.0;
 };
 
@@ -415,8 +547,9 @@ static void build_edges(TCContext &ctx)
 {
     int n = ctx.n_edges, cap = ctx.edge_cap;
     int *edges = ctx.d_edges; Entity *table = ctx.d_edge_table; int *ov = ctx.overflow;
+    TC_TRACE_K("-> build_edges      n=%d edge_cap=%d", n, cap);
 #if USE_TARGET
-    #pragma omp target teams distribute parallel for is_device_ptr(edges, table) map(present: ov[0:1])
+    #pragma omp target teams distribute parallel for TC_MEM_BUILD
     for (int i = 0; i < n; i++) tc_build_one(i, edges, table, cap, ov);
 #else
     #pragma omp parallel for
@@ -430,8 +563,9 @@ static void init_base(TCContext &ctx)
     int *edges = ctx.d_edges; u64 *set = ctx.d_result_set;
     u64 *fr = ctx.d_frontier; int *fs = ctx.d_frontier_size;
     u64 *rc = ctx.d_result_count; int *ov = ctx.overflow;
+    TC_TRACE_K("-> init_base        n=%d rcap=%ld fcap=%d", n, rcap, fcap);
 #if USE_TARGET
-    #pragma omp target teams distribute parallel for is_device_ptr(edges, set, fr, fs, rc) map(present: ov[0:1])
+    #pragma omp target teams distribute parallel for TC_MEM_INIT_BASE
     for (int i = 0; i < n; i++) tc_init_base_one(i, edges, set, rcap, fr, fcap, fs, rc, ov);
 #else
     #pragma omp parallel for
@@ -442,8 +576,9 @@ static void init_base(TCContext &ctx)
 static void compact(TCContext &ctx, u64 *out, u64 *out_count)
 {
     u64 *set = ctx.d_result_set; long cap = ctx.result_cap;
+    TC_TRACE_K("-> compact          rcap=%ld", cap);
 #if USE_TARGET
-    #pragma omp target teams distribute parallel for is_device_ptr(set, out, out_count)
+    #pragma omp target teams distribute parallel for TC_MEM_COMPACT
     for (long i = 0; i < cap; i++) tc_compact_one(i, set, out, out_count);
 #else
     #pragma omp parallel for
@@ -483,6 +618,7 @@ static void compact(TCContext &ctx, u64 *out, u64 *out_count)
 static void k_reset(TCContext &ctx)
 {
     int *nc = ctx.new_count;
+    TC_TRACE_K("   -> k_reset");
 #if USE_TARGET
     OMP_TARGET_TASK(DEPEND(out, nc[0]) MAP(present: nc[0:1]))
     { nc[0] = 0; }
@@ -500,13 +636,15 @@ static void k_expand(TCContext &ctx)
     u64 *nf = ctx.d_new_frontier; int nfc = ctx.frontier_cap;
     int *ncnt = ctx.new_count; u64 *rcnt = ctx.d_result_count; int *ov = ctx.overflow;
     int nw = ctx.n_workers;
-    /* GPU: is_device_ptr (mp slot) carries the device-only buffers and
-     * map(present:) the two pinned-host scalars (new_count, overflow); CPU:
-     * default(none) firstprivate (fp slot) captures the pointers/scalars. The
-     * OpenMP bound is the host constant nw; the frontier size fs[0] is read on the
-     * DEVICE by every worker, so replay uses the current frontier size. */
+    TC_TRACE_K("   -> k_expand     nw=%d edge_cap=%d rcap=%ld nfcap=%d", nw, ec, rc, nfc);
+    /* GPU: TC_MEM_EXPAND is the memory-model clause (is_device_ptr for the
+     * device-only buffers plus map(present:) for the two pinned-host scalars, or
+     * all-map(present:) under TC_MAPPED_MEM); CPU: default(none) firstprivate
+     * captures the pointers/scalars. The OpenMP bound is the host constant nw;
+     * the frontier size fs[0] is read on the DEVICE by every worker, so replay
+     * uses the current frontier size. */
     OMP_TILE(DEPEND(in, fs[0], fr[0]) DEPEND(inout, rs[0], ncnt[0], rcnt[0], ov[0]) DEPEND(out, nf[0]),
-             is_device_ptr(et, fr, fs, rs, nf, rcnt) MAP(present: ncnt[0:1], ov[0:1]),
+             TC_MEM_EXPAND,
              DEFAULT_NONE firstprivate(et, ec, fr, fs, rs, rc, nf, nfc, ncnt, rcnt, ov, nw))
     for (int t = 0; t < nw; t++) {
         const int n = fs[0];
@@ -526,11 +664,12 @@ static void k_promote(TCContext &ctx)
 {
     u64 *fr = ctx.d_frontier; u64 *nf = ctx.d_new_frontier; int *nc = ctx.new_count;
     int nw = ctx.n_workers; int nfc = ctx.frontier_cap;
+    TC_TRACE_K("   -> k_promote    nw=%d nfcap=%d", nw, nfc);
     /* Same grid-stride shape as k_expand: nc[0] is the DEVICE copy of new_count
      * (map(present:)), read inside the body. Reading it as the OpenMP bound would
      * take the host copy, which still holds the PREVIOUS round's count. */
     OMP_TILE(DEPEND(in, nc[0], nf[0]) DEPEND(out, fr[0]),
-             is_device_ptr(fr, nf) MAP(present: nc[0:1]),
+             TC_MEM_PROMOTE,
              DEFAULT_NONE firstprivate(fr, nf, nc, nw, nfc))
     for (int t = 0; t < nw; t++) {
         const int n = nc[0] < nfc ? nc[0] : nfc;
@@ -541,8 +680,9 @@ static void k_promote(TCContext &ctx)
 static void k_set_sizes(TCContext &ctx)
 {
     int *fs = ctx.d_frontier_size; int *nc = ctx.new_count; int nfc = ctx.frontier_cap;
+    TC_TRACE_K("   -> k_set_sizes  nfcap=%d", nfc);
 #if USE_TARGET
-    OMP_TARGET_TASK(DEPEND(in, nc[0]) DEPEND(out, fs[0]) is_device_ptr(fs) MAP(present: nc[0:1]))
+    OMP_TARGET_TASK(DEPEND(in, nc[0]) DEPEND(out, fs[0]) TC_MEM_SET_SIZES)
     { fs[0] = nc[0] < nfc ? nc[0] : nfc; }
 #else
     OMP_TASK(DEFAULT_NONE firstprivate(fs, nc, nfc) DEPEND(in, nc[0]) DEPEND(out, fs[0]))
@@ -559,6 +699,7 @@ static void k_set_sizes(TCContext &ctx)
 static void k_writeback(TCContext &ctx)
 {
     int *nc = ctx.new_count; int *ov = ctx.overflow;
+    TC_TRACE_K("   -> k_writeback");
     (void) nc; (void) ov;      /* the directive vanishes on the host backend */
     OMP_TARGET_UPDATE(from(nc[0:1], ov[0:1]) NOWAIT DEPEND(in, nc[0], ov[0]))
 }
@@ -568,6 +709,10 @@ static void k_writeback(TCContext &ctx)
  * launch geometry; only the device-resident sizes read inside the kernels move. */
 static inline void tc_round(TCContext &ctx)
 {
+    /* new_count is the HOST copy, i.e. the previous round's result: under
+     * TC_TRACE it shows the frontier growing round by round, which is what
+     * distinguishes a size-driven failure from a work-driven one. */
+    TC_TRACE_K("== round %d  (prev nc=%d)", ctx.trace_round++, ctx.new_count[0]);
     k_reset(ctx);
     k_expand(ctx);
     k_promote(ctx);

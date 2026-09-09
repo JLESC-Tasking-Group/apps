@@ -505,7 +505,7 @@ MNMG = AppSpec(
     # left out only for sweep time.
     sizes=[23874, 165435, 552020],
     iters=0,                           # unused: round count comes from the data
-    pretty="MNMG",
+    pretty="MNMG (TC)",
     klass="Graph analytics",
     backends=["cpu", "gpu", "ompss"],
     # The transitive closure has an exact size; there is nothing to round off.

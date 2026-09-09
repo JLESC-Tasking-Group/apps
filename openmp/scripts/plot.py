@@ -1376,7 +1376,10 @@ def _size_cell(size, parens=False):
     bare 7035 would also invite a comparison that is not there."""
     if size == "" or size is None:
         return ""
-    txt = f"{int(size):,}" if str(size).isdigit() else str(size)
+    # {,} not , : in math mode a bare comma is punctuation and TeX puts a thin
+    # space after it, so 23,874 sets as "23, 874".
+    txt = (f"{int(size):,}".replace(",", "{,}") if str(size).isdigit()
+           else str(size))
     cell = f"$s\\!=\\!{txt}$"
     return f" ({cell})" if parens else cell
 
@@ -1502,7 +1505,7 @@ def _emit_table(caption, label, colspec, header, body, out, wide=True,
     if not wide:
         # A single-column table has ~240pt to work with; the default 6pt of
         # padding either side of five columns is 60pt of it.
-        lines.append("  \\setlength{\\tabcolsep}{2.5pt}")
+        lines.append("  \\setlength{\\tabcolsep}{2pt}")
     lines += [
         "  \\begin{tabular}{" + colspec + "}",
         "    \\toprule",
@@ -1655,7 +1658,7 @@ def latex_table_cost(rows, cgstats_path, jitstats_path, baseline, main_tag,
         ])
 
     _emit_table(
-        "Replay time of an instance, and cost of each pass (additive, left to right). "
+        "Replay time of an iteration, and cost of each pass (additive, left to right). "
         "Times are in milliseconds. We report both cold (no ondisk cache) and "
         "warm (with ondisk cache) times for the JIT pass, and the resulting total "
         "and break-even. \\code{JIT} is the only cached pass, so it is the only "

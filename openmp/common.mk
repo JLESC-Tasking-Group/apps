@@ -100,7 +100,7 @@ endif
 # it is auto-detected from nvidia-smi when available.
 ifeq ($(USE_TARGET),1)
   CFLAGS  += -fopenmp-targets=nvptx64-nvidia-cuda -fopenmp-offload-mandatory
-  #CFLAGS += -foffload-lto
+  CFLAGS += -foffload-lto
   DETECTED_SMS := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | sort -u | tr -d '.')
   ifneq ($(DETECTED_SMS),)
     CFLAGS += $(foreach sm,$(DETECTED_SMS),--offload-arch=sm_$(sm))

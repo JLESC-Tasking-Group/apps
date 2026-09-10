@@ -52,10 +52,22 @@ from appspecs import (APPS, BACKENDS, CGIR_PASSES, DEFAULT_OPTS,  # noqa: E402
 APPS_OPENMP = Path(__file__).resolve().parent.parent
 
 DEFAULT_ENV = {
-    "XKRT_STATS":   "0",
-    "OMP_PLACES":   "cores",
-    "XKRT_DRIVERS": "host,2;cuda,1",
+    "XKRT_STATS":     "0",
+    "OMP_PLACES":     "cores",
+    "OMP_PROC_BIND":  "close",
+    "XKRT_DRIVERS":   "host,2;cuda,1",
 }
+
+# Host threads for a measured run, and the width of the CPU set it is pinned to.
+#
+# A GPU sweep does not need the whole host, and leaving it unbound was measurably
+# harmful: the `synchronous` baseline came out bimodal -- e.g. LULESH s=16 gave
+# [0.691, 0.693, 1.210, 1.210, 1.222] ms over five repeats, two stable modes 1.75x
+# apart, each process picking one and holding it. A median of five then lands on
+# whichever mode won three, which moved that problem's reported speedup between
+# 2.27x and 3.98x. Pinning the process to a fixed core set with OMP_PLACES=cores
+# and OMP_PROC_BIND=close removes that degree of freedom.
+DEFAULT_THREADS = 8
 
 CSV_FIELDS = [
     "run_id", "timestamp", "machine", "tag",
@@ -79,6 +91,60 @@ def ordered_unique(seq):
             seen.add(x)
             out.append(x)
     return out
+
+
+def cpuset_width(spec):
+    """Number of CPUs a taskset -c list names ('0-7,16' -> 9); None if malformed."""
+    n = 0
+    try:
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                lo, hi = (int(x) for x in part.split("-", 1))
+                if hi < lo:
+                    return None
+                n += hi - lo + 1
+            else:
+                int(part)
+                n += 1
+    except ValueError:
+        return None
+    return n or None
+
+
+def pin_prefix(args):
+    """`taskset -c <list>` to prefix a measured run with, or [] when not pinning.
+
+    Only the runs are pinned, never the builds: `make` is not measured and
+    confining it to the same eight cores would only make the sweep longer.
+    """
+    spec = (args.cpuset or "").strip()
+    if spec.lower() in ("none", "off", "0-"):
+        return []
+    if not spec:
+        if args.threads <= 0:
+            return []                      # --threads 0: nothing to derive a set from
+        spec = "0" if args.threads == 1 else f"0-{args.threads - 1}"
+    if shutil.which("taskset") is None:
+        print("[warn] taskset not found on PATH: runs are NOT pinned, and the "
+              "measurement is exposed to the placement variance --threads/--cpuset "
+              "exist to remove", file=sys.stderr)
+        return []
+    width = cpuset_width(spec)
+    if width is None:
+        print(f"[warn] --cpuset '{spec}' is not a taskset -c list; not pinning",
+              file=sys.stderr)
+        return []
+    ncpu = os.cpu_count() or 0
+    if ncpu and width > ncpu:
+        print(f"[warn] --cpuset '{spec}' names {width} CPUs but the machine has "
+              f"{ncpu}", file=sys.stderr)
+    if args.threads > width:
+        print(f"[warn] OMP_NUM_THREADS={args.threads} exceeds the {width} CPUs of "
+              f"--cpuset '{spec}': threads will share cores", file=sys.stderr)
+    return ["taskset", "-c", spec]
 
 
 def build_cmd(app, variant, cfg, size, iters, backend_vars, grain, unroll):
@@ -253,8 +319,21 @@ def main():
     ap.add_argument("--tag", default="", help="free-form string written to the `tag` column "
                     "of runs.csv, to mark a sweep (e.g. 'jit-cold') so several sweeps can "
                     "share one results file and still be told apart")
-    ap.add_argument("--threads", type=int, default=0, help="OMP_NUM_THREADS (0=leave unset)")
+    ap.add_argument("--threads", type=int, default=DEFAULT_THREADS, metavar="N",
+                    help=f"OMP_NUM_THREADS, and the width of the CPU set each run is "
+                    f"pinned to (default {DEFAULT_THREADS}). 0 leaves both unset -- "
+                    "which on a GPU sweep let the host placement drift and made the "
+                    "reference configurations bimodal, so raise it rather than clear "
+                    "it. A CPU-backend sweep (--target cpu|ompss) wants a value near "
+                    "the core count instead")
+    ap.add_argument("--cpuset", default="", metavar="LIST",
+                    help="explicit `taskset -c` list for the runs, e.g. '0-7' or "
+                    "'8-15' to keep two sweeps off each other's cores. Default: "
+                    "derived from --threads as 0-(N-1). 'none' disables pinning. "
+                    "Builds are never pinned")
     ap.add_argument("--places", default=DEFAULT_ENV["OMP_PLACES"], help="OMP_PLACES")
+    ap.add_argument("--bind", default=DEFAULT_ENV["OMP_PROC_BIND"],
+                    help="OMP_PROC_BIND (default %(default)s)")
     ap.add_argument("--drivers", default=DEFAULT_ENV["XKRT_DRIVERS"], help="XKRT_DRIVERS")
     ap.add_argument("--outdir", default=str(APPS_OPENMP / "results"))
     ap.add_argument("--out", default="", help="runs.csv path (default: <outdir>/runs.csv)")
@@ -356,6 +435,15 @@ def main():
     machine = socket.gethostname()
     ts_run = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
+    # Resolved once: every run of the sweep is pinned the same way, and the
+    # decision (including any warning about it) is reported before the first run
+    # rather than repeated 1280 times.
+    pin = pin_prefix(args)
+    print(f"[env ] OMP_NUM_THREADS={args.threads or '(inherited)'} "
+          f"OMP_PLACES={args.places} OMP_PROC_BIND={args.bind} "
+          f"| runs pinned to: {' '.join(pin) if pin else '(not pinned)'}",
+          file=sys.stderr)
+
     new_file = not runs_csv.exists() or runs_csv.stat().st_size == 0
     if not args.dry_run and not new_file:
         _check_csv_header(runs_csv, ap)
@@ -456,7 +544,7 @@ def main():
                         # directory -- which the run args rely on for their relative
                         # data paths.
                         exe = stashed.get(bkey) or app.binary(variant)
-                        argv = [str(exe)] + list(
+                        argv = pin + [str(exe)] + list(
                             app.run_args(variant, size, eff_iters, cfg, grain, unroll))
                         workdir = APPS_OPENMP / app.directory
 
@@ -464,6 +552,7 @@ def main():
                         env.update(DEFAULT_ENV)
                         env.update(backend.env)
                         env["OMP_PLACES"] = args.places
+                        env["OMP_PROC_BIND"] = args.bind
                         env["XKRT_DRIVERS"] = args.drivers
                         if args.threads:
                             env["OMP_NUM_THREADS"] = str(args.threads)

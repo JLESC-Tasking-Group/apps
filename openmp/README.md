@@ -97,6 +97,16 @@ while the CSV said it had. `evaluate.py` now validates every pass name against
 CGIR's list and refuses to start, and both runtimes now treat an unknown name as
 fatal, so the same mistake fails loudly instead.
 
+**Device LTO is not optional.** `common.mk` builds the GPU configurations with
+`-foffload-lto`, and the paper's numbers assume it. Without it, the ahead-of-time
+kernel keeps its calls into the OpenMP DeviceRTL while CGIR's `jit` pass links
+that runtime in, internalizes and re-optimizes, emitting PTX with no runtime call
+at all -- so `jit` appears to be worth 1.27-1.41x on Krylov when what it measured
+was the missing flag. Every configuration up to `+reduce` runs ahead-of-time
+device code and every configuration from `+jit` on runs JIT'd code, so the flag
+does not cancel out of the ratio: it inflated the whole figure. With it on, the
+two are within noise (CG: 0.345 vs 0.346 ms) and `jit` is neutral.
+
 **1. End-to-end, GPU (GH200)** -- the figure, and the graph statistics and pass
 costs of the table. `cgstats.csv` / `jitstats.csv` are written automatically.
 
@@ -118,6 +128,25 @@ nothing at all (node count 442 -> 442, zero chains fused). Repeats are what tell
 a pass apart from the machine; `plot.py` reduces them to a median and draws the
 extremes as whiskers. Repeats are interleaved, not consecutive, so machine drift
 is spread across configurations instead of landing on one.
+
+**Host placement is pinned, and that is also not optional.** Every run goes
+through `taskset -c 0-7` with `OMP_NUM_THREADS=8`, `OMP_PLACES=cores` and
+`OMP_PROC_BIND=close` (`--threads`, `--cpuset`, `--places`, `--bind`; builds are
+never pinned). A GPU sweep does not need the whole host, and leaving it unbound
+was not merely noisy -- it made the reference configurations *bimodal*. LULESH at
+`s=16` gave `[0.691, 0.693, 1.210, 1.210, 1.222]` ms of `synchronous` over five
+repeats: two stable modes 1.75x apart, each process picking one at startup and
+holding it for its whole run. Repeats do not average that out, they vote on it,
+and a median of five lands on whichever mode won three -- which moved that
+problem's reported speedup between 2.27x and 3.98x. Six of the ten problems
+showed it. The speedup is a ratio whose denominator is a reference
+configuration, so this lands squarely on the headline number.
+
+Use `--threads N` to change both the thread count and the derived core set
+(`0-(N-1)`), `--cpuset` to place a sweep on specific cores (e.g. `8-15` to keep
+two sweeps off each other), and `--cpuset none` to reproduce the old unpinned
+behaviour. A CPU-backend sweep (`--target cpu|ompss`) wants `--threads` near the
+core count rather than the GPU default of 8.
 
 Each configuration is still built once. Because every app cleans its whole
 directory before building -- krylov's `clean` is `rm -f *.x`, which takes all

@@ -100,6 +100,13 @@ endif
 # it is auto-detected from nvidia-smi when available.
 ifeq ($(USE_TARGET),1)
   CFLAGS  += -fopenmp-targets=nvptx64-nvidia-cuda -fopenmp-offload-mandatory
+  # REQUIRED for a fair baseline -- do not comment out. Without device LTO the
+  # ahead-of-time kernel keeps its calls into the OpenMP DeviceRTL, whereas CGIR's
+  # `jit` pass links that runtime in, internalizes everything but the entry and
+  # re-optimizes, so it emits PTX with no runtime call at all. The pass then
+  # measures 1.27-1.41x on Krylov -- which is this flag, not the pass. With it on,
+  # JIT and ahead-of-time land within noise of each other (CG: 0.345 vs 0.346 ms),
+  # which is what the paper reports.
   CFLAGS += -foffload-lto
   DETECTED_SMS := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | sort -u | tr -d '.')
   ifneq ($(DETECTED_SMS),)

@@ -104,6 +104,27 @@ COLORS = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9",
 # between rejects that pair and keeps every other. 1500 sits in the middle.
 _COLOR_MIN_DIST = 1500
 
+# The paper's fixed series styles, keyed by canonical configuration name (see
+# canon_config). A key present here takes this exact (color, hatch) in every
+# figure, overriding the hash-derived assignment, so the paper figure reads the
+# same on every machine and run. Keys not listed still fall back to the hashed
+# slot. `batch` and `...,sequence,batch` canonicalize to the same key, so
+# `+packing` is covered regardless of spelling -- as in PAPER_LABELS. Hatches are
+# the closest grayscale-safe glyphs matplotlib offers: '..' small dots, 'OO'
+# circles, '//' hashes, '--' horizontal bars, '++' a square grid, '' plain.
+PAPER_STYLE = {
+    "no-taskgraph":                                                  {"color": "#E69F00", "hatch": ".."},
+    "taskgraph:none":                                                {"color": "#0072B2", "hatch": "OO"},
+    "taskgraph:reduce-node,transitive-reduction":                   {"color": "#D55E00", "hatch": "//"},
+    "taskgraph:reduce-node,transitive-reduction,jit":               {"color": "#CC79A7", "hatch": "--"},
+    # Keys are canonical (passes in PASS_ORDER: prog-fuse precedes jit), which is
+    # what assign_styles() keys on -- not the order the pass appears in the label.
+    "taskgraph:reduce-node,transitive-reduction,prog-fuse,jit":     {"color": "#F0E442", "hatch": "++"},
+    "taskgraph:reduce-node,transitive-reduction,prog-fuse,jit,batch": {"color": "#56B4E9", "hatch": ""},
+    "taskgraph:reduce-node,transitive-reduction,batch":             {"color": "#009E73", "hatch": "xx"},
+    "taskgraph:batch":                                              {"color": "#6A3D9A", "hatch": "\\\\"},
+}
+
 
 def _color_distance(a, b):
     """Squared RGB distance between two "#rrggbb" strings. Crude next to a real
@@ -247,8 +268,31 @@ def assign_styles(labels, salt=0, priority=()):
     styles, used_color, used_pair = {}, set(), set()
     prio = {canon_config(x) for x in priority}
     prio_colors = set()
-    keys = sorted({canon_config(x) for x in labels})
+    # Priority keys must be in the assignment, not merely ordered first: a sweep
+    # run entirely at one unroll has no un-suffixed label in `labels`, so the
+    # paper figure's unroll-stripped series (passed in `priority`) would never be
+    # styled and the lookup would KeyError. Union them in.
+    keys = sorted({canon_config(x) for x in labels} | prio)
+    # The paper's series are pinned first (color, hatch and all), so their fill
+    # is the one the paper specifies rather than whatever the hash lands on, and
+    # so their colors are reserved before the hashed keys probe for a free one.
+    # used_color/used_pair hold palette *indices*, so a pinned color that is in
+    # COLORS reserves its index; one that is not (an off-palette paper color) is
+    # still used as the fill but reserves no index -- the hashed keys cannot land
+    # on an index that does not exist anyway.
+    for key in keys:
+        if key in PAPER_STYLE:
+            st = dict(PAPER_STYLE[key])
+            styles[key] = st
+            ci = COLORS.index(st["color"]) if st["color"] in COLORS else None
+            hi = HATCHES.index(st["hatch"]) if st["hatch"] in HATCHES else None
+            if ci is not None:
+                used_color.add(ci)
+                if hi is not None:
+                    used_pair.add((ci, hi))
     for key in sorted(prio.intersection(keys)) + [k for k in keys if k not in prio]:
+        if key in styles:                   # already pinned by PAPER_STYLE
+            continue
         h = zlib.crc32(("%d\0%s" % (salt, key)).encode("utf-8"))
         base_c, base_h = h % nc, (h // nc) % nh
         slot = None
@@ -859,6 +903,21 @@ PAPER_LABELS = {
     # are the same step of the evaluation, so both carry the same label -- older
     # results stay readable without being re-run.
     "taskgraph:reduce-node,transitive-reduction,prog-fuse,jit,batch": "+packing",
+    # taskgraph + reduce + packing, with neither jit nor prog-fuse: the packing
+    # path on its own.
+    "taskgraph:reduce-node,transitive-reduction,batch":              "reduce+packing only",
+    # taskgraph + packing alone: no reduce, no jit, no prog-fuse.
+    "taskgraph:batch":                                               "packing only",
+}
+
+# Configurations that exist in the sweep but are not steps of the paper's
+# incremental pipeline and are therefore kept out of the paper figure's bars.
+# `reduce+jit+batch` (canon `...,jit,batch`) is an exploratory point without
+# prog-fuse; it is neither a pipeline step nor the `reduce+packing only`
+# comparison, so it would only add an unlabelled `+batch` bar. Keyed by canonical
+# pass set, so every spelling of the same pass set is excluded at once.
+PAPER_EXCLUDE = {
+    "taskgraph:reduce-node,transitive-reduction,jit,batch",
 }
 
 # Configurations drawn as point markers rather than bars: they are references,
@@ -1108,7 +1167,8 @@ def plot_paper_speedup(rows, figdir, dpi, fmt, show, styles, baseline,
         # Bars: the pipeline, in the order the sweep produced it (which is the
         # order passes are added), skipping the reference series.
         bars = [c for c in ordered_unique(r["config"] for r in grp)
-                if canon_pipeline(c) != canon_pipeline(baseline) and c not in MARKERS]
+                if canon_pipeline(c) != canon_pipeline(baseline) and c not in MARKERS
+                and canon_pipeline(c) not in PAPER_EXCLUDE]
         width = 0.8 / max(len(bars), 1)
         idx = list(range(len(xs)))
         whisker_top = 0.0
@@ -1196,7 +1256,8 @@ def plot_paper_speedup(rows, figdir, dpi, fmt, show, styles, baseline,
 
 
 def plot_paper_unroll(rows, figdir, dpi, fmt, show, styles, baseline,
-                      apps_order, tag=None, figsize=None, only_pipeline=None):
+                      apps_order, tag=None, figsize=None, only_pipeline=None,
+                      ylim=None):
     """Speedup against `baseline` as a function of the unroll, one panel per app.
 
     `only_pipeline` restricts the panel to one configuration. The point the
@@ -1322,6 +1383,12 @@ def plot_paper_unroll(rows, figdir, dpi, fmt, show, styles, baseline,
             handles.setdefault(paper_label(pipe), ln)
 
         ax.axhline(1.0, color="black", lw=0.8, ls="--", zorder=1)
+        # The figure exists to show where the curve crosses 1.0, so an explicit
+        # range beats autoscale: a reference marker an order of magnitude below
+        # the curves (LULESH's `synchronous` sits near 0.35) otherwise stretches
+        # the axis until the crossing itself is a few pixels tall.
+        if ylim:
+            ax.set_ylim(*ylim)
         ax.set_xscale("log", base=2)
         all_u = sorted({u for by_u in series.values() for u in by_u})
         ax.set_xticks(all_u)
@@ -1736,6 +1803,11 @@ def main():
                     help="draw only this configuration in the unroll figure (e.g. the "
                     "full pipeline). The figure is about the instance barrier, which "
                     "no pass removes, so one curve states it and several only overlap")
+    ap.add_argument("--unroll-ylim", default="", metavar="LO,HI",
+                    help="fix the y range of the unroll figure, e.g. '0.5,1.5'. "
+                    "The figure is about where the curve crosses 1.0, and a "
+                    "reference marker far below it (LULESH's synchronous sits near "
+                    "0.35) autoscales that crossing down to nothing")
     ap.add_argument("--unroll-tag", default=None, metavar="TAG",
                     help="runs.csv `tag` the unroll figure reads, to keep it to the "
                     "one sweep that varied the unroll (\"\" selects the untagged "
@@ -1887,10 +1959,20 @@ def main():
                            [a.strip() for a in args.apps.split(",") if a.strip()],
                            figsize, args.paper_unroll or None, args.main_tag)
     if args.paper_unroll_figure and not args.no_figures:
+        ylim = None
+        if args.unroll_ylim:
+            try:
+                lo, hi = (float(x) for x in args.unroll_ylim.split(","))
+            except ValueError:
+                ap.error("--unroll-ylim: expected LO,HI (e.g. 0.5,1.5)")
+            if not lo < hi:
+                ap.error("--unroll-ylim: LO must be below HI")
+            ylim = (lo, hi)
         plot_paper_unroll(rows, figdir, args.dpi, args.format, args.show, styles,
                           args.async_baseline,
                           [a.strip() for a in args.apps.split(",") if a.strip()],
-                          args.unroll_tag, None, args.unroll_pipeline or None)
+                          args.unroll_tag, None, args.unroll_pipeline or None,
+                          ylim)
     if cgstats_csv.exists():
         plot_graph_stats(rows, cgstats_csv, figdir, args.dpi, args.format, args.show)
     else:

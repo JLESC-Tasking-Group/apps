@@ -18,6 +18,7 @@
 # LLVM / XKOMP fork). A portable CPU build (USE_TASKGRAPH=0) also works on
 # vanilla clang. Override on the command line with `make CC=clang++`.
 CC = xkcxx -DUSE_XKOMP=1
+#CC=clang++ -DUSE_OMPSS=1
 #CC=clang++
 
 # ---- Backend / schedule toggles (override on the command line) ------------
@@ -27,7 +28,6 @@ USE_TASKGRAPHLOOP ?= 1  # 1: unroll -u iterations into ONE graph instance (taskg
                         # 0: one graph instance per iteration (the A/B baseline)
 USE_SYNC       ?= 0     # 0: asynchronous tasks     1: synchronous blocking
 USE_REPLAYABLE ?= 0     # mark task-generating constructs replayable(1)
-                        # (USE_OMPSS is declared above, next to the compiler it selects)
 
 # ---- Common flags ---------------------------------------------------------
 # -I.. makes the shared apps/openmp/tasking.h resolvable as #include "tasking.h"
@@ -64,7 +64,6 @@ CFLAGS += -DUSE_TASKGRAPH=$(USE_TASKGRAPH)
 CFLAGS += -DUSE_TASKGRAPHLOOP=$(USE_TASKGRAPHLOOP)
 CFLAGS += -DUSE_SYNC=$(USE_SYNC)
 CFLAGS += -DUSE_REPLAYABLE=$(USE_REPLAYABLE)
-CFLAGS += -DUSE_OMPSS=$(USE_OMPSS)
 
 LDFLAGS += -lm
 
@@ -90,13 +89,6 @@ endif
 # it is auto-detected from nvidia-smi when available.
 ifeq ($(USE_TARGET),1)
   CFLAGS  += -fopenmp-targets=nvptx64-nvidia-cuda -fopenmp-offload-mandatory
-  # REQUIRED for a fair baseline -- do not comment out. Without device LTO the
-  # ahead-of-time kernel keeps its calls into the OpenMP DeviceRTL, whereas CGIR's
-  # `jit` pass links that runtime in, internalizes everything but the entry and
-  # re-optimizes, so it emits PTX with no runtime call at all. The pass then
-  # measures 1.27-1.41x on Krylov -- which is this flag, not the pass. With it on,
-  # JIT and ahead-of-time land within noise of each other (CG: 0.345 vs 0.346 ms),
-  # which is what the paper reports.
   CFLAGS += -foffload-lto
   DETECTED_SMS := $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader,nounits 2>/dev/null | sort -u | tr -d '.')
   ifneq ($(DETECTED_SMS),)

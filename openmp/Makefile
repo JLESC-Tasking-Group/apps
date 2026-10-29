@@ -39,6 +39,9 @@ sw4lite:
 cloverleaf:
 	$(MAKE) -C cloverleaf all
 
+mnmg:
+	$(MAKE) -C MNMGDatalog all
+
 clean:
 	$(MAKE) -C krylov clean
 	$(MAKE) -C lulesh clean
@@ -47,5 +50,6 @@ clean:
 	$(MAKE) -C miniWeather clean
 	$(MAKE) -C sw4lite clean
 	$(MAKE) -C cloverleaf clean
+	$(MAKE) -C MNMGDatalog clean
 
 .PHONY: all $(APPS) clean

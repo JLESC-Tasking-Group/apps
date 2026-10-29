@@ -30,9 +30,11 @@ source = lulesh.cc \
         lulesh-init.cc \
         energy.cc
 
-obj = $(source:.cc=.o)
+# alloc.o is the shared pinned host allocator (../alloc.c), built here because
+# it lives one level up and is a .c file (the %.o: %.cc rule does not match it).
+obj = $(source:.cc=.o) alloc.o
 
-HDR = lulesh.h energy.h ../tasking.h
+HDR = lulesh.h energy.h ../tasking.h ../alloc.h
 
 # =============================================================================
 # Targets to build
@@ -44,6 +46,9 @@ $(program): $(obj)
 
 %.o: %.cc $(HDR)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+alloc.o: ../alloc.c ../alloc.h
+	$(CC) $(CFLAGS) -c ../alloc.c -o alloc.o
 
 clean:
 	rm -rf $(program) $(obj) mpc-omp-task-trace-* report*

@@ -22,7 +22,7 @@
  */
 #include "spmat.h"
 #include "tasking.h"
-#include "kalloc.h"
+#include "alloc.h"
 #include "kernels.h"
 #include "driver.h"
 
@@ -43,6 +43,7 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
                            const KrylovParams *prm, KrylovStats *st)
 {
     const int     max_iter  = prm->iters;
+    const int     unroll    = prm->unroll;   /* iterations per taskgraph instance (-u) */
     const int     T1        = prm->T1;
     const int     T2        = prm->T2;
     const int     print_dbg = prm->print_dbg;
@@ -54,37 +55,37 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
     const real_t *val     = A->val;
 
     Tiling tl;
-    tiling_init(&tl, n, T1, T2);
+    tiling_init(&tl, A, T1, T2);
 
     /* Device-mapped working vectors (pinned on GPU builds). */
-    real_t *r   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *c   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* shadow residual r0 */
-    real_t *p   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *q   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* A p                */
-    real_t *v   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* M q                */
-    real_t *s   = (real_t *) kr_alloc((size_t) n * sizeof(real_t));
-    real_t *d   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* A s                */
-    real_t *t   = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* M d                */
-    real_t *inv = (real_t *) kr_alloc((size_t) n * sizeof(real_t)); /* 1/diag(A)          */
+    real_t *r   = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *c   = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* shadow residual r0 */
+    real_t *p   = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *q   = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* A p                */
+    real_t *v   = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* M q                */
+    real_t *s   = (real_t *) host_alloc((size_t) n * sizeof(real_t));
+    real_t *d   = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* A s                */
+    real_t *t   = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* M d                */
+    real_t *inv = (real_t *) host_alloc((size_t) n * sizeof(real_t)); /* 1/diag(A)          */
 
     /* Device-mapped length-1 scalar buffers. */
-    real_t *rho      = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *next_rho = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *cv       = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *ts       = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *tt       = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *alpha    = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *omega    = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *beta     = (real_t *) kr_alloc(sizeof(real_t));
-    real_t *rr       = (real_t *) kr_alloc(sizeof(real_t)); /* <r,r> for the residual */
+    real_t *rho      = (real_t *) host_alloc(sizeof(real_t));
+    real_t *next_rho = (real_t *) host_alloc(sizeof(real_t));
+    real_t *cv       = (real_t *) host_alloc(sizeof(real_t));
+    real_t *ts       = (real_t *) host_alloc(sizeof(real_t));
+    real_t *tt       = (real_t *) host_alloc(sizeof(real_t));
+    real_t *alpha    = (real_t *) host_alloc(sizeof(real_t));
+    real_t *omega    = (real_t *) host_alloc(sizeof(real_t));
+    real_t *beta     = (real_t *) host_alloc(sizeof(real_t));
+    real_t *rr       = (real_t *) host_alloc(sizeof(real_t)); /* <r,r> for the residual */
 
     /* Per-block partial dot sums (device-resident; the dot decomposes into T1
      * partial reductions into these + a finalize, on both backends). */
-    real_t *part_cv = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_ts = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_tt = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_nr = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
-    real_t *part_rr = (real_t *) kr_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_cv = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_ts = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_tt = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_nr = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t));
+    real_t *part_rr = (real_t *) host_alloc((size_t) tl.NTB1 * sizeof(real_t));
 
     /* Host init: inv_diag = 1/diag(A), x = 0, r = b (true residual, x0 = 0). */
     spmat_extract_diagonal(A, inv);
@@ -111,60 +112,71 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
 
         double prev_ts = omp_get_wtime();
 
-        for (int it = 0; it < max_iter; it++) {
-            const double spawn0 = print_dbg ? omp_get_wtime() : 0.0;
-
-            TASKGRAPH_BEGIN
-            {
-                task_scalar_copy(next_rho, rho);                          /* rho = next_rho    */
-                task_spmv(row_ptr, col_idx, val, nnz, p, q, &tl);        /* q = A p           */
-                task_vmul_spmv(&tl, inv, q, v);                          /* v = M q           */
-                task_dot(&tl, c, v, part_cv, cv);                        /* <c,v>             */
-                task_scalar_div(rho, cv, alpha);                         /* alpha = rho/<c,v> */
-                task_copy(&tl, r, s);                                    /* s = r            */
-                task_axpy(&tl, alpha, (real_t) -1.0, v, s);              /* s -= alpha*v     */
-                task_axpy(&tl, alpha, (real_t) +1.0, p, x);              /* x += alpha*p     */
-                task_spmv(row_ptr, col_idx, val, nnz, s, d, &tl);       /* d = A s          */
-                task_vmul_spmv(&tl, inv, d, t);                         /* t = M d          */
-                task_dot(&tl, t, s, part_ts, ts);                       /* <t,s>            */
-                task_dot(&tl, t, t, part_tt, tt);                       /* <t,t>            */
-                task_scalar_div(ts, tt, omega);                         /* omega = <t,s>/<t,t> */
-                task_axpy(&tl, omega, (real_t) +1.0, s, x);             /* x += omega*s     */
-                task_copy(&tl, s, r);                                   /* r = s            */
-                task_axpy(&tl, omega, (real_t) -1.0, t, r);             /* r -= omega*t     */
-                task_dot(&tl, c, r, part_nr, next_rho);                 /* next_rho = <c,r> */
-                task_dot(&tl, r, r, part_rr, rr);                       /* <r,r> (residual) */
-                /* beta = (next_rho/rho) * (alpha/omega) -- a compound scalar task. */
-                OMP_TARGET_TASK(DEFAULT_NONE
-                                DEPEND(in, next_rho[0], rho[0], alpha[0], omega[0]) DEPEND(out, beta[0])
-                                MAP(present: next_rho[0:1], rho[0:1], alpha[0:1], omega[0:1], beta[0:1])
-                                SHARED(next_rho, rho, alpha, omega, beta))
-                {
-                    beta[0] = (next_rho[0] / rho[0]) * (alpha[0] / omega[0]);
-                }
-                task_axpy(&tl, omega, (real_t) -1.0, v, p);             /* p -= omega*v     */
-                task_xpby(&tl, r, beta, p);                             /* p = r + beta*p   */
-            }
-            TASKGRAPH_END
-
-            /* Per-iteration timing (always) + optional residual print (-p).
-             * Depend-synchronized host task (no taskwait), anchored on rr =
-             * <r,r> = ||b - A x||_2^2. */
-            const double spawn_ms = print_dbg ? (omp_get_wtime() - spawn0) * 1000.0 : 0.0;
+        /* Identical task pattern on identical buffers every iteration, so the
+         * instance is recorded once and replayed. `unroll` (-u) iterations per
+         * instance, so consecutive iterations overlap inside the graph instead of
+         * being separated by its implicit taskgroup. */
+        TASKGRAPH_LOOP(unroll,
+                       [&] (size_t done) { return done < (size_t) max_iter; },
+                       [&] (size_t inst, size_t done)
+        {
+            (void) done;
+            /* Per-instance timing (always) + optional residual print (-p).
+             * Anchored on rr = <r,r> = ||b - A x||_2^2; divided by `unroll` to
+             * stay per-iteration.             *
+             * EPILOGUE_TASK measures inline where the instance is provably
+             * drained (any taskgraph build: replay is synchronous), which is
+             * exact; elsewhere it emits the host task, which must not block or
+             * the no-taskgraph configuration loses its cross-instance
+             * pipelining. EPILOGUE_NOWAIT likewise drops `nowait` from the -p
+             * read-back when inline, so the residual cannot be read while its
+             * D2H is still in flight. */
             if (print_dbg) {
-                OMP_TARGET_UPDATE(from(rr[0:1]) NOWAIT DEPEND(inout, rr[0]))
+                OMP_TARGET_UPDATE(from(rr[0:1]) EPILOGUE_NOWAIT DEPEND(inout, rr[0]))
             }
-            OMP_HOST_TASK(DEFAULT_NONE firstprivate(it, spawn_ms, rr, print_dbg, st)
+            EPILOGUE_TASK(DEFAULT_NONE firstprivate(inst, unroll, rr, print_dbg, st)
                           shared(prev_ts) DEPEND(in, rr[0]))
             {
                 const double now = omp_get_wtime();
-                st->iter_ms[it] = (now - prev_ts) * 1000.0;
+                st->iter_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
                 prev_ts = now;
                 if (print_dbg)
-                    printf("  iter %4d   residual = %.6e   spawn = %8.3f ms   exec = %8.3f ms\n",
-                           it, sqrt(fabs((double) rr[0])), spawn_ms, st->iter_ms[it]);
+                    printf("  instance %4zu   residual = %.6e   exec = %8.3f ms/iter\n",
+                           inst, sqrt(fabs((double) rr[0])), st->iter_ms[inst]);
             }
+        })
+        {
+            task_scalar_copy(next_rho, rho);                          /* rho = next_rho    */
+            task_spmv(row_ptr, col_idx, val, nnz, p, q, &tl);        /* q = A p           */
+            task_vmul_spmv(&tl, inv, q, v);                          /* v = M q           */
+            task_dot(&tl, c, v, part_cv, cv);                        /* <c,v>             */
+            task_scalar_div(rho, cv, alpha);                         /* alpha = rho/<c,v> */
+            task_copy(&tl, r, s);                                    /* s = r            */
+            task_axpy(&tl, alpha, (real_t) -1.0, v, s);              /* s -= alpha*v     */
+            task_axpy(&tl, alpha, (real_t) +1.0, p, x);              /* x += alpha*p     */
+            task_spmv(row_ptr, col_idx, val, nnz, s, d, &tl);       /* d = A s          */
+            task_vmul_spmv(&tl, inv, d, t);                         /* t = M d          */
+            task_dot(&tl, t, s, part_ts, ts);                       /* <t,s>            */
+            task_dot(&tl, t, t, part_tt, tt);                       /* <t,t>            */
+            task_scalar_div(ts, tt, omega);                         /* omega = <t,s>/<t,t> */
+            task_axpy(&tl, omega, (real_t) +1.0, s, x);             /* x += omega*s     */
+            task_copy(&tl, s, r);                                   /* r = s            */
+            task_axpy(&tl, omega, (real_t) -1.0, t, r);             /* r -= omega*t     */
+            task_dot(&tl, c, r, part_nr, next_rho);                 /* next_rho = <c,r> */
+            task_dot(&tl, r, r, part_rr, rr);                       /* <r,r> (residual) */
+            /* beta = (next_rho/rho) * (alpha/omega) -- a compound scalar task. */
+            OMP_TARGET_TASK(DEFAULT_NONE
+                            DEPEND(in, next_rho[0], rho[0], alpha[0], omega[0]) DEPEND(out, beta[0])
+                            MAP(present: next_rho[0:1], rho[0:1], alpha[0:1], omega[0:1], beta[0:1])
+                            SHARED(next_rho, rho, alpha, omega, beta))
+            {
+                beta[0] = (next_rho[0] / rho[0]) * (alpha[0] / omega[0]);
+            }
+            task_axpy(&tl, omega, (real_t) -1.0, v, p);             /* p -= omega*v     */
+            task_xpby(&tl, r, beta, p);                             /* p = r + beta*p   */
         }
+        TASKGRAPH_LOOP_END
+
         #pragma omp taskwait
     }
 
@@ -178,11 +190,12 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
                                       part_cv[0:tl.NTB1], part_ts[0:tl.NTB1], part_tt[0:tl.NTB1],
                                       part_nr[0:tl.NTB1], part_rr[0:tl.NTB1]))
 
-    kr_free(r); kr_free(c); kr_free(p); kr_free(q); kr_free(v);
-    kr_free(s); kr_free(d); kr_free(t); kr_free(inv);
-    kr_free(rho); kr_free(next_rho); kr_free(cv); kr_free(ts); kr_free(tt);
-    kr_free(alpha); kr_free(omega); kr_free(beta); kr_free(rr);
-    kr_free(part_cv); kr_free(part_ts); kr_free(part_tt); kr_free(part_nr); kr_free(part_rr);
+    host_free(r); host_free(c); host_free(p); host_free(q); host_free(v);
+    host_free(s); host_free(d); host_free(t); host_free(inv);
+    host_free(rho); host_free(next_rho); host_free(cv); host_free(ts); host_free(tt);
+    host_free(alpha); host_free(omega); host_free(beta); host_free(rr);
+    host_free(part_cv); host_free(part_ts); host_free(part_tt); host_free(part_nr); host_free(part_rr);
+    tiling_fini(&tl);
     st->total_s = t1 - t0;
 }
 

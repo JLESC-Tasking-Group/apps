@@ -49,7 +49,7 @@ extern "C" {
  * (a convenient built-in correctness check for the solvers).
  *
  *   A       : output matrix; CSR arrays are device-mapped so they are allocated
- *             with kr_alloc (pinned on GPU builds) -- free them with spmat_free
+ *             with host_alloc (pinned on GPU builds) -- free them with spmat_free
  *   stencil : SPMAT_STENCIL_7PT or SPMAT_STENCIL_27PT
  *   b       : if non-NULL, *b is malloc'd [n] and filled with the RHS (host-only;
  *             free with free())
@@ -85,7 +85,7 @@ void spmat_generate_convdiff(SpMatrix *A, idx_t nx, idx_t ny, idx_t nz,
  * As with the generators, b and xexact are optional host-only outputs: b is set
  * to the row sums (= A*1) so the all-ones vector is the exact solution, keeping
  * the solvers' built-in residual/error checks meaningful. The CSR arrays are
- * device-mapped (kr_alloc) -- free A with spmat_free, b/xexact with free().
+ * device-mapped (host_alloc) -- free A with spmat_free, b/xexact with free().
  *
  * Fatal (exit) on any error: unreadable file, non-square, truncated, or an
  * unsupported header (complex, hermitian, array/dense).

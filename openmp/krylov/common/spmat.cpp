@@ -2,7 +2,7 @@
  * spmat.cpp - implementation of the sparse-matrix library (see spmat.h).
  */
 #include "spmat.h"
-#include "kalloc.h"
+#include "alloc.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -11,7 +11,7 @@
 /* Fatal allocation helper for device-mapped arrays (pinned on GPU builds). */
 static void *xalloc_dev(size_t bytes)
 {
-    void *p = kr_alloc(bytes);
+    void *p = host_alloc(bytes);
     if (!p) {
         fprintf(stderr, "spmat: out of memory (%zu bytes)\n", bytes);
         exit(EXIT_FAILURE);
@@ -38,7 +38,7 @@ void spmat_generate_stencil(SpMatrix *A, idx_t nx, idx_t ny, idx_t nz,
     const real_t diag_val = (real_t) stencil;      /* 7 or 27 on the diagonal */
     const idx_t  max_nnz  = (idx_t) stencil * n;   /* upper bound (interior rows) */
 
-    /* CSR arrays are mapped onto the device -> allocate them pinned (kr_alloc). */
+    /* CSR arrays are mapped onto the device -> allocate them pinned (host_alloc). */
     A->n       = n;
     A->row_ptr = (idx_t  *) xalloc_dev((size_t)(n + 1) * sizeof(idx_t));
     A->col_idx = (idx_t  *) xalloc_dev((size_t) max_nnz * sizeof(idx_t));
@@ -341,9 +341,9 @@ void spmat_shift_diagonal(SpMatrix *A, real_t sigma)
 
 void spmat_free(SpMatrix *A)
 {
-    kr_free(A->row_ptr);
-    kr_free(A->col_idx);
-    kr_free(A->val);
+    host_free(A->row_ptr);
+    host_free(A->col_idx);
+    host_free(A->val);
     A->row_ptr = NULL;
     A->col_idx = NULL;
     A->val     = NULL;

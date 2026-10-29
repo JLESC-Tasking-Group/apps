@@ -771,20 +771,11 @@ void CalcElemVelocityGradient(
 
 /******************************************/
 
-# if ALLOC_OMP
-omp_allocator_handle_t allocator;
-# endif
-
 int main(int argc, char *argv[])
 {
-  # if ALLOC_OMP
-  omp_alloctrait_t traits[2] = {omp_atk_pinned, omp_atk_pin_device};
-  allocator = omp_init_allocator(omp_default_mem_space, 2, traits);
-  if (allocator == omp_null_allocator) {
-      fprintf(stderr, "Failed to initialize allocator\n");
-      return 1;
-  }
-  # endif
+  /* The pinned host allocator is now the shared ../alloc.c (host_alloc/
+   * host_free), which creates its OpenMP allocator lazily on first use -- no
+   * per-app omp_init_allocator/omp_destroy_allocator handling here. */
 
   power_init();
 
@@ -808,8 +799,22 @@ int main(int argc, char *argv[])
   opts.cost = 1;
   opts.iteration_cap = 0;
   opts.nb  = 32;
+  opts.unroll = 1;
 
   ParseCommandLineOptions(argc, argv, myRank, &opts);
+
+  /* The unrolled cycles form one taskgraph instance, so the cycle count must be
+   * a whole number of instances (there is no epilogue: a shorter last instance
+   * would be a different graph and would not replay). */
+  if (opts.its % opts.unroll != 0) {
+    const Int_t its = (opts.its / opts.unroll) * opts.unroll;
+    if (its == 0) {
+      printf("-u %d exceeds -i %d: nothing to run\n", opts.unroll, opts.its);
+      exit(-1);
+    }
+    printf("-i %d is not a multiple of -u %d: running %d cycles\n", opts.its, opts.unroll, its);
+    opts.its = its;
+  }
 
   if ((myRank == 0) && (opts.quiet == 0)) {
     printf("Running problem size %d^3 per domain until completion\n", opts.nx);
@@ -1293,10 +1298,17 @@ OMP_TARGET_ENTER_DATA( \
 
   double t0, t1, tf;
 
-  /* Per-iteration wall-clock times (ms). Recorded by a depend-synchronized host
-   * task at the end of each iteration: iteration 0 is the taskgraph record, 1
-   * the first replay, 2.. the steady state -- like the krylov / cholesky apps. */
-  double *iter_times = (double *) malloc(sizeof(double) * (opts.its > 0 ? opts.its : 1));
+  /* One taskgraph instance covers `unroll` cycles (see -u), so the loop steps by
+   * that much and there are `ninst` instances. */
+  const Int_t unroll = opts.unroll;
+  const Int_t ninst  = (opts.its > 0) ? (opts.its / unroll) : 0;
+
+  /* Per-cycle wall-clock times (ms), one entry per taskgraph instance and
+   * divided by `unroll` so the unit is always one cycle. Recorded by a
+   * depend-synchronized host task at the end of each instance: instance 0 is the
+   * taskgraph record, 1 the first replay, 2.. the steady state -- like the
+   * krylov / cholesky apps. */
+  double *iter_times = (double *) malloc(sizeof(double) * (ninst > 0 ? ninst : 1));
   double prev_ts = 0.0;
 
   Int_t numThreads = 0;
@@ -1309,10 +1321,38 @@ OMP_TARGET_ENTER_DATA( \
 
     t0 = omp_get_wtime();
     prev_ts = t0;
-  for (Int_t iter = 0; iter < opts.its; ++iter) {
-
-      TASKGRAPH_BEGIN
-      {
+  /* `unroll` cycles per taskgraph instance (-u). The body is unrollable as-is:
+   * it does not depend on the cycle index and has no host-side control flow --
+   * the per-cycle state (time, cycle, deltatime) lives in 1-element buffers
+   * chained through `depend` and incremented on the device, so consecutive
+   * unrolled cycles order themselves. */
+  TASKGRAPH_LOOP(unroll,
+                 [&] (size_t done) { return done < (size_t) opts.its; },
+                 [&] (size_t inst, size_t done)
+  {
+    (void) done;
+    /* Per-instance timing + progress print, OUTSIDE the recorded region. Reads
+     * the host copies of cycle/time/deltatime kept current by the earlier
+     * `target update from`, and divides by `unroll` so the reported unit stays
+     * one cycle at any -u.
+     *
+     * EPILOGUE_TASK measures inline where the instance is provably drained (any
+     * taskgraph build: replay is synchronous), which is exact; elsewhere it
+     * emits a depend-synchronized task that fires after the instance's last work
+     * (TimeIncrement update + end-of-step reductions) and before the next
+     * instance's TimeIncrement, without serializing the configurations that have
+     * no taskgraph barrier. */
+    EPILOGUE_TASK(firstprivate(inst, unroll, iter_times) shared(prev_ts)
+                  DEPEND(in, cycle[0], time[0], deltatime[0], dtcourant[0], dthydro[0]))
+    {
+        const double now = omp_get_wtime();
+        iter_times[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
+        prev_ts = now;
+        printf("cycle = %d, time = %e, dt=%e, exec = %.3f ms\n",
+               cycle[0], double(time[0]), double(deltatime[0]), iter_times[inst]);
+    }
+  })
+  {
 
     //==============================================================================
     // TimeIncrement(*locDom) ;
@@ -2728,27 +2768,9 @@ OMP_TARGET_ENTER_DATA( \
     }
     opts.iteration_cap -= 1;
     # endif
-
-    }
-    TASKGRAPH_END
-
-    /* Per-iteration timing + progress print. Created OUTSIDE the taskgraph (so
-     * it is not recorded/replayed) and depend-synchronized on this iteration's
-     * per-step scalars, so it fires after the iteration's last work (TimeIncrement
-     * update + end-of-step reductions) and before the next iteration's
-     * TimeIncrement -- recording the steady-state per-iteration wall time. It
-     * reads the host copies of cycle/time/deltatime kept current by the earlier
-     * `target update from`. */
-    OMP_HOST_TASK(firstprivate(iter, iter_times) shared(prev_ts)
-                  DEPEND(in, cycle[0], time[0], deltatime[0], dtcourant[0], dthydro[0]))
-    {
-        const double now = omp_get_wtime();
-        iter_times[iter] = (now - prev_ts) * 1000.0;
-        prev_ts = now;
-        printf("cycle = %d, time = %e, dt=%e, exec = %.3f ms\n",
-               cycle[0], double(time[0]), double(deltatime[0]), iter_times[iter]);
-    }
   }
+  TASKGRAPH_LOOP_END
+
   t1 = omp_get_wtime();
   # pragma omp taskwait
   tf = omp_get_wtime();
@@ -2795,30 +2817,39 @@ OMP_TARGET_ENTER_DATA( \
   printf("FOM/watt             = %10.8g (z/s/J)\n", fom_per_watt);
   printf("TDG creation time    = %10.8g (s)\n", t1 - t0);
 
-  /* Per-iteration timing summary (record / 1st replay / steady mean+stddev),
-   * parseable by scripts/evaluate.py -- same breakdown as the krylov app. */
-  if (opts.its > 0) {
-    const int lo  = (opts.its > 2) ? 2 : (opts.its > 1 ? 1 : 0);  /* first steady iter */
-    const int cnt = opts.its - lo;
+  /* Timing summary (record / 1st replay / steady mean+stddev), parseable by
+   * scripts/evaluate.py -- same breakdown, and the same labels, as the krylov
+   * and mnmg apps. Entries are per taskgraph INSTANCE, i.e. instance k covers
+   * cycles [k*unroll, (k+1)*unroll), and every figure is in ms per CYCLE (the
+   * epilogue divides by `unroll`) so they stay comparable across -u. The three
+   * phases are the runtime's own: xkomp records the graph on instance 0, builds
+   * and optimizes the command graph on instance 1 and then replays, so instance
+   * 1 carries the whole build cost and instances 2.. are the steady state. */
+  if (ninst > 0) {
+    const int graphed = (USE_TASKGRAPH && !USE_SYNC);
+    const int lo  = (ninst > 2) ? 2 : (ninst > 1 ? 1 : 0);  /* first steady instance */
+    const int cnt = ninst - lo;
     double mean = 0.0;
-    for (int r = lo; r < opts.its; r++) mean += iter_times[r];
+    for (int r = lo; r < ninst; r++) mean += iter_times[r];
     if (cnt > 0) mean /= cnt;
     double var = 0.0;
-    for (int r = lo; r < opts.its; r++) { double d = iter_times[r] - mean; var += d * d; }
+    for (int r = lo; r < ninst; r++) { double d = iter_times[r] - mean; var += d * d; }
     const double sd = (cnt > 1) ? sqrt(var / (cnt - 1)) : 0.0;
-    printf("iteration 0          : %10.3f ms  (record)\n", iter_times[0]);
-    printf("iteration 1          : %10.3f ms  (1st replay)\n",
-           (opts.its > 1) ? iter_times[1] : iter_times[0]);
-    printf("iterations 2.. (avg)    : %10.3f ms\n", mean);
-    printf("iterations 2.. (stddev) : %10.3f ms\n", sd);
+    if (unroll > 1)
+      printf("taskgraph unroll     : %10d cycles/instance (%d instances)\n", unroll, ninst);
+    printf("instance 0%-11s: %10.3f ms\n", graphed ? " (record)" : "", iter_times[0]);
+    if (ninst > 1)
+      printf("instance 1%-11s: %10.3f ms\n",
+             graphed ? " (1st replay)" : "", iter_times[1]);
+    /* Report the window actually averaged: it starts below 2 only when there are
+     * too few instances for the record / first replay to be dropped. */
+    printf("instances %d..%d (avg)    : %10.3f ms   (%d instances)\n",
+           lo, ninst - 1, mean, cnt);
+    printf("instances %d..%d (stddev) : %10.3f ms\n", lo, ninst - 1, sd);
   }
   free(iter_times);
 
   power_deinit();
-
-  # if ALLOC_OMP
-  omp_destroy_allocator(allocator);
-  # endif
 
   return 0 ;
 }

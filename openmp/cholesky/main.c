@@ -30,7 +30,7 @@
 #include <omp.h>
 
 #include "tasking.h"
-#include "kalloc.h"
+#include "alloc.h"
 #include "kernels.h"
 
 /* ---- Problem defaults (override with -D on the compiler, see Makefile) ---- */
@@ -178,7 +178,7 @@ int main(int argc, char **argv)
     const size_t total  = ntiles * ts * ts;
 
     /* Device-mapped matrix (pinned on GPU builds) + pristine host copy. */
-    double *A     = (double *) ch_alloc(total * sizeof(double));
+    double *A     = (double *) host_alloc(total * sizeof(double));
     double *A_org = (double *) malloc(total * sizeof(double));
     /* One dependency "token" per tile; the DAG is expressed on these on both
      * backends (the tiles themselves are device-resident in the GPU build). */
@@ -305,7 +305,7 @@ int main(int argc, char **argv)
         free(ref);
     }
 
-    ch_free(A);
+    host_free(A);
     free(A_org);
     free(deps);
     free(rep_ms);

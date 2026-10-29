@@ -1,3 +1,4 @@
 *.x
 *.o
 *_tc.bin
+tc_capacity.cache

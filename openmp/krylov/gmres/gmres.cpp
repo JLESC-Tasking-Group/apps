@@ -95,6 +95,7 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                         const KrylovParams *prm, KrylovStats *st)
 {
     const int     nrestart  = prm->iters;
+    const int     unroll    = prm->unroll;   /* forced to 1 for a restarted solver */
     const int     m         = prm->m;
     const int     T1        = prm->T1;
     const int     T2        = prm->T2;
@@ -148,57 +149,20 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
     #pragma omp parallel
     #pragma omp single
     {
-        for (int r = 0; r < nrestart; r++) {
-            const double spawn0 = print_dbg ? omp_get_wtime() : 0.0;
-
-            /* --- Arnoldi restart cycle (recorded once, replayed) --- */
-            TASKGRAPH_BEGIN
-            {
-                /* Setup: r0 = M(b - A x); beta = ||r0||; V[0] = r0/beta. */
-                task_spmv(row_ptr, col_idx, val, nnz, x, w, &tl);          /* w = A x        */
-                task_copy(&tl, bd, res);                                   /* res = b        */
-                task_axpy_spmv(&tl, one, (real_t) -1.0, w, res);           /* res -= A x     */
-                task_vmul(&tl, inv, res, q);                              /* q = M res      */
-                task_dot(&tl, q, q, part, beta);                         /* beta = <q,q>   */
-                OMP_TARGET_TASK(DEFAULT_NONE MAP(present: beta[0:1], ibeta[0:1]) SHARED(beta, ibeta))
-                {
-                    beta[0]  = sqrt(beta[0]);
-                    ibeta[0] = (real_t) 1.0 / beta[0];
-                }
-                task_scal_copy(&tl, ibeta, q, Vd /* V[0] */);             /* V[0] = q/beta  */
-
-                /* Arnoldi + modified Gram-Schmidt. */
-                for (int j = 0; j < m; j++) {
-                    real_t *Vj = Vd + (size_t) j * n;
-                    task_spmv(row_ptr, col_idx, val, nnz, Vj, w, &tl);       /* w = A V[j] */
-                    task_vmul_spmv(&tl, inv, w, q);                          /* q = M w    */
-                    for (int i = 0; i <= j; i++) {
-                        real_t *Vi = Vd + (size_t) i * n;
-                        task_dot(&tl, Vi, q, part, H + (i + j * ld));         /* H[i,j] = <V[i],q> */
-                        task_axpy(&tl, H + (i + j * ld), (real_t) -1.0, Vi, q); /* q -= H[i,j] V[i] */
-                    }
-                    task_dot(&tl, q, q, part, hh);                          /* hh = <q,q> */
-                    OMP_TARGET_TASK(DEFAULT_NONE firstprivate(j, ld)
-                                    DEPEND(in, hh[0]) DEPEND(out, ih[0], H[(j + 1) + j * ld])
-                                    MAP(present: hh[0:1], ih[0:1], H[0:ld * m])
-                                    SHARED(hh, ih, H))
-                    {
-                        const real_t hn = sqrt(hh[0]);
-                        H[(j + 1) + j * ld] = hn;
-                        ih[0] = (hn != (real_t) 0.0) ? (real_t) 1.0 / hn : (real_t) 0.0;
-                    }
-                    if (j < m - 1) {
-                        real_t *Vjp1 = Vd + (size_t)(j + 1) * n;
-                        task_scal_copy(&tl, ih, q, Vjp1);                   /* V[j+1] = q/||q|| */
-                    }
-                }
-            }
-            TASKGRAPH_END
-
-            /* Host time to record/replay the restart's task graph. */
-            const double spawn_ms = print_dbg ? (omp_get_wtime() - spawn0) * 1000.0 : 0.0;
-
-            #pragma omp taskwait
+        /* --- Arnoldi restart cycle (recorded once, replayed) ---
+         *
+         * `unroll` is always 1 here (the driver forces it for a restarted
+         * solver): each restart ends with a host least-squares solve whose result
+         * is pushed back to the device and consumed by the next restart, so two
+         * restarts cannot be folded into one recorded instance. That host work is
+         * the loop epilogue below -- outside the recorded region, exactly where
+         * this construct expects host-side, data-dependent computation to live. */
+        TASKGRAPH_LOOP(unroll,
+                       [&] (size_t done) { return done < (size_t) nrestart; },
+                       [&] (size_t inst, size_t done)
+        {
+            (void) done;
+            TASKWAIT
             OMP_TARGET_UPDATE(from(H[0:ld * m]) from(beta[0:1]))
 
             /* Host least-squares min ||beta e1 - H y||, then push y to device. */
@@ -209,17 +173,58 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
             /* x += sum_i y[i] V[i]. */
             for (int i = 0; i < m; i++)
                 task_axpy(&tl, y + i, (real_t) +1.0, Vd + (size_t) i * n, x);
-            #pragma omp taskwait
+            TASKWAIT
 
             /* Per-restart timing (always; GMRES already taskwaits per restart, so
              * this is a plain host measurement) + optional residual print (-p). */
             const double now = omp_get_wtime();
-            st->iter_ms[r] = (now - prev_ts) * 1000.0;
+            st->iter_ms[inst] = (now - prev_ts) * 1000.0;
             if (print_dbg)
-                printf("  restart %4d   residual = %.6e   spawn = %8.3f ms   exec = %8.3f ms\n",
-                       r, resid, spawn_ms, st->iter_ms[r]);
+                printf("  restart %4zu   residual = %.6e   exec = %8.3f ms\n",
+                       inst, resid, st->iter_ms[inst]);
             prev_ts = now;
+        })
+        {
+            /* Setup: r0 = M(b - A x); beta = ||r0||; V[0] = r0/beta. */
+            task_spmv(row_ptr, col_idx, val, nnz, x, w, &tl);          /* w = A x        */
+            task_copy(&tl, bd, res);                                   /* res = b        */
+            task_axpy_spmv(&tl, one, (real_t) -1.0, w, res);           /* res -= A x     */
+            task_vmul(&tl, inv, res, q);                              /* q = M res      */
+            task_dot(&tl, q, q, part, beta);                         /* beta = <q,q>   */
+            OMP_TARGET_TASK(DEFAULT_NONE MAP(present: beta[0:1], ibeta[0:1]) SHARED(beta, ibeta))
+            {
+                beta[0]  = sqrt(beta[0]);
+                ibeta[0] = (real_t) 1.0 / beta[0];
+            }
+            task_scal_copy(&tl, ibeta, q, Vd /* V[0] */);             /* V[0] = q/beta  */
+
+            /* Arnoldi + modified Gram-Schmidt. */
+            for (int j = 0; j < m; j++) {
+                real_t *Vj = Vd + (size_t) j * n;
+                task_spmv(row_ptr, col_idx, val, nnz, Vj, w, &tl);       /* w = A V[j] */
+                task_vmul_spmv(&tl, inv, w, q);                          /* q = M w    */
+                for (int i = 0; i <= j; i++) {
+                    real_t *Vi = Vd + (size_t) i * n;
+                    task_dot(&tl, Vi, q, part, H + (i + j * ld));         /* H[i,j] = <V[i],q> */
+                    task_axpy(&tl, H + (i + j * ld), (real_t) -1.0, Vi, q); /* q -= H[i,j] V[i] */
+                }
+                task_dot(&tl, q, q, part, hh);                          /* hh = <q,q> */
+                OMP_TARGET_TASK(DEFAULT_NONE firstprivate(j, ld)
+                                DEPEND(in, hh[0]) DEPEND(out, ih[0], H[(j + 1) + j * ld])
+                                MAP(present: hh[0:1], ih[0:1], H[0:ld * m])
+                                SHARED(hh, ih, H))
+                {
+                    const real_t hn = sqrt(hh[0]);
+                    H[(j + 1) + j * ld] = hn;
+                    ih[0] = (hn != (real_t) 0.0) ? (real_t) 1.0 / hn : (real_t) 0.0;
+                }
+                if (j < m - 1) {
+                    real_t *Vjp1 = Vd + (size_t)(j + 1) * n;
+                    task_scal_copy(&tl, ih, q, Vjp1);                   /* V[j+1] = q/||q|| */
+                }
+            }
         }
+        TASKGRAPH_LOOP_END
     }
 
     const double t1 = omp_get_wtime();

@@ -37,7 +37,7 @@ void krylov_stats_free(KrylovStats *s)
     s->iter_ms = NULL;
 }
 
-void krylov_stats_report(const KrylovStats *s, const char *unit, int taskgraph, double flops)
+void krylov_stats_report(const KrylovStats *s, int taskgraph, double flops)
 {
     char lbl[64];
 
@@ -49,18 +49,21 @@ void krylov_stats_report(const KrylovStats *s, const char *unit, int taskgraph, 
             printf("  %-27s : %10.3f GFLOP/s\n", "performance", flops / s->total_s / 1e9);
     }
 
+    /* Times are per taskgraph INSTANCE -- a group of `unroll` iterations -- and
+     * always in ms per iteration (the solver divides by `unroll`), so they stay
+     * comparable across -u. The three phases are the runtime's own: xkomp
+     * records the graph on instance 0, builds and optimizes the command graph on
+     * instance 1 and then replays, so instance 1 carries the whole build cost
+     * and instances 2.. are the steady state. */
     if (s->niter >= 1) {
-        snprintf(lbl, sizeof lbl, "%s 0%s", unit, taskgraph ? " (record)" : "");
+        snprintf(lbl, sizeof lbl, "instance 0%s", taskgraph ? " (record)" : "");
         printf("  %-27s : %10.3f ms\n", lbl, s->iter_ms[0]);
     }
     if (s->niter >= 2) {
-        snprintf(lbl, sizeof lbl, "%s 1%s", unit, taskgraph ? " (1st replay)" : "");
+        snprintf(lbl, sizeof lbl, "instance 1%s", taskgraph ? " (1st replay)" : "");
         printf("  %-27s : %10.3f ms\n", lbl, s->iter_ms[1]);
     }
     if (s->niter >= 3) {
-        /* Steady-state iterations 2..niter-1 (iteration 0 = record and iteration
-         * 1 = first replay are excluded as outliers). Report mean and the
-         * (sample) standard deviation of the per-iteration time. */
         const int cnt = s->niter - 2;
         double sum = 0.0;
         for (int i = 2; i < s->niter; i++) sum += s->iter_ms[i];
@@ -73,9 +76,9 @@ void krylov_stats_report(const KrylovStats *s, const char *unit, int taskgraph, 
         }
         const double stddev = (cnt > 1) ? sqrt(var / (cnt - 1)) : 0.0;
 
-        snprintf(lbl, sizeof lbl, "%ss 2..%d (avg)", unit, s->niter - 1);
-        printf("  %-27s : %10.3f ms   (%d %ss)\n", lbl, mean, cnt, unit);
-        snprintf(lbl, sizeof lbl, "%ss 2..%d (stddev)", unit, s->niter - 1);
+        snprintf(lbl, sizeof lbl, "instances 2..%d (avg)", s->niter - 1);
+        printf("  %-27s : %10.3f ms   (%d instances)\n", lbl, mean, cnt);
+        snprintf(lbl, sizeof lbl, "instances 2..%d (stddev)", s->niter - 1);
         printf("  %-27s : %10.3f ms\n", lbl, stddev);
     }
 }
@@ -125,6 +128,15 @@ static void usage(const char *prog, const KrylovDescriptor *d)
     fprintf(stderr,
             "  -p         print the residual at each %s\n",
             d->restarted ? "restart" : "iteration");
+    fprintf(stderr,
+            "  -u UNROLL  %ss per taskgraph instance          (default 1)\n"
+            "             The taskgraph construct carries an implicit taskgroup, so\n"
+            "             consecutive instances cannot overlap; unrolling UNROLL %ss\n"
+            "             into one instance recovers that overlap inside the graph and\n"
+            "             amortizes the barrier. Must divide -i. Inert without the\n"
+            "             taskgraph (USE_TASKGRAPH=0).\n",
+            d->restarted ? "restart" : "iteration",
+            d->restarted ? "restart" : "iteration");
 }
 
 int main(int argc, char **argv)
@@ -141,6 +153,7 @@ int main(int argc, char **argv)
     prm.conv      = 1.0;
     prm.sigma     = 0.0;
     prm.print_dbg = 0;
+    prm.unroll    = 1;
     prm.mtx       = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -153,6 +166,7 @@ int main(int argc, char **argv)
         else if ((d->opt_mask & OPT_STENCIL) && !strcmp(argv[i], "-S") && i + 1 < argc) prm.stencil = atoi(argv[++i]);
         else if ((d->opt_mask & OPT_SHIFT)   && !strcmp(argv[i], "-g") && i + 1 < argc) prm.sigma   = atof(argv[++i]);
         else if ((d->opt_mask & OPT_CONV)    && !strcmp(argv[i], "-c") && i + 1 < argc) prm.conv    = atof(argv[++i]);
+        else if (!strcmp(argv[i], "-u") && i + 1 < argc) prm.unroll = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-p"))                 prm.print_dbg = 1;
         else if (!strcmp(argv[i], "-h")) { usage(argv[0], d); return 0; }
         else { fprintf(stderr, "unknown argument: %s\n", argv[i]); usage(argv[0], d); return 1; }
@@ -163,6 +177,27 @@ int main(int argc, char **argv)
     if (prm.T1 <= 0) prm.T1 = USE_TARGET ? 1 : omp_get_max_threads();
     if (prm.T2 <= 0) prm.T2 = USE_TARGET ? 1 : omp_get_max_threads();
     if (prm.m  <= 0) prm.m  = d->default_m;
+
+    /* One taskgraph instance is `unroll` iterations, and there is no epilogue --
+     * a shorter last instance is a different graph and would not replay -- so the
+     * iteration count must be a whole number of instances. */
+    if (prm.unroll < 1) prm.unroll = 1;
+    if (d->restarted && prm.unroll > 1) {
+        /* GMRES interleaves a host least-squares solve between restarts, whose
+         * result feeds the next restart's graph; unrolling would drop it. */
+        fprintf(stderr, "%s: -u is not supported for a restarted solver (forcing -u 1)\n", d->name);
+        prm.unroll = 1;
+    }
+    if (prm.iters % prm.unroll != 0) {
+        const int iters = (prm.iters / prm.unroll) * prm.unroll;
+        if (iters == 0) {
+            fprintf(stderr, "-u %d exceeds -i %d: nothing to run\n", prm.unroll, prm.iters);
+            return 1;
+        }
+        fprintf(stderr, "-i %d is not a multiple of -u %d: running %d iterations\n",
+                prm.iters, prm.unroll, iters);
+        prm.iters = iters;
+    }
     if ((d->opt_mask & OPT_STENCIL) &&
         prm.stencil != SPMAT_STENCIL_7PT && prm.stencil != SPMAT_STENCIL_27PT)
         prm.stencil = SPMAT_STENCIL_27PT;
@@ -200,6 +235,9 @@ int main(int argc, char **argv)
     printf("  exec mode  : %s\n", USE_SYNC ? "synchronous (blocking, no tasks)"
                                            : "asynchronous (tasks + depend)");
     printf("  taskgraph  : %s\n", (USE_TASKGRAPH && !USE_SYNC) ? "on" : "off");
+    if (prm.unroll > 1)
+        printf("  unroll     : %d %ss per taskgraph instance (%d instances)\n",
+               prm.unroll, d->restarted ? "restart" : "iteration", prm.iters / prm.unroll);
     if (prm.mtx) {
         /* imported: the loader already printed the detailed matrix info block */
         printf("  matrix     : Matrix Market file %s\n", prm.mtx);
@@ -230,7 +268,7 @@ int main(int argc, char **argv)
     real_t *x = (real_t *) host_alloc((size_t) A.n * sizeof(real_t));
 
     KrylovStats st;
-    krylov_stats_init(&st, prm.iters);
+    krylov_stats_init(&st, prm.iters / prm.unroll);   /* one entry per instance */
 
     d->solve(&A, b, x, &prm, &st);
 
@@ -249,8 +287,7 @@ int main(int argc, char **argv)
     printf("  relative error        : %.6e   (||x-xexact|| / ||xexact||)\n", sqrt(err2 / xe2));
 
     const double flops = d->flops ? d->flops(&A, &prm) : 0.0;
-    krylov_stats_report(&st, d->restarted ? "restart" : "iteration",
-                        USE_TASKGRAPH && !USE_SYNC, flops);
+    krylov_stats_report(&st, USE_TASKGRAPH && !USE_SYNC, flops);
 
     free(Ax); host_free(x); free(b); free(xexact);
     spmat_free(&A);

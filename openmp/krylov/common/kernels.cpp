@@ -147,7 +147,7 @@ void task_spmv(const idx_t *row_ptr, const idx_t *col_idx, const real_t *val,
             const idx_t end   = KR_MIN(begin + SBS, bend);
             const SpMVDeps *d = &tl->spmv_deps[t1 * T2 + t2];
             OMP_TILE(DEPEND_MULTI(in, (i=0:d->size), x[d->indices[i]]) DEPEND(out, y[begin]),
-                     MAP(present: x[0:n], y[0:n], val[0:nnz], col_idx[0:nnz], row_ptr[0:n + 1]),
+                     MAP(present: x[0:n], y[0:n], val[0:nnz], col_idx[0:nnz], row_ptr[0:n + 1]) KR_LAUNCH(begin, end),
                      firstprivate(row_ptr, col_idx, val, x, y, begin, end))
             for (idx_t i = begin; i < end; i++) {
                 real_t sum = (real_t) 0.0;
@@ -168,7 +168,7 @@ void task_copy(const Tiling *tl, const real_t *x, real_t *y)
     for (idx_t blk = 0; blk < n; blk += BS) {
         const idx_t begin = blk, end = KR_MIN(blk + BS, n);
         OMP_TILE(DEPEND(in, x[begin]) DEPEND(out, y[begin]),
-                 MAP(present: x[0:n], y[0:n]),
+                 MAP(present: x[0:n], y[0:n]) KR_LAUNCH(begin, end),
                  firstprivate(x, y, begin, end))
         for (idx_t i = begin; i < end; i++) y[i] = x[i];
     }
@@ -180,7 +180,7 @@ void task_vmul(const Tiling *tl, const real_t *d, const real_t *x, real_t *y)
     for (idx_t blk = 0; blk < n; blk += BS) {
         const idx_t begin = blk, end = KR_MIN(blk + BS, n);
         OMP_TILE(DEPEND(in, d[begin], x[begin]) DEPEND(out, y[begin]),
-                 MAP(present: d[0:n], x[0:n], y[0:n]),
+                 MAP(present: d[0:n], x[0:n], y[0:n]) KR_LAUNCH(begin, end),
                  firstprivate(d, x, y, begin, end))
         for (idx_t i = begin; i < end; i++) y[i] = d[i] * x[i];
     }
@@ -192,7 +192,7 @@ void task_scal(const Tiling *tl, const real_t *s, real_t *y)
     for (idx_t blk = 0; blk < n; blk += BS) {
         const idx_t begin = blk, end = KR_MIN(blk + BS, n);
         OMP_TILE(DEPEND(in, s[0]) DEPEND(inout, y[begin]),
-                 MAP(present: s[0:1], y[0:n]),
+                 MAP(present: s[0:1], y[0:n]) KR_LAUNCH(begin, end),
                  firstprivate(s, y, begin, end))
         for (idx_t i = begin; i < end; i++) y[i] = s[0] * y[i];
     }
@@ -204,7 +204,7 @@ void task_scal_copy(const Tiling *tl, const real_t *s, const real_t *x, real_t *
     for (idx_t blk = 0; blk < n; blk += BS) {
         const idx_t begin = blk, end = KR_MIN(blk + BS, n);
         OMP_TILE(DEPEND(in, s[0], x[begin]) DEPEND(out, y[begin]),
-                 MAP(present: s[0:1], x[0:n], y[0:n]),
+                 MAP(present: s[0:1], x[0:n], y[0:n]) KR_LAUNCH(begin, end),
                  firstprivate(s, x, y, begin, end))
         for (idx_t i = begin; i < end; i++) y[i] = s[0] * x[i];
     }
@@ -216,7 +216,7 @@ void task_axpy(const Tiling *tl, const real_t *s, real_t sign, const real_t *x, 
     for (idx_t blk = 0; blk < n; blk += BS) {
         const idx_t begin = blk, end = KR_MIN(blk + BS, n);
         OMP_TILE(DEPEND(in, s[0], x[begin]) DEPEND(inout, y[begin]),
-                 MAP(present: s[0:1], x[0:n], y[0:n]),
+                 MAP(present: s[0:1], x[0:n], y[0:n]) KR_LAUNCH(begin, end),
                  firstprivate(s, x, y, sign, begin, end))
         for (idx_t i = begin; i < end; i++) y[i] += sign * s[0] * x[i];
     }
@@ -228,7 +228,7 @@ void task_xpby(const Tiling *tl, const real_t *x, const real_t *s, real_t *y)
     for (idx_t blk = 0; blk < n; blk += BS) {
         const idx_t begin = blk, end = KR_MIN(blk + BS, n);
         OMP_TILE(DEPEND(in, x[begin], s[0]) DEPEND(inout, y[begin]),
-                 MAP(present: x[0:n], s[0:1], y[0:n]),
+                 MAP(present: x[0:n], s[0:1], y[0:n]) KR_LAUNCH(begin, end),
                  firstprivate(x, s, y, begin, end))
         for (idx_t i = begin; i < end; i++) y[i] = x[i] + s[0] * y[i];
     }
@@ -327,7 +327,7 @@ void task_copy_spmv(const Tiling *tl, const real_t *ys, real_t *y)
         const idx_t begin = (idx_t) t1 * BS, end = KR_MIN(begin + BS, n);
         const int   ns = tiling_nsub(tl, t1);
         OMP_TILE(DEPEND_MULTI(in, (k=0:ns), ys[begin + k * SBS]) DEPEND(out, y[begin]),
-                 MAP(present: ys[0:n], y[0:n]),
+                 MAP(present: ys[0:n], y[0:n]) KR_LAUNCH(begin, end),
                  firstprivate(ys, y, begin, end))
         for (idx_t i = begin; i < end; i++) y[i] = ys[i];
     }
@@ -341,7 +341,7 @@ void task_vmul_spmv(const Tiling *tl, const real_t *d, const real_t *ys, real_t 
         const idx_t begin = (idx_t) t1 * BS, end = KR_MIN(begin + BS, n);
         const int   ns = tiling_nsub(tl, t1);
         OMP_TILE(DEPEND(in, d[begin]) DEPEND_MULTI(in, (k=0:ns), ys[begin + k * SBS]) DEPEND(out, y[begin]),
-                 MAP(present: d[0:n], ys[0:n], y[0:n]),
+                 MAP(present: d[0:n], ys[0:n], y[0:n]) KR_LAUNCH(begin, end),
                  firstprivate(d, ys, y, begin, end))
         for (idx_t i = begin; i < end; i++) y[i] = d[i] * ys[i];
     }
@@ -355,7 +355,7 @@ void task_axpy_spmv(const Tiling *tl, const real_t *s, real_t sign, const real_t
         const idx_t begin = (idx_t) t1 * BS, end = KR_MIN(begin + BS, n);
         const int   ns = tiling_nsub(tl, t1);
         OMP_TILE(DEPEND(in, s[0]) DEPEND_MULTI(in, (k=0:ns), ys[begin + k * SBS]) DEPEND(inout, y[begin]),
-                 MAP(present: s[0:1], ys[0:n], y[0:n]),
+                 MAP(present: s[0:1], ys[0:n], y[0:n]) KR_LAUNCH(begin, end),
                  firstprivate(s, ys, y, sign, begin, end))
         for (idx_t i = begin; i < end; i++) y[i] += sign * s[0] * ys[i];
     }
@@ -369,7 +369,7 @@ void task_xpby_spmv(const Tiling *tl, const real_t *ys, const real_t *s, real_t 
         const idx_t begin = (idx_t) t1 * BS, end = KR_MIN(begin + BS, n);
         const int   ns = tiling_nsub(tl, t1);
         OMP_TILE(DEPEND(in, s[0]) DEPEND_MULTI(in, (k=0:ns), ys[begin + k * SBS]) DEPEND(inout, y[begin]),
-                 MAP(present: ys[0:n], s[0:1], y[0:n]),
+                 MAP(present: ys[0:n], s[0:1], y[0:n]) KR_LAUNCH(begin, end),
                  firstprivate(ys, s, y, begin, end))
         for (idx_t i = begin; i < end; i++) y[i] = ys[i] + s[0] * y[i];
     }

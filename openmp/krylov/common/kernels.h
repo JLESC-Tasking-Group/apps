@@ -34,6 +34,33 @@
 
 #include "spmat.h" /* real_t, idx_t, SpMatrix */
 
+/* GPU launch geometry for one tiled kernel.
+ *
+ * Pinned rather than left to the OpenMP runtime, which picks 32 threads per
+ * block here: that is 7 blocks per SM, 224 of the 2048 threads an SM can hold,
+ * and it turns a 65536-element tile into a 2048-block launch. Pinning it is
+ * worth 1.26x on CG on its own. LULESH already pins its geometry the same way
+ * (lulesh.cc: THREADS 256); this brings Krylov to the same footing.
+ *
+ * The size is 512 rather than 256 because it also decides whether these kernels
+ * can be fused. A fused device kernel is one launch ordered by a grid-wide
+ * barrier, which completes only if every block is resident, so CGIR fuses only
+ * a grid it can guarantee -- one block per multiprocessor. A GH200 has 132, and
+ * a 65536-element tile is 256 blocks at 256 threads (just over) but 128 at 512
+ * (just under). The two sizes measure the same on their own, 0.335 ms either
+ * way on CG, so nothing is given up to land on the fusible side.
+ *
+ * That threshold is a property of the device, not of the program, hence a knob
+ * (-DKR_THREADS=...) and not a constant. GPU-only: OMP_TILE drops its `mp`
+ * argument on the host backends, so none of this reaches a CPU or OmpSs-2
+ * build. */
+#ifndef KR_THREADS
+# define KR_THREADS 512
+#endif
+#define KR_LAUNCH(begin, end)                                                  \
+    num_teams((int) (((end) - (begin) + KR_THREADS - 1) / KR_THREADS))         \
+    thread_limit(KR_THREADS)
+
 /* The x blocks that one SpMV sub-block reads (precomputed from col_idx). */
 typedef struct {
     int    size;      /* number of distinct x blocks read                     */

@@ -67,9 +67,11 @@ def build_cmd(app, variant, cfg, size, iters, backend_vars, grain):
     argv = ["make", "-C", app.directory, "clean", app.make_target(variant)]
     argv += [f"{k}={v}" for k, v in variables.items()]
     if app.rebuild_per_size and app.llmc_defs:
-        # grain is a compile-time macro (GRAN_TMP) for llm.c; on sync it is 1/loop.
+        # grain is a compile-time macro (e.g. GRAN_TMP for llm.c); on sync it is
+        # 1/loop. The defs string is passed as the app's make variable (LLMC_DEFS
+        # for llm.c; PB_DEFS / MW_DEFS / SW4_DEFS for the stencil ports).
         g = None if cfg.grain1 else grain
-        argv.append("LLMC_DEFS=" + app.llmc_defs(size, iters, app.batch, g))
+        argv.append(f"{app.defs_var}=" + app.llmc_defs(size, iters, app.batch, g))
     return argv
 
 

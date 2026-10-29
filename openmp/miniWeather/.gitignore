@@ -1,0 +1,4 @@
+miniweather
+*.o
+output.nc
+.gdb_history

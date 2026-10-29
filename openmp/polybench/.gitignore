@@ -1,0 +1,3 @@
+*.x
+*.o
+.gdb_history

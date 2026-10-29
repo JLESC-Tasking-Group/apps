@@ -119,6 +119,19 @@ def _parse_llmc(text):
     }
 
 
+def _parse_harness(text):
+    # Shared summary emitted by the polybench / miniWeather / sw4lite / cloverleaf
+    # ports (same lines as lulesh): iteration 0 / iterations 2.. (avg|stddev),
+    # Elapsed time, and a FOM line (unit varies per app, so match loosely).
+    return {
+        "avg_ms":    _grab(text, r"iterations 2\.\..*\(avg\)\s*:\s*" + _F + r"\s*ms"),
+        "stddev_ms": _grab(text, r"iterations 2\.\..*\(stddev\)\s*:\s*" + _F + r"\s*ms"),
+        "iter0_ms":  _grab(text, r"iteration 0\s*:\s*" + _F + r"\s*ms"),
+        "elapsed_s": _grab(text, r"Elapsed time\s*=\s*" + _F),
+        "fom":       _grab(text, r"FOM\s*=\s*" + _F),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # App registry.
 # --------------------------------------------------------------------------- #
@@ -134,9 +147,12 @@ class AppSpec:
     work: Callable[[int], tuple]         # size -> (value, label) for the top axis
     sizes: List[int]
     iters: int
-    rebuild_per_size: bool = False       # llm.c: size is a compile-time macro
-    llmc_defs: Optional[Callable] = None # (size, iters, batch) -> LLMC_DEFS string
+    rebuild_per_size: bool = False       # size is a compile-time macro (rebuild)
+    llmc_defs: Optional[Callable] = None # (size, iters, batch, grain) -> defs string
     batch: int = 4                       # llm.c BATCH_SIZE (for tokens = B*T)
+    defs_var: str = "LLMC_DEFS"          # make variable the defs string is passed as
+                                         # (PB_DEFS / MW_DEFS / SW4_DEFS for the
+                                         #  rebuild-per-size stencil apps)
 
 
 # ---- krylov: grid n, matrix N=n^3, work ~ n^3; -t/-s = task counts (0=threads) --
@@ -216,4 +232,130 @@ LLMC = AppSpec(
     llmc_defs=_llmc_defs,
 )
 
-APPS: Dict[str, AppSpec] = {a.name: a for a in (KRYLOV, LULESH, LLMC)}
+# ---- polybench stencils: N / TSTEPS are compile-time macros -> rebuild per size -
+# Four fully-parallel stencils (jacobi-1d/2d, heat-3d, fdtd-2d) as variants, like
+# krylov's solvers; each builds <variant>.x. -nb = tasks per loop; -i = TSTEPS cap.
+# Size sweeps the spatial dimension (TSTEPS held at the default per build).
+_PB_TSTEPS = 100
+
+def _pb_run(variant, size, iters, cfg, grain):
+    nb = "1" if cfg.grain1 else (str(grain[0]) if grain else "32")
+    return ["-i", str(iters), "-nb", nb]
+
+def _pb_defs(size, iters, batch, grain):
+    # 2D/3D stencils take N; fdtd-2d takes NX/NY; set all so one spec serves all.
+    n = size
+    return (f"-DPB_N={n} -DPB_TSTEPS={_PB_TSTEPS} "
+            f"-DPB_NX={n} -DPB_NY={n} -DPB_TMAX={_PB_TSTEPS}")
+
+POLYBENCH = AppSpec(
+    name="polybench",
+    directory="polybench",
+    variants=["jacobi-1d", "jacobi-2d", "heat-3d", "fdtd-2d"],
+    make_target=lambda v: v,
+    binary=lambda v: f"./{v}.x",
+    run_args=_pb_run,
+    parse=_parse_harness,
+    # work axis: lattice sites * timesteps (N^2 * TSTEPS is a reasonable common
+    # proxy; heat-3d is N^3 and jacobi-1d is N, but N^2 keeps the plot readable).
+    work=lambda n: (float(n) ** 2 * _PB_TSTEPS, "N\u00b2\u00b7TSTEPS"),
+    sizes=[128, 256, 512],
+    iters=_PB_TSTEPS,
+    rebuild_per_size=True,
+    llmc_defs=_pb_defs,
+    defs_var="PB_DEFS",
+)
+
+# ---- miniWeather: NX/NZ/SIM_TIME are compile-time -> rebuild per size ------------
+# size -> NX (NZ = NX/2, as the domain is 2:1). -nb = tasks per loop; -i caps steps.
+def _mw_run(variant, size, iters, cfg, grain):
+    nb = "1" if cfg.grain1 else (str(grain[0]) if grain else "32")
+    return ["-nb", nb, "-i", str(iters)]
+
+def _mw_defs(size, iters, batch, grain):
+    nx = size
+    nz = max(size // 2, 1)
+    return (f"-D_NX={nx} -D_NZ={nz} -D_SIM_TIME=400 -D_OUT_FREQ=-1 "
+            f"-D_DATA_SPEC=DATA_SPEC_THERMAL")
+
+MINIWEATHER = AppSpec(
+    name="miniweather",
+    directory="miniWeather",
+    variants=[""],
+    make_target=lambda v: "miniweather",
+    binary=lambda v: "./miniweather",
+    run_args=_mw_run,
+    parse=_parse_harness,
+    work=lambda n: (float(n) * max(n // 2, 1), "cells (NX\u00b7NZ)"),
+    sizes=[100, 200, 400],
+    iters=50,
+    rebuild_per_size=True,
+    llmc_defs=_mw_defs,
+    defs_var="MW_DEFS",
+)
+
+# ---- sw4lite proxy: SW4_N/SW4_NZ are compile-time -> rebuild per size ------------
+# size -> N (cubic box, NZ = N). -nb = tasks per loop; -i = #timesteps.
+def _sw4_run(variant, size, iters, cfg, grain):
+    nb = "1" if cfg.grain1 else (str(grain[0]) if grain else "32")
+    return ["-i", str(iters), "-nb", nb]
+
+def _sw4_defs(size, iters, batch, grain):
+    return f"-DSW4_N={size} -DSW4_NZ={size}"
+
+SW4LITE = AppSpec(
+    name="sw4lite",
+    directory="sw4lite",
+    variants=[""],
+    make_target=lambda v: "sw4lite",
+    binary=lambda v: "./sw4lite",
+    run_args=_sw4_run,
+    parse=_parse_harness,
+    work=lambda n: (float(n) ** 3, "grid points (N\u00b3)"),
+    sizes=[32, 48, 64],
+    iters=50,
+    rebuild_per_size=True,
+    llmc_defs=_sw4_defs,
+    defs_var="SW4_DEFS",
+)
+
+# ---- cloverleaf: mesh from an input deck (runtime), not compile-time ------------
+# size -> x_cells = y_cells via a generated deck written to the app dir. Granularity
+# is deck-driven (tiles_per_chunk); the harness grain maps to tiles_per_chunk.
+# end_step caps the run (= iters). test_problem left 0 (no reference KE check in the
+# sweep). The deck path is passed with --file and the host device with --device 0.
+def _cloverleaf_run(variant, size, iters, cfg, grain):
+    tiles = "1" if cfg.grain1 else (str(grain[0]) if grain else "1")
+    # write a deck sized `size` with `iters` steps into the app directory.
+    import os
+    deck = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "..", "cloverleaf", f"clover_sweep_{size}_{iters}_{tiles}.in")
+    with open(deck, "w") as fh:
+        fh.write(
+            "*clover\n"
+            " state 1 density=0.2 energy=1.0\n"
+            " state 2 density=1.0 energy=2.5 geometry=rectangle xmin=0.0 xmax=5.0 ymin=0.0 ymax=2.0\n"
+            f" x_cells={size}\n y_cells={size}\n"
+            " xmin=0.0\n ymin=0.0\n xmax=10.0\n ymax=10.0\n"
+            " initial_timestep=0.04\n timestep_rise=1.5\n max_timestep=0.04\n"
+            f" end_time=100.0\n end_step={iters}\n"
+            f" tiles_per_chunk {tiles}\n"
+            "*endclover\n")
+    return ["--file", os.path.basename(deck), "--device", "0"]
+
+CLOVERLEAF = AppSpec(
+    name="cloverleaf",
+    directory="cloverleaf",
+    variants=[""],
+    make_target=lambda v: "cloverleaf",
+    binary=lambda v: "./cloverleaf",
+    run_args=_cloverleaf_run,
+    parse=_parse_harness,
+    work=lambda n: (float(n) ** 2, "cells (x\u00b7y)"),
+    sizes=[128, 256, 512],
+    iters=30,
+)
+
+
+APPS: Dict[str, AppSpec] = {a.name: a for a in (
+    KRYLOV, LULESH, LLMC, POLYBENCH, MINIWEATHER, SW4LITE, CLOVERLEAF)}

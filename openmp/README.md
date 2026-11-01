@@ -16,6 +16,10 @@ by compile-time toggles shared through `common.mk`.
 | CloverLeaf                       | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Cholesky                         | ✅ | ✅ | ✅ | ❌ | ❌ |
 
+Cholesky is kept as a standalone tasks/target benchmark but is **not** a
+record/replay taskgraph example (its tiled DAG changes shape every step), so it
+is excluded from the shared harness; build it with `make -C cholesky`.
+
 ## Building
 
 One top-level `Makefile` dispatches to each app (which shares `common.mk`):

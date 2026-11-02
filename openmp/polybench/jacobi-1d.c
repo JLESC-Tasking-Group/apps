@@ -49,63 +49,63 @@ int main(int argc, char **argv)
 
     OMP_TARGET_ENTER_DATA(MAP(to: A[0:npts], B[0:npts]))
 
-#pragma omp parallel
-{
-#pragma omp single
-{
-    t0 = omp_get_wtime();
-    prev_ts = t0;
-    /* `unroll` timesteps per taskgraph instance (-u). The body is one timestep and
-     * is loop-invariant: it takes no timestep index, so recording it once and
-     * replaying it is exact. */
-    TASKGRAPH_LOOP(unroll,
-                   [&] (size_t done) { return done < (size_t) tsteps; },
-                   [&] (size_t inst, size_t done)
+    #pragma omp parallel
     {
-        (void) done;
-        /* Per-instance timing, OUTSIDE the recorded region, in ms per timestep.
-         * Inline where the instance is provably drained (any taskgraph build);
-         * elsewhere a host task ordered after the last sweep of every block, which
-         * keeps the no-taskgraph configuration pipelined. */
-        EPILOGUE_TASK(firstprivate(inst, unroll, inst_ms) shared(prev_ts)
-                      DEPEND_MULTI(in, (b=0:nblk), A[b * BS]))
+        #pragma omp single
         {
-            const double now = omp_get_wtime();
-            inst_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
-            prev_ts = now;
-        }
-    })
-    {
-        for (int b = 0; b < nblk; b++) {
-            const int rb = b * BS < 1 ? 1 : b * BS;
-            const int re = (b + 1) * BS > n - 1 ? n - 1 : (b + 1) * BS;
-            if (rb >= re) continue;
-            const int bm = (b > 0) ? (b - 1) : b;
-            const int bp = (b < nblk - 1) ? (b + 1) : b;
-            OMP_TILE(DEPEND(in, A[b * BS], A[bm * BS], A[bp * BS]) DEPEND(out, B[b * BS]),
-                     MAP(present: A[0:npts], B[0:npts]) num_teams((re - rb)) thread_limit(256),
-                     firstprivate(A, B, rb, re))
-            for (int i = rb; i < re; i++)
-                B[i] = SCALAR_VAL(0.33333) * (A[i - 1] + A[i] + A[i + 1]);
-        }
-        for (int b = 0; b < nblk; b++) {
-            const int rb = b * BS < 1 ? 1 : b * BS;
-            const int re = (b + 1) * BS > n - 1 ? n - 1 : (b + 1) * BS;
-            if (rb >= re) continue;
-            const int bm = (b > 0) ? (b - 1) : b;
-            const int bp = (b < nblk - 1) ? (b + 1) : b;
-            OMP_TILE(DEPEND(in, B[b * BS], B[bm * BS], B[bp * BS]) DEPEND(out, A[b * BS]),
-                     MAP(present: A[0:npts], B[0:npts]) num_teams((re - rb)) thread_limit(256),
-                     firstprivate(A, B, rb, re))
-            for (int i = rb; i < re; i++)
-                A[i] = SCALAR_VAL(0.33333) * (B[i - 1] + B[i] + B[i + 1]);
+            t0 = omp_get_wtime();
+            prev_ts = t0;
+            /* `unroll` timesteps per taskgraph instance (-u). The body is one timestep and
+             * is loop-invariant: it takes no timestep index, so recording it once and
+             * replaying it is exact. */
+            TASKGRAPH_LOOP(unroll,
+                           [&] (size_t done) { return done < (size_t) tsteps; },
+                           [&] (size_t inst, size_t done)
+            {
+                (void) done;
+                /* Per-instance timing, OUTSIDE the recorded region, in ms per timestep.
+                 * Inline where the instance is provably drained (any taskgraph build);
+                 * elsewhere a host task ordered after the last sweep of every block, which
+                 * keeps the no-taskgraph configuration pipelined. */
+                EPILOGUE_TASK(firstprivate(inst, unroll, inst_ms) shared(prev_ts)
+                              DEPEND_MULTI(in, (b=0:nblk), A[b * BS]))
+                {
+                    const double now = omp_get_wtime();
+                    inst_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
+                    prev_ts = now;
+                }
+            })
+            {
+                for (int b = 0; b < nblk; b++) {
+                    const int rb = b * BS < 1 ? 1 : b * BS;
+                    const int re = (b + 1) * BS > n - 1 ? n - 1 : (b + 1) * BS;
+                    if (rb >= re) continue;
+                    const int bm = (b > 0) ? (b - 1) : b;
+                    const int bp = (b < nblk - 1) ? (b + 1) : b;
+                    OMP_TILE(DEPEND(in, A[b * BS], A[bm * BS], A[bp * BS]) DEPEND(out, B[b * BS]),
+                             MAP(present: A[0:npts], B[0:npts]) num_teams((re - rb)) thread_limit(256),
+                             firstprivate(A, B, rb, re))
+                    for (int i = rb; i < re; i++)
+                        B[i] = SCALAR_VAL(0.33333) * (A[i - 1] + A[i] + A[i + 1]);
+                }
+                for (int b = 0; b < nblk; b++) {
+                    const int rb = b * BS < 1 ? 1 : b * BS;
+                    const int re = (b + 1) * BS > n - 1 ? n - 1 : (b + 1) * BS;
+                    if (rb >= re) continue;
+                    const int bm = (b > 0) ? (b - 1) : b;
+                    const int bp = (b < nblk - 1) ? (b + 1) : b;
+                    OMP_TILE(DEPEND(in, B[b * BS], B[bm * BS], B[bp * BS]) DEPEND(out, A[b * BS]),
+                             MAP(present: A[0:npts], B[0:npts]) num_teams((re - rb)) thread_limit(256),
+                             firstprivate(A, B, rb, re))
+                    for (int i = rb; i < re; i++)
+                        A[i] = SCALAR_VAL(0.33333) * (B[i - 1] + B[i] + B[i + 1]);
+                }
+            }
+            TASKGRAPH_LOOP_END
+            #pragma omp taskwait
+            tf = omp_get_wtime();
         }
     }
-    TASKGRAPH_LOOP_END
-#pragma omp taskwait
-    tf = omp_get_wtime();
-} /* single */
-} /* parallel */
 
     OMP_TARGET_UPDATE(from(A[0:npts]))
     OMP_TARGET_EXIT_DATA(MAP(release: A[0:npts], B[0:npts]))

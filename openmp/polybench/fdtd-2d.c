@@ -74,96 +74,96 @@ int main(int argc, char **argv)
 
     OMP_TARGET_ENTER_DATA(MAP(to: ex[0:npts], ey[0:npts], hz[0:npts], fict[0:(size_t)tmax], tstep[0:1]))
 
-#pragma omp parallel
-{
-#pragma omp single
-{
-    t0 = omp_get_wtime();
-    prev_ts = t0;
-    /* `unroll` timesteps per taskgraph instance (-u). The body is one timestep and
-     * is loop-invariant: it takes no timestep index, so recording it once and
-     * replaying it is exact. */
-    TASKGRAPH_LOOP(unroll,
-                   [&] (size_t done) { return done < (size_t) tmax; },
-                   [&] (size_t inst, size_t done)
+    #pragma omp parallel
     {
-        (void) done;
-        /* Per-instance timing, OUTSIDE the recorded region, in ms per timestep.
-         * Inline where the instance is provably drained (any taskgraph build);
-         * elsewhere a host task ordered after the last sweep of every block, which
-         * keeps the no-taskgraph configuration pipelined. */
-        EPILOGUE_TASK(firstprivate(inst, unroll, inst_ms) shared(prev_ts)
-                      DEPEND_MULTI(in, (b=0:nblk), hz[b * RBS * ny]))
+        #pragma omp single
         {
-            const double now = omp_get_wtime();
-            inst_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
-            prev_ts = now;
-        }
-    })
-    {
-        /* (0) source row ey[0][*] = fict[t] (part of block 0, keyed ey[0]),
-         *     t read from the device-side counter, then t += 1 */
-        OMP_TILE(DEPEND(in, tstep[0]) DEPEND(inout, ey[0]),
-                 MAP(present: ey[0:npts], fict[0:(size_t)tmax], tstep[0:1]) num_teams(1) thread_limit(256),
-                 firstprivate(ey, fict, tstep, ny))
-        for (int j = 0; j < ny; j++)
-            ey[0 * ny + j] = fict[tstep[0]];
-        OMP_TARGET_TASK(DEPEND(inout, tstep[0]) MAP(present: tstep[0:1]))
-        {
-            tstep[0] += 1;
-        }
-
-        /* (1) ey[i][j] -= 0.5*(hz[i][j]-hz[i-1][j]) ; reads hz rows i-1,i
-         *     -> depend on hz block b and the previous block b-1. */
-        for (int b = 0; b < nblk; b++) {
-            const int rb = b * RBS < 1 ? 1 : b * RBS;
-            const int re = (b + 1) * RBS > nx ? nx : (b + 1) * RBS;
-            if (rb >= re) continue;
-            const int bm = (b > 0) ? (b - 1) : b;
-            OMP_TILE(DEPEND(in, hz[b * RBS * ny], hz[bm * RBS * ny]) DEPEND(inout, ey[b * RBS * ny]),
-                     MAP(present: ey[0:npts], hz[0:npts]) num_teams((re - rb)) thread_limit(256),
-                     firstprivate(ey, hz, rb, re, ny))
-            for (int i = rb; i < re; i++)
+            t0 = omp_get_wtime();
+            prev_ts = t0;
+            /* `unroll` timesteps per taskgraph instance (-u). The body is one timestep and
+             * is loop-invariant: it takes no timestep index, so recording it once and
+             * replaying it is exact. */
+            TASKGRAPH_LOOP(unroll,
+                           [&] (size_t done) { return done < (size_t) tmax; },
+                           [&] (size_t inst, size_t done)
+            {
+                (void) done;
+                /* Per-instance timing, OUTSIDE the recorded region, in ms per timestep.
+                 * Inline where the instance is provably drained (any taskgraph build);
+                 * elsewhere a host task ordered after the last sweep of every block, which
+                 * keeps the no-taskgraph configuration pipelined. */
+                EPILOGUE_TASK(firstprivate(inst, unroll, inst_ms) shared(prev_ts)
+                              DEPEND_MULTI(in, (b=0:nblk), hz[b * RBS * ny]))
+                {
+                    const double now = omp_get_wtime();
+                    inst_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
+                    prev_ts = now;
+                }
+            })
+            {
+                /* (0) source row ey[0][*] = fict[t] (part of block 0, keyed ey[0]),
+                 *     t read from the device-side counter, then t += 1 */
+                OMP_TILE(DEPEND(in, tstep[0]) DEPEND(inout, ey[0]),
+                         MAP(present: ey[0:npts], fict[0:(size_t)tmax], tstep[0:1]) num_teams(1) thread_limit(256),
+                         firstprivate(ey, fict, tstep, ny))
                 for (int j = 0; j < ny; j++)
-                    ey[i * ny + j] -= SCALAR_VAL(0.5) * (hz[i * ny + j] - hz[(i - 1) * ny + j]);
-        }
+                    ey[0 * ny + j] = fict[tstep[0]];
+                OMP_TARGET_TASK(DEPEND(inout, tstep[0]) MAP(present: tstep[0:1]))
+                {
+                    tstep[0] += 1;
+                }
 
-        /* (2) ex[i][j] -= 0.5*(hz[i][j]-hz[i][j-1]) ; reads hz row i only */
-        for (int b = 0; b < nblk; b++) {
-            const int rb = b * RBS;
-            const int re = (b + 1) * RBS > nx ? nx : (b + 1) * RBS;
-            if (rb >= re) continue;
-            OMP_TILE(DEPEND(in, hz[b * RBS * ny]) DEPEND(inout, ex[b * RBS * ny]),
-                     MAP(present: ex[0:npts], hz[0:npts]) num_teams((re - rb)) thread_limit(256),
-                     firstprivate(ex, hz, rb, re, ny))
-            for (int i = rb; i < re; i++)
-                for (int j = 1; j < ny; j++)
-                    ex[i * ny + j] -= SCALAR_VAL(0.5) * (hz[i * ny + j] - hz[i * ny + (j - 1)]);
-        }
+                /* (1) ey[i][j] -= 0.5*(hz[i][j]-hz[i-1][j]) ; reads hz rows i-1,i
+                 *     -> depend on hz block b and the previous block b-1. */
+                for (int b = 0; b < nblk; b++) {
+                    const int rb = b * RBS < 1 ? 1 : b * RBS;
+                    const int re = (b + 1) * RBS > nx ? nx : (b + 1) * RBS;
+                    if (rb >= re) continue;
+                    const int bm = (b > 0) ? (b - 1) : b;
+                    OMP_TILE(DEPEND(in, hz[b * RBS * ny], hz[bm * RBS * ny]) DEPEND(inout, ey[b * RBS * ny]),
+                             MAP(present: ey[0:npts], hz[0:npts]) num_teams((re - rb)) thread_limit(256),
+                             firstprivate(ey, hz, rb, re, ny))
+                    for (int i = rb; i < re; i++)
+                        for (int j = 0; j < ny; j++)
+                            ey[i * ny + j] -= SCALAR_VAL(0.5) * (hz[i * ny + j] - hz[(i - 1) * ny + j]);
+                }
 
-        /* (3) hz[i][j] -= 0.7*(ex[i][j+1]-ex[i][j] + ey[i+1][j]-ey[i][j])
-         *     reads ex,ey rows i,i+1 -> depend on blocks b and b+1. i=0..nx-2 */
-        for (int b = 0; b < nblk; b++) {
-            const int rb = b * RBS;
-            const int re = (b + 1) * RBS > nx - 1 ? nx - 1 : (b + 1) * RBS;
-            if (rb >= re) continue;
-            const int bp = (b < nblk - 1) ? (b + 1) : b;
-            OMP_TILE(DEPEND(in, ex[b * RBS * ny], ex[bp * RBS * ny], ey[b * RBS * ny], ey[bp * RBS * ny])
-                     DEPEND(inout, hz[b * RBS * ny]),
-                     MAP(present: ex[0:npts], ey[0:npts], hz[0:npts]) num_teams((re - rb)) thread_limit(256),
-                     firstprivate(ex, ey, hz, rb, re, ny))
-            for (int i = rb; i < re; i++)
-                for (int j = 0; j < ny - 1; j++)
-                    hz[i * ny + j] -= SCALAR_VAL(0.7) *
-                        (ex[i * ny + (j + 1)] - ex[i * ny + j]
-                       + ey[(i + 1) * ny + j] - ey[i * ny + j]);
+                /* (2) ex[i][j] -= 0.5*(hz[i][j]-hz[i][j-1]) ; reads hz row i only */
+                for (int b = 0; b < nblk; b++) {
+                    const int rb = b * RBS;
+                    const int re = (b + 1) * RBS > nx ? nx : (b + 1) * RBS;
+                    if (rb >= re) continue;
+                    OMP_TILE(DEPEND(in, hz[b * RBS * ny]) DEPEND(inout, ex[b * RBS * ny]),
+                             MAP(present: ex[0:npts], hz[0:npts]) num_teams((re - rb)) thread_limit(256),
+                             firstprivate(ex, hz, rb, re, ny))
+                    for (int i = rb; i < re; i++)
+                        for (int j = 1; j < ny; j++)
+                            ex[i * ny + j] -= SCALAR_VAL(0.5) * (hz[i * ny + j] - hz[i * ny + (j - 1)]);
+                }
+
+                /* (3) hz[i][j] -= 0.7*(ex[i][j+1]-ex[i][j] + ey[i+1][j]-ey[i][j])
+                 *     reads ex,ey rows i,i+1 -> depend on blocks b and b+1. i=0..nx-2 */
+                for (int b = 0; b < nblk; b++) {
+                    const int rb = b * RBS;
+                    const int re = (b + 1) * RBS > nx - 1 ? nx - 1 : (b + 1) * RBS;
+                    if (rb >= re) continue;
+                    const int bp = (b < nblk - 1) ? (b + 1) : b;
+                    OMP_TILE(DEPEND(in, ex[b * RBS * ny], ex[bp * RBS * ny], ey[b * RBS * ny], ey[bp * RBS * ny])
+                             DEPEND(inout, hz[b * RBS * ny]),
+                             MAP(present: ex[0:npts], ey[0:npts], hz[0:npts]) num_teams((re - rb)) thread_limit(256),
+                             firstprivate(ex, ey, hz, rb, re, ny))
+                    for (int i = rb; i < re; i++)
+                        for (int j = 0; j < ny - 1; j++)
+                            hz[i * ny + j] -= SCALAR_VAL(0.7) *
+                                (ex[i * ny + (j + 1)] - ex[i * ny + j]
+                               + ey[(i + 1) * ny + j] - ey[i * ny + j]);
+                }
+            }
+            TASKGRAPH_LOOP_END
+            #pragma omp taskwait
+            tf = omp_get_wtime();
         }
     }
-    TASKGRAPH_LOOP_END
-#pragma omp taskwait
-    tf = omp_get_wtime();
-} /* single */
-} /* parallel */
 
     OMP_TARGET_UPDATE(from(ex[0:npts], ey[0:npts], hz[0:npts]))
     OMP_TARGET_EXIT_DATA(MAP(release: ex[0:npts], ey[0:npts], hz[0:npts], fict[0:(size_t)tmax], tstep[0:1]))

@@ -735,40 +735,42 @@ int main(int argc, char **argv)
     double *inst_ms = (double *) malloc(sizeof(double) * ninst);
     double prev_ts = 0.0, t0 = 0.0, tf = 0.0;
     const int nb = nblk;
-#pragma omp parallel
-#pragma omp single
+    #pragma omp parallel
     {
-        // start.cpp: equation of state, then every halo at depth 2
-        ideal_gas(density0, energy0);
-        halo(density0, H_CELL, 2); halo(energy0, H_CELL, 2); halo(pressure, H_CELL, 2);
-        halo(viscosity, H_CELL, 2); halo(density1, H_CELL, 2); halo(energy1, H_CELL, 2);
-        halo(xvel0, H_XVEL, 2); halo(yvel0, H_YVEL, 2); halo(xvel1, H_XVEL, 2); halo(yvel1, H_YVEL, 2);
-#pragma omp taskwait
+        #pragma omp single
+        {
+            // start.cpp: equation of state, then every halo at depth 2
+            ideal_gas(density0, energy0);
+            halo(density0, H_CELL, 2); halo(energy0, H_CELL, 2); halo(pressure, H_CELL, 2);
+            halo(viscosity, H_CELL, 2); halo(density1, H_CELL, 2); halo(energy1, H_CELL, 2);
+            halo(xvel0, H_XVEL, 2); halo(yvel0, H_YVEL, 2); halo(xvel1, H_XVEL, 2); halo(yvel1, H_YVEL, 2);
+            #pragma omp taskwait
 
-        t0 = omp_get_wtime();
-        prev_ts = t0;
-        TASKGRAPH_LOOP(unroll,
-                       [&] (size_t done) { return done < (size_t) iters; },
-                       [&] (size_t inst, size_t done)
-        {
-            (void) done;
-            // ms per iteration, after reset_field on every block
-            EPILOGUE_TASK(firstprivate(inst, unroll, inst_ms) shared(prev_ts)
-                          DEPEND_MULTI(in, (q = 0:nb), K(density0, q))
-                          DEPEND_MULTI(in, (q = 0:nb), K(xvel0, q)))
+            t0 = omp_get_wtime();
+            prev_ts = t0;
+            TASKGRAPH_LOOP(unroll,
+                           [&] (size_t done) { return done < (size_t) iters; },
+                           [&] (size_t inst, size_t done)
             {
-                const double now = omp_get_wtime();
-                inst_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
-                prev_ts = now;
+                (void) done;
+                // ms per iteration, after reset_field on every block
+                EPILOGUE_TASK(firstprivate(inst, unroll, inst_ms) shared(prev_ts)
+                              DEPEND_MULTI(in, (q = 0:nb), K(density0, q))
+                              DEPEND_MULTI(in, (q = 0:nb), K(xvel0, q)))
+                {
+                    const double now = omp_get_wtime();
+                    inst_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
+                    prev_ts = now;
+                }
+            })
+            {
+                timestep(true);    // x sweep first
+                timestep(false);   // y sweep first
             }
-        })
-        {
-            timestep(true);    // x sweep first
-            timestep(false);   // y sweep first
+            TASKGRAPH_LOOP_END
+            #pragma omp taskwait
+            tf = omp_get_wtime();
         }
-        TASKGRAPH_LOOP_END
-#pragma omp taskwait
-        tf = omp_get_wtime();
     }
 
     OMP_TARGET_UPDATE(from(density0[0:N], energy0[0:N], xvel0[0:N], yvel0[0:N], dtv[0:NDTV]))

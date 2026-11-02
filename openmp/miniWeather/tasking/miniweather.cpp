@@ -503,55 +503,55 @@ int main(int argc, char **argv)
     const double dt_full = dt;
 
     auto wall1 = std::chrono::steady_clock::now();
-#pragma omp parallel
-{
-#pragma omp single
-{
-    t0 = omp_get_wtime();
-    prev_ts = t0;
-    // `unroll` step pairs per taskgraph instance (-u).
-    TASKGRAPH_LOOP(unroll,
-                   [&] (size_t done) { return done < (size_t) iters; },
-                   [&] (size_t inst, size_t done)
+    #pragma omp parallel
     {
-        (void) done;
-        // host bookkeeping only, step by step as the reference accumulates it
-        for (long k = 0; k < 2 * unroll; k++) etime += dt_full;
-        /* Per-instance timing, OUTSIDE the recorded region, in ms per iteration.
-         * Inline where the instance is provably drained (any taskgraph build);
-         * elsewhere a host task ordered after the last RK stage on every block. */
-        EPILOGUE_TASK(firstprivate(inst, unroll, inst_ms) shared(prev_ts)
-                      DEPEND_MULTI(in, (b=0:nblk), state[(b * KBS + hs) * SR]))
+        #pragma omp single
         {
-            const double now = omp_get_wtime();
-            inst_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
-            prev_ts = now;
-        }
-    })
-    {
-        perform_timestep(dt_full, 1);   // x-first
-        perform_timestep(dt_full, 0);   // z-first
-    }
-    TASKGRAPH_LOOP_END
-#pragma omp taskwait
-    tf = omp_get_wtime();
-    nsteps = 2 * iters;
+            t0 = omp_get_wtime();
+            prev_ts = t0;
+            // `unroll` step pairs per taskgraph instance (-u).
+            TASKGRAPH_LOOP(unroll,
+                           [&] (size_t done) { return done < (size_t) iters; },
+                           [&] (size_t inst, size_t done)
+            {
+                (void) done;
+                // host bookkeeping only, step by step as the reference accumulates it
+                for (long k = 0; k < 2 * unroll; k++) etime += dt_full;
+                /* Per-instance timing, OUTSIDE the recorded region, in ms per iteration.
+                 * Inline where the instance is provably drained (any taskgraph build);
+                 * elsewhere a host task ordered after the last RK stage on every block. */
+                EPILOGUE_TASK(firstprivate(inst, unroll, inst_ms) shared(prev_ts)
+                              DEPEND_MULTI(in, (b=0:nblk), state[(b * KBS + hs) * SR]))
+                {
+                    const double now = omp_get_wtime();
+                    inst_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
+                    prev_ts = now;
+                }
+            })
+            {
+                perform_timestep(dt_full, 1);   // x-first
+                perform_timestep(dt_full, 0);   // z-first
+            }
+            TASKGRAPH_LOOP_END
+            #pragma omp taskwait
+            tf = omp_get_wtime();
+            nsteps = 2 * iters;
 
-    // Run to SIM_TIME (no -i): the leftover steps, the last one shortened,
-    // continuing the x-first / z-first alternation. Plain tasks, untimed.
-    if (iter_cap < 0) {
-        int x_first = 1;
-        while (etime < sim_time) {
-            if (etime + dt > sim_time) dt = sim_time - etime;
-            perform_timestep(dt, x_first);
-            x_first = !x_first;
-            etime += dt;
-            nsteps++;
+            // Run to SIM_TIME (no -i): the leftover steps, the last one shortened,
+            // continuing the x-first / z-first alternation. Plain tasks, untimed.
+            if (iter_cap < 0) {
+                int x_first = 1;
+                while (etime < sim_time) {
+                    if (etime + dt > sim_time) dt = sim_time - etime;
+                    perform_timestep(dt, x_first);
+                    x_first = !x_first;
+                    etime += dt;
+                    nsteps++;
+                }
+                #pragma omp taskwait
+            }
         }
-#pragma omp taskwait
     }
-} /* single */
-} /* parallel */
     auto wall2 = std::chrono::steady_clock::now();
     const double cpu_time = std::chrono::duration<double>(wall2 - wall1).count();
 

@@ -517,37 +517,37 @@ int main(int argc, char **argv)
                                   mu[0:(size_t)npts], la[0:(size_t)npts], rho[0:(size_t)npts])
                           MAP(alloc: Up[0:(size_t)3*npts], Lu[0:(size_t)3*npts], Uacc[0:(size_t)3*npts]))
 
-#pragma omp parallel
-{
-#pragma omp single
-{
-    t0 = omp_get_wtime();
-    prev_ts = t0;
-    /* `unroll` timesteps per taskgraph instance (-u). */
-    TASKGRAPH_LOOP(unroll,
-                   [&] (size_t done) { return done < (size_t) steps; },
-                   [&] (size_t inst, size_t done)
+    #pragma omp parallel
     {
-        (void) done;
-        /* Per-instance timing, OUTSIDE the recorded region, in ms per timestep.
-         * Inline where the instance is provably drained (any taskgraph build);
-         * elsewhere a host task ordered after cycleArrays() on every block. */
-        EPILOGUE_TASK(firstprivate(inst, unroll, inst_ms) shared(prev_ts)
-                      DEPEND_MULTI(in, (b=0:nblk), U[b * KBS * nij]))
+        #pragma omp single
         {
-            const double now = omp_get_wtime();
-            inst_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
-            prev_ts = now;
+            t0 = omp_get_wtime();
+            prev_ts = t0;
+            /* `unroll` timesteps per taskgraph instance (-u). */
+            TASKGRAPH_LOOP(unroll,
+                           [&] (size_t done) { return done < (size_t) steps; },
+                           [&] (size_t inst, size_t done)
+            {
+                (void) done;
+                /* Per-instance timing, OUTSIDE the recorded region, in ms per timestep.
+                 * Inline where the instance is provably drained (any taskgraph build);
+                 * elsewhere a host task ordered after cycleArrays() on every block. */
+                EPILOGUE_TASK(firstprivate(inst, unroll, inst_ms) shared(prev_ts)
+                              DEPEND_MULTI(in, (b=0:nblk), U[b * KBS * nij]))
+                {
+                    const double now = omp_get_wtime();
+                    inst_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
+                    prev_ts = now;
+                }
+            })
+            {
+                timestep();
+            }
+            TASKGRAPH_LOOP_END
+            #pragma omp taskwait
+            tf = omp_get_wtime();
         }
-    })
-    {
-        timestep();
     }
-    TASKGRAPH_LOOP_END
-#pragma omp taskwait
-    tf = omp_get_wtime();
-} /* single */
-} /* parallel */
 
     OMP_TARGET_UPDATE(from(U[0:(size_t)3*npts]))
     OMP_TARGET_EXIT_DATA(MAP(release: U[0:(size_t)3*npts], Um[0:(size_t)3*npts],

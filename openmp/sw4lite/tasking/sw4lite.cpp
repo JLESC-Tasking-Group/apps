@@ -23,12 +23,15 @@
 // Decomposition: every kernel is tiled into -nb blocks of z-planes. The stencil
 // reaches +/-2 in k, so an rhs block names its neighbour blocks (b-2..b+2) as
 // extra `in` state deps (block-aligned keys, as in the LULESH / PolyBench ports);
-// predictor/corrector/DpDm are element-wise and tile cleanly. One timestep body is
-// wrapped in TASKGRAPH_BEGIN/END for record/replay.
+// predictor/corrector/DpDm are element-wise and tile cleanly. The time loop is a
+// TASKGRAPH_LOOP whose body is one timestep (loop-invariant: dt is a constant and
+// the step index is never read), so -u <n> folds n timesteps into one recorded
+// taskgraph instance, as in LULESH.
 //
 // Verification: component-last layout, so a tasks run must reproduce the
-// synchronous run bit-for-bit; -v prints the final displacement checksum and the
-// L2 norm of U (a decaying standing wave).
+// synchronous run bit-for-bit. The L2 norm of U (a decaying standing wave) is the
+// `answer` the harness checks across configurations; -v also prints the plain
+// displacement checksum.
 //////////////////////////////////////////////////////////////////////////////////////////
 
 #include <stdlib.h>
@@ -38,6 +41,7 @@
 #include <omp.h>
 
 #include "tasking.h"
+#include "tg_report.h"
 
 #ifndef float_sw4
 # define float_sw4 double
@@ -478,33 +482,35 @@ double checksum()
 //////////////////////////////////////////////////////////////////////////////////////////
 int main(int argc, char **argv)
 {
-    int steps = 100, verify = 0;
+    int steps = 100, verify = 0, unroll = 1;
     for (int a = 1; a < argc; a++) {
         if (!strcmp(argv[a], "-nb") && a + 1 < argc) NB = atoi(argv[++a]);
         else if (!strcmp(argv[a], "-i") && a + 1 < argc) steps = atoi(argv[++a]);
+        else if (!strcmp(argv[a], "-u") && a + 1 < argc) unroll = atoi(argv[++a]);
         else if (!strcmp(argv[a], "-v")) verify = 1;
-        else if (!strcmp(argv[a], "-h")) { printf("usage: %s [-i steps] [-nb tasks-per-loop] [-v]\n", argv[0]); return 0; }
+        else if (!strcmp(argv[a], "-h")) { printf("usage: %s [-i steps] [-nb tasks-per-loop] [-u unroll] [-v]\n", argv[0]); return 0; }
+        else { fprintf(stderr, "%s: unknown option '%s' (-h for help)\n", argv[0], argv[a]); return 1; }
     }
+    if (unroll < 1) unroll = 1;
+    /* a whole number of -u instances (a shorter last one would not replay) */
+    steps = (int) tg_round_iters(steps, unroll);
+    if (steps <= 0) return 1;
+    const int ninst = steps / unroll;
 
     init();
     if (NB < 1) NB = 1;
     KBS = nk / NB + (nk % NB != 0);
     if (KBS < 1) KBS = 1;
 
-#if USE_SYNC
-    const char *backend = "synchronous (blocking)";
-#elif USE_TARGET
-    const char *backend = "GPU target tasks";
-#else
-    const char *backend = "CPU tasks";
-#endif
     printf("grid: %d x %d x %d  (interior %d x %d x %d)\n", ni, nj, nk, N, N, NZ);
     printf("dt: %g\n", dt);
-    printf("backend=%s taskgraph=%d\n", backend, USE_TASKGRAPH);
+    printf("backend=%s taskgraph=%d\n", tg_backend_name(), USE_TASKGRAPH);
     printf("Num tasks per loop: %d\n", NB);
 
     const long nij = (long)ni * nj;
-    double *iter_times = (double *)malloc(sizeof(double) * (steps > 0 ? steps : 1));
+    const int nblk = (nk + KBS - 1) / KBS;
+    /* ms per timestep, one entry per taskgraph instance (see tg_report.h) */
+    double *inst_ms = (double *)malloc(sizeof(double) * ninst);
     double prev_ts, t0, tf;
 
     OMP_TARGET_ENTER_DATA(MAP(to: U[0:(size_t)3*npts], Um[0:(size_t)3*npts],
@@ -517,21 +523,27 @@ int main(int argc, char **argv)
 {
     t0 = omp_get_wtime();
     prev_ts = t0;
-    for (int s = 0; s < steps; s++) {
-        TASKGRAPH_BEGIN
-        {
-            timestep();
-        }
-        TASKGRAPH_END
-
-        OMP_HOST_TASK(firstprivate(s, iter_times, nij) shared(prev_ts)
-                      DEPEND(in, U[(nk / 2) * nij]))
+    /* `unroll` timesteps per taskgraph instance (-u). */
+    TASKGRAPH_LOOP(unroll,
+                   [&] (size_t done) { return done < (size_t) steps; },
+                   [&] (size_t inst, size_t done)
+    {
+        (void) done;
+        /* Per-instance timing, OUTSIDE the recorded region, in ms per timestep.
+         * Inline where the instance is provably drained (any taskgraph build);
+         * elsewhere a host task ordered after cycleArrays() on every block. */
+        EPILOGUE_TASK(firstprivate(inst, unroll, inst_ms) shared(prev_ts)
+                      DEPEND_MULTI(in, (b=0:nblk), U[b * KBS * nij]))
         {
             const double now = omp_get_wtime();
-            iter_times[s] = (now - prev_ts) * 1000.0;
+            inst_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
             prev_ts = now;
         }
+    })
+    {
+        timestep();
     }
+    TASKGRAPH_LOOP_END
 #pragma omp taskwait
     tf = omp_get_wtime();
 } /* single */
@@ -542,28 +554,14 @@ int main(int argc, char **argv)
                                       Up[0:(size_t)3*npts], Lu[0:(size_t)3*npts], Uacc[0:(size_t)3*npts],
                                       mu[0:(size_t)npts], la[0:(size_t)npts], rho[0:(size_t)npts]))
 
-    printf("Elapsed time         = %10.6f\n", tf - t0);
-    if (steps > 0) {
-        const int lo  = (steps > 2) ? 2 : (steps > 1 ? 1 : 0);
-        const int cnt = steps - lo;
-        double mean = 0.0;
-        for (int r = lo; r < steps; r++) mean += iter_times[r];
-        if (cnt > 0) mean /= cnt;
-        double var = 0.0;
-        for (int r = lo; r < steps; r++) { double d = iter_times[r] - mean; var += d * d; }
-        const double sd = (cnt > 1) ? sqrt(var / (cnt - 1)) : 0.0;
-        printf("iteration 0          : %10.3f ms  (record)\n", iter_times[0]);
-        printf("iteration 1          : %10.3f ms  (1st replay)\n", (steps > 1) ? iter_times[1] : iter_times[0]);
-        printf("iterations 2.. (avg)    : %10.3f ms\n", mean);
-        printf("iterations 2.. (stddev) : %10.3f ms\n", sd);
-        const double gpupd = (double)N * N * NZ;   // interior grid-point updates / step
-        const double fom = (mean > 0.0) ? gpupd / (mean / 1000.0) : 0.0;
-        printf("FOM                  = %10.8g (gridpt-updates/s)\n", fom);
-    }
-    printf("L2 norm of U         = %.10e\n", l2norm());
+    const double mean = tg_report_instances(inst_ms, ninst, unroll);
+    printf("Elapsed time (s)     : %10.6f\n", tf - t0);
+    const double gpupd = (double)N * N * NZ;   // interior grid-point updates / step
+    printf("FOM (gridpt-updates/s): %10.8g\n", (mean > 0.0) ? gpupd / (mean / 1000.0) : 0.0);
+    printf("answer (L2 norm of U): %.15e\n", l2norm());
     if (verify) printf("checksum             = %.10e\n", checksum());
 
-    free(iter_times);
+    free(inst_ms);
     finalize();
     return 0;
 }

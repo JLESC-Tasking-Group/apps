@@ -5,20 +5,64 @@ its CGIR command-graph optimizations. Each app is a single source expressing two
 backends (CPU tasks vs GPU target offload) plus a synchronous baseline, selected
 by compile-time toggles shared through `common.mk`.
 
-| App                              | CPU tasks | GPU target | synchronous | taskgraph | in harness |
-| -------------------------------- | :-------: | :--------: | :---------: | :-------: | :--------: |
-| Krylov (cg/cr/bicgstab/minres/gmres) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| LULESH                           | ✅ | ✅ | ✅ | ✅ | ✅ |
-| llm.c                            | ✅ | ✅ | ✅ | ✅ | ✅ |
-| PolyBench (jacobi-1d/2d, heat-3d, fdtd-2d) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| miniWeather                      | ✅ | ✅ | ✅ | ✅ | ✅ |
-| sw4lite (proxy)                  | ✅ | ✅ | ✅ | ✅ | ✅ |
-| CloverLeaf                       | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Cholesky                         | ✅ | ✅ | ✅ | ❌ | ❌ |
+| App                              | CPU tasks | GPU target | OmpSs-2 | synchronous | taskgraph | in harness |
+| -------------------------------- | :-------: | :--------: | :-----: | :---------: | :-------: | :--------: |
+| Krylov (cg/cr/bicgstab/minres/gmres) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| LULESH                           | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| MNMG (Datalog TC)                | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| PolyBench (jacobi-1d/2d, heat-3d, fdtd-2d) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| miniWeather                      | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| sw4lite (proxy)                  | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| CloverLeaf                       | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Cholesky                         | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ |
+| llm.c                            | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+
+Every app in the harness drives its time loop through `TASKGRAPH_LOOP`
+(`tasking.h`), so `-u <n>` folds n iterations into one recorded taskgraph
+instance, and prints the same timing summary (record / first replay / steady
+state per instance) and an `answer` that every configuration must reproduce.
+
+llm.c is **not** in the harness. Its OpenMP-target port is a transliteration of
+the reference implementation -- a scalar triple-loop matmul, fp32, no tensor
+cores, 860 kernels per training step of which 92 run on a single thread block --
+so it reaches ~0.4 % of a GH200's fp32 peak and every configuration takes the
+same time. The passes target launch overhead and inter-kernel memory traffic;
+neither is where its time goes, so it measures the port rather than the runtime.
+(Its self-reported "MFU" is also misleading: `train_gpt2.c` divides by a
+dual-socket Sapphire Rapids FP64 peak, not the GPU's.) It is kept as a
+standalone benchmark: `make -C llm.c`.
 
 Cholesky is kept as a standalone tasks/target benchmark but is **not** a
 record/replay taskgraph example (its tiled DAG changes shape every step), so it
 is excluded from the shared harness; build it with `make -C cholesky`.
+
+Notes on the four most-recently-ported apps:
+
+* **PolyBench** — only the four fully-parallel stencils are ported (`jacobi-1d`,
+  `jacobi-2d`, `heat-3d`, `fdtd-2d`). `seidel-2d` and `adi` have loop-carried
+  wavefront / tridiagonal dependences that are not clean record/replay examples
+  (like Cholesky), so they are intentionally excluded. A small vendored
+  `polybench/pb_common.h` replaces the (absent) upstream PolyBench utilities.
+  `fdtd-2d`'s per-timestep source term is indexed through a device-side step
+  counter, so the recorded timestep stays loop-invariant. Note that `heat-3d`'s
+  upstream initial field is linear, which the stencil leaves unchanged, so its
+  checksum cannot catch a wrong result.
+* **miniWeather** — ported from the serial reference (`miniWeather/c/…`) with MPI
+  and parallel-netcdf stripped (single node, periodic halo, no file output). The
+  x/z Strang splitting alternates each step, so one `TASKGRAPH_LOOP` iteration is
+  a timestep *pair* (x-first then z-first) and `-i` counts pairs; the final,
+  shortened step to `SIM_TIME` runs after the loop. Correctness is the native
+  mass / total-energy conservation check (`d_te` is the harness `answer`).
+* **sw4lite** — a self-contained *proxy* of the LLNL sw4lite seismic mini-app:
+  the real 4th-order elastic-wave stencil (`rhs4sg_rev.C`) + predictor/corrector
+  time integrator (`ew-cfromfort.C`), on a uniform Cartesian box without the
+  MPI/BLAS/LAPACK/supergrid machinery of the full code. The upstream build is
+  kept as `sw4lite/Makefile.upstream`.
+* **CloverLeaf** — `cloverleaf/tasking/cloverleaf.cpp`, a single-chunk rewrite
+  of the vendored UoB-HPC C++ code (kept as the reference) on the `clover_bm`
+  problem, `-s` cells per side. `dt` is a CFL reduction kept in device memory and
+  the advection order alternates, so one `TASKGRAPH_LOOP` iteration is a timestep
+  *pair* and `-i` counts pairs. The `answer` is the final kinetic energy.
 
 ## Building
 
@@ -27,7 +71,7 @@ One top-level `Makefile` dispatches to each app (which shares `common.mk`):
 ```sh
 make                 # build all harness apps (CPU tasks + taskgraph, defaults)
 make krylov          # just the krylov solvers
-make lulesh          # (also: make llmc / polybench / miniweather / sw4lite / cloverleaf)
+make lulesh          # (also: make mnmg / polybench / miniweather / sw4lite / cloverleaf / llmc)
 make USE_TARGET=1    # GPU target offload for all apps
 make USE_SYNC=1      # synchronous blocking baseline
 make USE_TASKGRAPH=0 # plain tasks/target, no record/replay
@@ -56,7 +100,7 @@ command-graph stats are collected via `CGIR_STATS_CSV` into `results/cgstats.csv
 ./scripts/evaluate.py --apps lulesh --sizes 30,45,60
 ./scripts/evaluate.py --apps krylov --variants cg --target gpu
 ./scripts/evaluate.py --apps polybench --variants heat-3d,jacobi-2d
-./scripts/evaluate.py --apps miniweather,sw4lite,cloverleaf
+./scripts/evaluate.py --apps miniweather,sw4lite --unroll 1,4
 ./scripts/plot.py                                # -> results/figures/*.png
 ```
 

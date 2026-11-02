@@ -1,57 +1,25 @@
-# =============================================================================
-# CloverLeaf - tasking.h port build configuration.
+# CloverLeaf - tasking.h port (tasking/cloverleaf.cpp). The vendored upstream
+# tree (driver/, src/<model>/, CMakeLists.txt) is the reference it was ported from.
 #
-# In-place port of the UoB-HPC CloverLeaf C++ code to the shared apps/openmp
-# tasking.h backends. It reuses the model-independent driver/ and a new model
-# directory src/tasking/ (cloned from src/omp-target, with context.h routing the
-# conditional-offload macro through tasking.h). The per-timestep kernel chain is
-# wrapped in a record/replay taskgraph in driver/hydro.cpp (guarded by
-# CLOVER_TASKING).
-#
-# This Makefile bypasses the upstream CMake build (kept as CMakeLists.txt) and
-# compiles a single-node (NO_MPI) binary with the shared toggles from ../common.mk:
-#     make                           # CPU tasks + taskgraph (defaults)
-#     make USE_TARGET=1              # GPU target offload
-#     make USE_SYNC=1               # synchronous blocking baseline (use -nb 1)
-#     make USE_TASKGRAPH=0          # plain tasks/target, no record/replay
-#
-# Run with a CloverLeaf input deck, e.g.:
-#     ./cloverleaf --file InputDecks/clover_bm16_short.in --device 0
-# (--device 0 selects the host device under the conditional-target model.)
-# =============================================================================
+#     make                   # toggles from ../common.mk (USE_TARGET, USE_SYNC, ...)
+#     ./cloverleaf -s 512 -i 50 -nb 32 -u 1
+# -s cells per side, -i timestep PAIRS (one TASKGRAPH_LOOP iteration is an
+# x-first + y-first pair), -nb tasks per loop, -u pairs per taskgraph instance.
 include ../common.mk
 
-# C++17 + single-node + the tasking model hooks. CloverLeaf needs C++17.
-CFLAGS += -std=c++17
-CFLAGS += -Idriver -Isrc/tasking
-CFLAGS += -DNO_MPI -DCLOVER_TASKING
-
 program = cloverleaf
-
-DRIVER_SRC  = $(wildcard driver/*.cpp)
-KERNEL_SRC  = $(wildcard src/tasking/*.cpp)
-source      = $(DRIVER_SRC) $(KERNEL_SRC)
-obj         = $(source:.cpp=.o)
-
-HDR = $(wildcard driver/*.h) src/tasking/context.h ../tasking.h
+source  = tasking/cloverleaf.cpp
+HDR     = ../tasking.h ../tg_report.h
 
 all: $(program)
 
-$(program): $(obj)
-	$(CC) $(CFLAGS) $(obj) -o $@ $(LDFLAGS)
-
-%.o: %.cpp $(HDR)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-# Correctness reference: the canonical short deck (test_problem 4). Large (3840^2);
-# use a smaller deck for a quick smoke test.
-test: $(program)
-	./$(program) --file InputDecks/clover_bm2_short.in --device 0
+$(program): $(source) $(HDR)
+	$(CC) $(CFLAGS) $(source) -o $(program) $(LDFLAGS)
 
 run: $(program)
-	./$(program) --file InputDecks/clover_bm16_short.in --device 0
+	./$(program) -s 512 -i 50 -nb 32
 
 clean:
-	rm -f $(program) $(obj)
+	rm -f $(program) *.o
 
-.PHONY: all clean test run
+.PHONY: all clean run

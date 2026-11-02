@@ -154,7 +154,8 @@ def build_cmd(app, variant, cfg, size, iters, backend_vars, grain, unroll):
     argv += [f"{k}={v}" for k, v in variables.items()]
     if app.rebuild_per_size and app.build_defs:
         # An app whose problem size is a compile-time macro contributes extra
-        # make variables here; on sync the grain is 1/loop.
+        # make variables here (PB_DEFS / MW_DEFS / SW4_DEFS for the stencil
+        # ports); on sync the grain is 1/loop.
         g = None if cfg.grain1 else grain
         argv += app.build_defs(size, iters, g, unroll)
     return argv
@@ -167,10 +168,12 @@ def build_key(app, variant, cfg, target, size, grain, unroll):
     binary that build produced -- see stash_binary()."""
     key = (app.name, variant, cfg.label, target)
     if app.rebuild_per_size:
-        # size, grain (GRAN_TMP/...) and unroll (UNROLL) are all compile-time for
-        # such an app, so each combination is its own binary; tuple() to stay
-        # hashable. iters is compiled in too, but it is a pure function of
-        # (size, unroll) here, so it needs no key of its own.
+        # build_defs receives size, grain and unroll, so each combination is
+        # assumed to be its own binary; tuple() to stay hashable. (The current
+        # ports only compile the size in, so this rebuilds more than strictly
+        # needed -- but it must not be narrowed without stashing: a key reused
+        # after another size's `make clean` would run the wrong binary.) iters
+        # is a pure function of (size, unroll) here, so it needs no key.
         key = key + (size, tuple(grain) if grain else None, unroll)
     return key
 
@@ -347,8 +350,9 @@ def main():
 
     if args.list:
         print("apps:")
+        w = max(len(n) for n in APPS)
         for name, spec in APPS.items():
-            print(f"  {name:8s} variants={spec.variants} sizes={spec.sizes} iters={spec.iters}"
+            print(f"  {name:{w}s} variants={spec.variants} sizes={spec.sizes} iters={spec.iters}"
                   f" backends={spec.backends}"
                   f"{' (rebuild per size)' if spec.rebuild_per_size else ''}")
         print("\nbackends:")

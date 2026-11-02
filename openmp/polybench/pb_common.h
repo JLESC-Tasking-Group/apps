@@ -9,13 +9,15 @@
  *
  *   - flat row-major arrays allocated through the pinned/target allocator
  *     (so the same buffer is both host-usable and GPU-mappable),
- *   - the per-iteration timing summary + FOM print the evaluate.py harness
- *     parses (iteration 0 / iterations 2.. (avg|stddev), Elapsed time, FOM),
- *   - a cheap checksum over the live-out array for self-consistency checks.
+ *   - the per-instance timing summary (../tg_report.h, the same lines as
+ *     LULESH), FOM and `answer` the evaluate.py harness parses,
+ *   - a cheap checksum over the live-out array, printed as the `answer` every
+ *     configuration must reproduce.
  *
  * Problem size is compile-time: each kernel .c defines its own default sizes,
  * overridable with -DPB_N=<n> / -DPB_TSTEPS=<t> (and -DPB_TMAX for fdtd). The
- * number of tasks per loop is the runtime knob -nb <n> (default 32), matching
+ * number of tasks per loop is the runtime knob -nb <n> (default 32) and the
+ * timesteps folded into one taskgraph instance is -u <n> (default 1), matching
  * the other harness apps.
  */
 #ifndef PB_COMMON_H
@@ -28,6 +30,7 @@
 #include <omp.h>
 
 #include "tasking.h"
+#include "tg_report.h"
 
 #ifndef DATA_TYPE
 # define DATA_TYPE double
@@ -78,62 +81,64 @@ static inline int pb_block_size(int extent, int nb)
     return bs < 1 ? 1 : bs;
 }
 
-/* ---- Command line (-i iters, -nb tasks-per-loop, -v verify dump) ----------- */
+/* ---- Command line (-i iters, -nb tasks-per-loop, -u unroll, -v) ----------- */
 typedef struct {
-    int iters;   /* -i : TSTEPS cap for timing (0 -> use the compiled TSTEPS) */
+    int iters;   /* -i : timesteps to run (0 -> use the compiled TSTEPS) */
     int nb;      /* -nb: tasks per loop            */
-    int verify;  /* -v : print the live-out checksum */
+    int unroll;  /* -u : timesteps folded into one taskgraph instance */
+    int verify;  /* -v : print per-array checksums */
 } pb_opts;
 
 static inline void pb_parse_args(int argc, char **argv, pb_opts *o)
 {
-    o->iters = 0;
-    o->nb    = 32;
+    o->iters  = 0;
+    o->nb     = 32;
+    o->unroll = 1;
     o->verify = 0;
     for (int a = 1; a < argc; a++) {
-        if (!strcmp(argv[a], "-nb") && a + 1 < argc)      o->nb    = atoi(argv[++a]);
-        else if (!strcmp(argv[a], "-i") && a + 1 < argc)  o->iters = atoi(argv[++a]);
+        if (!strcmp(argv[a], "-nb") && a + 1 < argc)      o->nb     = atoi(argv[++a]);
+        else if (!strcmp(argv[a], "-i") && a + 1 < argc)  o->iters  = atoi(argv[++a]);
+        else if (!strcmp(argv[a], "-u") && a + 1 < argc)  o->unroll = atoi(argv[++a]);
         else if (!strcmp(argv[a], "-v"))                  o->verify = 1;
         else if (!strcmp(argv[a], "-h")) {
-            printf("usage: %s [-i tsteps] [-nb tasks-per-loop] [-v]\n", argv[0]);
+            printf("usage: %s [-i tsteps] [-nb tasks-per-loop] [-u unroll] [-v]\n", argv[0]);
             exit(0);
+        } else {
+            fprintf(stderr, "%s: unknown option '%s' (-h for help)\n", argv[0], argv[a]);
+            exit(1);
         }
     }
+    if (o->nb < 1)     o->nb = 1;
+    if (o->unroll < 1) o->unroll = 1;
 }
 
-/* ---- Per-iteration timing + FOM summary (parseable by evaluate.py) -------- */
-/* iter_times[] holds the per-timestep wall-clock (ms). lattice_updates is the
- * number of stencil point-updates per timestep (for the FOM). */
-static inline void pb_report(const char *name, int backend_taskgraph,
-                             const char *backend, int nb,
-                             double *iter_times, int its,
-                             double elapsed_s, double lattice_updates_per_step)
+/* Timesteps to run: -i (or the compiled default) rounded down to a whole number
+ * of -u instances. Exits if that leaves nothing. */
+static inline int pb_tsteps(const pb_opts *o, int compiled_default)
+{
+    const long t = tg_round_iters(o->iters > 0 ? o->iters : compiled_default, o->unroll);
+    if (t <= 0) exit(1);
+    return (int) t;
+}
+
+/* ---- Timing + FOM + answer summary (parseable by evaluate.py) -------------- */
+/* inst_ms[] holds ms per timestep, one entry per taskgraph instance (see
+ * tg_report.h). lattice_updates_per_step is the number of stencil point-updates
+ * per timestep (for the FOM); answer is the live-out checksum. */
+static inline void pb_report(const char *name, int nb,
+                             const double *inst_ms, long ninst, long unroll,
+                             double elapsed_s, double lattice_updates_per_step,
+                             double answer)
 {
     printf("app=%s\n", name);
-    printf("backend=%s taskgraph=%d\n", backend, backend_taskgraph);
+    printf("backend=%s taskgraph=%d\n", tg_backend_name(), USE_TASKGRAPH);
     printf("Num tasks per loop: %d\n", nb);
-    printf("Elapsed time         = %10.6f\n", elapsed_s);
-
-    if (its > 0) {
-        const int lo  = (its > 2) ? 2 : (its > 1 ? 1 : 0);
-        const int cnt = its - lo;
-        double mean = 0.0;
-        for (int r = lo; r < its; r++) mean += iter_times[r];
-        if (cnt > 0) mean /= cnt;
-        double var = 0.0;
-        for (int r = lo; r < its; r++) { double d = iter_times[r] - mean; var += d * d; }
-        const double sd = (cnt > 1) ? sqrt(var / (cnt - 1)) : 0.0;
-
-        printf("iteration 0          : %10.3f ms  (record)\n", iter_times[0]);
-        printf("iteration 1          : %10.3f ms  (1st replay)\n",
-               (its > 1) ? iter_times[1] : iter_times[0]);
-        printf("iterations 2.. (avg)    : %10.3f ms\n", mean);
-        printf("iterations 2.. (stddev) : %10.3f ms\n", sd);
-
-        /* figure of merit: lattice-site updates per second (steady state). */
-        const double fom = (mean > 0.0) ? lattice_updates_per_step / (mean / 1000.0) : 0.0;
-        printf("FOM                  = %10.8g (lup/s)\n", fom);
-    }
+    const double mean = tg_report_instances(inst_ms, ninst, unroll);
+    printf("Elapsed time (s)     : %10.6f\n", elapsed_s);
+    /* figure of merit: lattice-site updates per second (steady state). */
+    const double fom = (mean > 0.0) ? lattice_updates_per_step / (mean / 1000.0) : 0.0;
+    printf("FOM (lup/s)          : %10.8g\n", fom);
+    printf("answer (checksum)    : %.15e\n", answer);
 }
 
 /* ---- Cheap checksum of a flat array (self-consistency verification) -------- */

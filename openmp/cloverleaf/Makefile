@@ -21,8 +21,6 @@
 # =============================================================================
 include ../common.mk
 
-# C++17 + single-node + the tasking model hooks. CloverLeaf needs C++17.
-CFLAGS += -std=c++17
 CFLAGS += -Idriver -Isrc/tasking
 CFLAGS += -DNO_MPI -DCLOVER_TASKING
 

@@ -52,7 +52,9 @@
 #define SYCL_DEBUG   // enable for debugging SYCL related things, also syncs kernel calls
 #define SYNC_KERNELS // enable for fully synchronous (e.g queue.wait_and_throw()) kernel calls
 #define USE_COND_TARGET // register the host device (target:false) in create_context
-#define CLOVER_TASKING  // enables the taskgraph wrapper in driver/hydro.cpp
+#ifndef CLOVER_TASKING
+# define CLOVER_TASKING  // enables the taskgraph wrapper in driver/hydro.cpp
+#endif
 
 // Backend selection for the conditional-target clause used by every kernel. On
 // the host backends the clause forces execution on the host (target : false); on

@@ -9,13 +9,20 @@
 //   USE_TARGET=0 : each spatial loop is tiled into -nb CPU tasks over the z-rows
 //   USE_TARGET=1 : each tiled loop is one offloaded parallel-for
 //   USE_SYNC=1   : synchronous blocking baseline (one kernel at a time)
-//   USE_TASKGRAPH: one perform_timestep() body recorded/replayed
+//   USE_TASKGRAPH: the time loop is a TASKGRAPH_LOOP (record once, replay)
 //
 // The solver advances with a 3-stage low-storage RK and Strang (dimensional)
-// splitting that alternates x-first / z-first every step. Because the alternation
-// makes consecutive timestep bodies differ, we record TWO taskgraphs (one per
-// parity) and replay the matching one -- the toggle itself is kept out of the
-// recorded region.
+// splitting that alternates x-first / z-first every step. Consecutive timesteps
+// therefore differ, but a PAIR of them (x-first then z-first) is loop-invariant:
+// that pair is one iteration of the TASKGRAPH_LOOP, and -u <n> folds n pairs into
+// one recorded instance. The parity is thus fixed by the structure of the body,
+// not read from host state a replay would not see.
+//
+// dt is a constant except for the final, shortened step that lands exactly on
+// SIM_TIME. A recorded body would replay the dt it was recorded with, so only
+// whole pairs of full-dt steps go through the TASKGRAPH_LOOP; the leftover steps
+// (at most one full step plus the partial one) run after it as plain tasks,
+// untimed. With -i <pairs> the run stops after that many pairs instead.
 //
 // Decomposition: every spatial loop is tiled into blocks of KBS z-rows. Task
 // dependences are keyed on block-aligned addresses X[b*KBS*<stride>] and, where a
@@ -37,6 +44,7 @@
 #include <omp.h>
 
 #include "tasking.h"
+#include "tg_report.h"
 
 constexpr double pi        = 3.14159265358979323846264338327;
 constexpr double grav      = 9.8;
@@ -112,7 +120,6 @@ double *state;
 double *state_tmp;
 double *flux;
 double *tend;
-int    direction_switch = 1;
 double mass0, te0, mass, te;
 
 // --- tiling knob ---
@@ -136,7 +143,7 @@ void collision      (double x,double z,double&r,double&u,double&w,double&t,doubl
 void hydro_const_theta (double z,double&r,double&t);
 void hydro_const_bvfreq(double z,double bv_freq0,double&r,double&t);
 double sample_ellipse_cosine(double x,double z,double amp,double x0,double z0,double xrad,double zrad);
-void perform_timestep  (double dt);
+void perform_timestep  (double dt, int x_first);
 void semi_discrete_step(double*state_init,double*state_forcing,double*state_out,double dt,int dir);
 void compute_tendencies_x(double*state,double dt);
 void compute_tendencies_z(double*state,double dt);
@@ -411,9 +418,9 @@ void set_halo_values_z(double *state)
 //////////////////////////////////////////////////////////////////////////////////////////
 // one timestep: 3-stage RK x-direction then z-direction (or reversed by parity).
 //////////////////////////////////////////////////////////////////////////////////////////
-void perform_timestep(double dt)
+void perform_timestep(double dt, int x_first)
 {
-    if (direction_switch) {
+    if (x_first) {
         semi_discrete_step(state, state,     state_tmp, dt / 3, DIR_X);
         semi_discrete_step(state, state_tmp, state_tmp, dt / 2, DIR_X);
         semi_discrete_step(state, state_tmp, state,     dt / 1, DIR_X);
@@ -436,29 +443,26 @@ void perform_timestep(double dt)
 //////////////////////////////////////////////////////////////////////////////////////////
 int main(int argc, char **argv)
 {
-    long iter_cap = -1;      // -i : cap #timesteps (for the harness); <0 = run to sim_time
+    long iter_cap = -1;      // -i : #iterations (timestep PAIRS) to run; <0 = run to sim_time
+    long unroll = 1;         // -u : iterations folded into one taskgraph instance
     for (int a = 1; a < argc; a++) {
         if (!strcmp(argv[a], "-nb") && a + 1 < argc) NB = atoi(argv[++a]);
         else if (!strcmp(argv[a], "-i") && a + 1 < argc) iter_cap = atol(argv[++a]);
-        else if (!strcmp(argv[a], "-h")) { printf("usage: %s [-i maxsteps] [-nb tasks-per-loop]\n", argv[0]); return 0; }
+        else if (!strcmp(argv[a], "-u") && a + 1 < argc) unroll = atol(argv[++a]);
+        else if (!strcmp(argv[a], "-h")) { printf("usage: %s [-i timestep-pairs] [-nb tasks-per-loop] [-u unroll]\n", argv[0]); return 0; }
+        else { fprintf(stderr, "%s: unknown option '%s' (-h for help)\n", argv[0], argv[a]); return 1; }
     }
+    if (unroll < 1) unroll = 1;
 
     init();
     if (NB < 1) NB = 1;
     KBS = nz / NB + (nz % NB != 0);
     if (KBS < 1) KBS = 1;
 
-#if USE_SYNC
-    const char *backend = "synchronous (blocking)";
-#elif USE_TARGET
-    const char *backend = "GPU target tasks";
-#else
-    const char *backend = "CPU tasks";
-#endif
     if (mainproc) {
         printf("nx_glob, nz_glob: %d %d\n", nx_glob, nz_glob);
         printf("dt: %lf\n", dt);
-        printf("backend=%s taskgraph=%d\n", backend, USE_TASKGRAPH);
+        printf("backend=%s taskgraph=%d\n", tg_backend_name(), USE_TASKGRAPH);
         printf("Num tasks per loop: %d\n", NB);
     }
 
@@ -475,55 +479,79 @@ int main(int argc, char **argv)
                                   hy_dens_int[0:nhi], hy_dens_theta_int[0:nhi], hy_pressure_int[0:nhi])
                           MAP(alloc: flux[0:nfl], tend[0:ntd]))
 
-    // estimate #timesteps for the timing array (fixed dt until the final partial step)
-    long est_steps = (long)(sim_time / dt) + 2;
-    if (iter_cap >= 0 && iter_cap < est_steps) est_steps = iter_cap + 1;
-    double *iter_times = (double *)malloc(sizeof(double) * (est_steps > 0 ? est_steps : 1));
+    // Number of full-dt steps before SIM_TIME, counted with the reference's own
+    // floating-point accumulation of etime so the run is step-for-step the same.
+    long full_steps = 0;
+    {
+        double e = etime;
+        while (e < sim_time && e + dt <= sim_time) { e += dt; full_steps++; }
+    }
+    // Iterations (step pairs) through the TASKGRAPH_LOOP: every full pair, or -i,
+    // rounded down to a whole number of -u instances.
+    long iters = full_steps / 2;
+    if (iter_cap >= 0 && iter_cap < iters) iters = iter_cap;
+    iters = tg_round_iters(iters, unroll);
+    if (iters <= 0) return 1;
+    const long ninst = iters / unroll;
+    const int  nblk  = (nz + KBS - 1) / KBS;
+    const int  SR    = st_row();
+
+    /* ms per iteration (= one timestep pair), one entry per instance */
+    double *inst_ms = (double *)malloc(sizeof(double) * ninst);
     long nsteps = 0;
     double prev_ts, t0, tf;
+    const double dt_full = dt;
 
     auto wall1 = std::chrono::steady_clock::now();
-#pragma omp parallel
-{
-#pragma omp single
-{
-    t0 = omp_get_wtime();
-    prev_ts = t0;
-    long step = 0;
-    while (etime < sim_time) {
-        if (etime + dt > sim_time) dt = sim_time - etime;
-        const int parity = direction_switch;   // kept OUT of the recorded region
-
-        // Two graphs: one per splitting parity. The body of a given parity is
-        // loop-invariant, so it records once and replays thereafter.
-        if (parity) {
-            TASKGRAPH_BEGIN
-            { perform_timestep(dt); }
-            TASKGRAPH_END
-        } else {
-            TASKGRAPH_BEGIN
-            { perform_timestep(dt); }
-            TASKGRAPH_END
-        }
-        direction_switch = parity ? 0 : 1;
-
-        OMP_HOST_TASK(firstprivate(step, iter_times) shared(prev_ts)
-                      DEPEND(in, state[(0 + hs) * (nx + 2 * hs)]))
+    #pragma omp parallel
+    {
+        #pragma omp single
         {
-            const double now = omp_get_wtime();
-            iter_times[step] = (now - prev_ts) * 1000.0;
-            prev_ts = now;
-        }
+            t0 = omp_get_wtime();
+            prev_ts = t0;
+            // `unroll` step pairs per taskgraph instance (-u).
+            TASKGRAPH_LOOP(unroll,
+                           [&] (size_t done) { return done < (size_t) iters; },
+                           [&] (size_t inst, size_t done)
+            {
+                (void) done;
+                // host bookkeeping only, step by step as the reference accumulates it
+                for (long k = 0; k < 2 * unroll; k++) etime += dt_full;
+                /* Per-instance timing, OUTSIDE the recorded region, in ms per iteration.
+                 * Inline where the instance is provably drained (any taskgraph build);
+                 * elsewhere a host task ordered after the last RK stage on every block. */
+                EPILOGUE_TASK(firstprivate(inst, unroll, inst_ms) shared(prev_ts)
+                              DEPEND_MULTI(in, (b=0:nblk), state[(b * KBS + hs) * SR]))
+                {
+                    const double now = omp_get_wtime();
+                    inst_ms[inst] = (now - prev_ts) * 1000.0 / (double) unroll;
+                    prev_ts = now;
+                }
+            })
+            {
+                perform_timestep(dt_full, 1);   // x-first
+                perform_timestep(dt_full, 0);   // z-first
+            }
+            TASKGRAPH_LOOP_END
+            #pragma omp taskwait
+            tf = omp_get_wtime();
+            nsteps = 2 * iters;
 
-        etime += dt;
-        step++;
-        if (iter_cap >= 0 && step >= iter_cap) break;
+            // Run to SIM_TIME (no -i): the leftover steps, the last one shortened,
+            // continuing the x-first / z-first alternation. Plain tasks, untimed.
+            if (iter_cap < 0) {
+                int x_first = 1;
+                while (etime < sim_time) {
+                    if (etime + dt > sim_time) dt = sim_time - etime;
+                    perform_timestep(dt, x_first);
+                    x_first = !x_first;
+                    etime += dt;
+                    nsteps++;
+                }
+                #pragma omp taskwait
+            }
+        }
     }
-    nsteps = step;
-#pragma omp taskwait
-    tf = omp_get_wtime();
-} /* single */
-} /* parallel */
     auto wall2 = std::chrono::steady_clock::now();
     const double cpu_time = std::chrono::duration<double>(wall2 - wall1).count();
 
@@ -538,28 +566,15 @@ int main(int argc, char **argv)
         printf("d_mass: %le\n", (mass - mass0) / mass0);
         printf("d_te:   %le\n", (te - te0) / te0);
         printf("CPU Time: %lf sec\n", cpu_time);
-        printf("Elapsed time         = %10.6f\n", tf - t0);
-
-        if (nsteps > 0) {
-            const long lo  = (nsteps > 2) ? 2 : (nsteps > 1 ? 1 : 0);
-            const long cnt = nsteps - lo;
-            double m = 0.0;
-            for (long r = lo; r < nsteps; r++) m += iter_times[r];
-            if (cnt > 0) m /= cnt;
-            double var = 0.0;
-            for (long r = lo; r < nsteps; r++) { double d = iter_times[r] - m; var += d * d; }
-            const double sd = (cnt > 1) ? sqrt(var / (cnt - 1)) : 0.0;
-            printf("iteration 0          : %10.3f ms  (record)\n", iter_times[0]);
-            printf("iteration 1          : %10.3f ms  (1st replay)\n", (nsteps > 1) ? iter_times[1] : iter_times[0]);
-            printf("iterations 2.. (avg)    : %10.3f ms\n", m);
-            printf("iterations 2.. (stddev) : %10.3f ms\n", sd);
-            const double cell_updates = (double)nx * nz;   // cells advanced per step
-            const double fom = (m > 0.0) ? cell_updates / (m / 1000.0) : 0.0;
-            printf("FOM                  = %10.8g (cell-updates/s)\n", fom);
-        }
+        printf("timesteps run: %ld (%ld recorded pairs)\n", nsteps, iters);
+        const double mean = tg_report_instances(inst_ms, ninst, unroll);
+        printf("Elapsed time (s)     : %10.6f\n", tf - t0);
+        const double cell_updates = 2.0 * nx * nz;   // cells advanced per iteration (2 steps)
+        printf("FOM (cell-updates/s) : %10.8g\n", (mean > 0.0) ? cell_updates / (mean / 1000.0) : 0.0);
+        printf("answer (d_te)        : %.15e\n", (te - te0) / te0);
     }
 
-    free(iter_times);
+    free(inst_ms);
     finalize();
     return 0;
 }

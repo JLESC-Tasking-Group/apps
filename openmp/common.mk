@@ -1,6 +1,7 @@
 # =============================================================================
 # common.mk - shared build configuration for the apps/openmp taskgraph apps
-# (krylov, lulesh, llm.c). Each app's Makefile does `include ../common.mk` and
+# (krylov, lulesh, mnmg, polybench, miniWeather, sw4lite, cloverleaf; also the
+# standalone llm.c / cholesky). Each app's Makefile does `include ../common.mk` and
 # then adds its own sources / defines / targets. The top-level Makefile only
 # dispatches (`$(MAKE) -C <app>`).
 #
@@ -17,9 +18,18 @@
 # clang(++) is the supported compiler (the taskgraph construct needs Julian's
 # LLVM / XKOMP fork). A portable CPU build (USE_TASKGRAPH=0) also works on
 # vanilla clang. Override on the command line with `make CC=clang++`.
-CC = xkcxx -DUSE_XKOMP=1
-#CC=clang++ -DUSE_OMPSS=1
-#CC=clang++
+#
+# USE_OMPSS=1 targets NODES/OmpSs-2 instead, which is a different toolchain, so
+# it takes its compiler from OMPSS_CC (default: the OmpSs-2 clang++). Selecting
+# it here rather than at the call site keeps `make USE_OMPSS=1` working on its
+# own -- the XKOMP default would otherwise be silently wrong.
+USE_OMPSS ?= 0
+ifeq ($(USE_OMPSS),1)
+  OMPSS_CC ?= clang++
+  CC = $(OMPSS_CC)
+else
+  CC = xkcxx -DUSE_XKOMP=1
+endif
 
 # ---- Backend / schedule toggles (override on the command line) ------------
 USE_TARGET     ?= 0     # 0: host CPU tasks        1: GPU target offload

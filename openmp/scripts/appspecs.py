@@ -28,8 +28,8 @@ Unrolling
 A taskgraph instance carries an implicit taskgroup, so consecutive instances
 cannot overlap. `unroll` (evaluate.py --unroll) folds that many iterations into
 ONE recorded instance, recovering the cross-iteration overlap inside the graph
-and paying the barrier once per `unroll` iterations. It is a run argument for
-krylov / lulesh / mnmg. It only does anything under USE_TASKGRAPH, so evaluate.py
+and paying the barrier once per `unroll` iterations. It is a run argument (-u)
+for every registered app. It only does anything under USE_TASKGRAPH, so evaluate.py
 sweeps it for the taskgraph configurations only.
 """
 
@@ -70,9 +70,6 @@ DEFAULT_OPTS = [
     "reduce-node,transitive-reduction,jit,prog-fuse,batch",
 ]
 
-# Short legend label for each pipeline, keyed by the LAST pass added. Keeps the
-# figures readable: the full pass list is still written to runs.csv, and the
-# `opt` column remains the ground truth.
 # Every pass name CGIR accepts, mirroring CGIR_FORALL_COMMAND_GRAPH_PASS in
 # cgir/include/cgir/command-graph-pass.hpp. The harness validates --opts against
 # this list and refuses to launch on an unknown name.
@@ -88,29 +85,17 @@ CGIR_PASSES = frozenset([
     "prog-fuse", "jit", "sequence", "batch",
 ])
 
+# Short legend label for each pipeline, keyed by the LAST pass added. Keeps the
+# figures readable: the full pass list is still written to runs.csv, and the
+# `opt` column remains the ground truth.
 OPT_LABELS = {
     "reduce-node,transitive-reduction":                             "+reduce",
     "reduce-node,transitive-reduction,jit":                          "+jit",
     "reduce-node,transitive-reduction,jit,prog-fuse":                "+prog-fuse",
-    "reduce-node,transitive-reduction,jit,prog-fuse,sequence,batch": "+packing",
+    "reduce-node,transitive-reduction,jit,prog-fuse,batch":          "+packing",
 }
 
 
-# --------------------------------------------------------------------------- #
-# Backends. A backend fixes the tasking runtime and the device the work runs on;
-# it is orthogonal to the configuration (which fixes the schedule and the CGIR
-# pass set) and is chosen once per sweep with --target.
-#
-# `opt_env` is the environment variable through which that runtime takes its CGIR
-# pass list. XKOMP and NODES accept the SAME pass names (both call
-# cgir::command_graph_pass_set_from_str), which is what lets one --opts string
-# drive an OpenMP and an OmpSs-2 sweep and makes the two comparable.
-#
-# `env` is applied to every run of the backend. NODES only reaches the CGIR path
-# when taskiter.opt.use_cgir is on, and that option is a NODES config variable,
-# not an environment variable, hence the NODES_CONFIG_OVERRIDE. (Its list
-# separator is ',', so no comma-valued option may be set through it -- which is
-# exactly why the pass list has an env var of its own.)
 # --------------------------------------------------------------------------- #
 # Backends. A backend fixes the tasking runtime and the device the work runs on;
 # it is orthogonal to the configuration (which fixes the schedule and the CGIR
@@ -283,19 +268,6 @@ def _parse_mnmg(text):
     return m
 
 
-def _parse_harness(text):
-    # Shared summary emitted by the polybench / miniWeather / sw4lite / cloverleaf
-    # ports (same lines as lulesh): iteration 0 / iterations 2.. (avg|stddev),
-    # Elapsed time, and a FOM line (unit varies per app, so match loosely).
-    return {
-        "avg_ms":    _grab(text, r"iterations 2\.\..*\(avg\)\s*:\s*" + _F + r"\s*ms"),
-        "stddev_ms": _grab(text, r"iterations 2\.\..*\(stddev\)\s*:\s*" + _F + r"\s*ms"),
-        "iter0_ms":  _grab(text, r"iteration 0\s*:\s*" + _F + r"\s*ms"),
-        "elapsed_s": _grab(text, r"Elapsed time\s*=\s*" + _F),
-        "fom":       _grab(text, r"FOM\s*=\s*" + _F),
-    }
-
-
 # --------------------------------------------------------------------------- #
 # App registry.
 # --------------------------------------------------------------------------- #
@@ -311,10 +283,8 @@ class AppSpec:
     work: Callable[[int], tuple]         # size -> (value, label) for the top axis
     sizes: List[int]
     iters: int
-
     # Whether the problem size is a compile-time macro, so each size needs its
-    # own binary. No app currently sets it; kept because it is a property of an
-    # app, not of the harness, and the next one may need it.
+    # own binary (the polybench / miniWeather / sw4lite ports).
     rebuild_per_size: bool = False
     build_defs: Optional[Callable] = None  # (size, iters, grain, unroll) -> extra make vars
     # Number of granularity knobs this app takes, i.e. how many ':'-separated
@@ -527,21 +497,43 @@ MNMG = AppSpec(
     answer_atol=0.0,
 )
 
-# ---- polybench stencils: N / TSTEPS are compile-time macros -> rebuild per size -
+# ---- polybench / miniWeather / sw4lite: the stencil ports ---------------------
+# They print the same instance lines as krylov / lulesh / mnmg (via ../tg_report.h)
+# plus "Elapsed time (s) : x", "FOM (<unit>) : x" and "answer (<what>) : x". Their
+# problem size is a compile-time macro (rebuild per size); -nb (tasks per loop) and
+# -u (iterations per taskgraph instance) are run-time, as for lulesh. Every kernel
+# is deterministic per point, so a correct run reproduces the answer bit for bit
+# within a backend; the tolerance only leaves room for the compiler.
+def _parse_harness(text):
+    m = _parse_instances(text)
+    m.update({
+        "elapsed_s": _grab(text, r"Elapsed time[^:=\n]*[:=]\s*" + _F),
+        "fom":       _grab(text, r"FOM[^:=\n]*[:=]\s*" + _F),
+        "answer":    _grab(text, r"answer[^:\n]*:\s*" + _F),
+    })
+    return m
+
+
+def _nb(cfg, grain):
+    # grain is THIS size's entry, a single component "nb" -> -nb (tasks per
+    # loop). None -> the app default (32). The synchronous config is always 1.
+    return "1" if cfg.grain1 else (str(grain[0]) if grain else "32")
+
+
+# ---- polybench stencils: N is a compile-time macro -> rebuild per size ---------
 # Four fully-parallel stencils (jacobi-1d/2d, heat-3d, fdtd-2d) as variants, like
-# krylov's solvers; each builds <variant>.x. -nb = tasks per loop; -i = TSTEPS cap.
-# Size sweeps the spatial dimension (TSTEPS held at the default per build).
+# krylov's solvers; each builds <variant>.x. -i = timesteps (TSTEPS / TMAX are only
+# the compiled defaults), -nb = tasks per loop, -u = timesteps per instance. Size
+# sweeps the spatial dimension.
 _PB_TSTEPS = 100
 
-def _pb_run(variant, size, iters, cfg, grain):
-    nb = "1" if cfg.grain1 else (str(grain[0]) if grain else "32")
-    return ["-i", str(iters), "-nb", nb]
+def _pb_run(variant, size, iters, cfg, grain, unroll):
+    return ["-i", str(iters), "-nb", _nb(cfg, grain), "-u", str(unroll)]
 
-def _pb_defs(size, iters, batch, grain):
+def _pb_defs(size, iters, grain, unroll):
     # 2D/3D stencils take N; fdtd-2d takes NX/NY; set all so one spec serves all.
-    n = size
-    return (f"-DPB_N={n} -DPB_TSTEPS={_PB_TSTEPS} "
-            f"-DPB_NX={n} -DPB_NY={n} -DPB_TMAX={_PB_TSTEPS}")
+    return [f"PB_DEFS=-DPB_N={size} -DPB_NX={size} -DPB_NY={size} "
+            f"-DPB_TSTEPS={_PB_TSTEPS} -DPB_TMAX={_PB_TSTEPS}"]
 
 POLYBENCH = AppSpec(
     name="polybench",
@@ -557,21 +549,30 @@ POLYBENCH = AppSpec(
     sizes=[128, 256, 512],
     iters=_PB_TSTEPS,
     rebuild_per_size=True,
-    llmc_defs=_pb_defs,
-    defs_var="PB_DEFS",
+    build_defs=_pb_defs,
+    grain_arity=1,          # "nb"
+    backends=["cpu", "gpu", "ompss"],
+    # The live-out checksum. NOTE heat-3d's upstream initial field is linear, which
+    # its Laplacian leaves unchanged, so its checksum is the same whatever the run
+    # did; only the other three variants make this check bite.
+    answer_rtol=1e-9,
+    pretty="PolyBench",
+    klass="Stencils",
+    panel_x="variant",
 )
 
-# ---- miniWeather: NX/NZ/SIM_TIME are compile-time -> rebuild per size ------------
-# size -> NX (NZ = NX/2, as the domain is 2:1). -nb = tasks per loop; -i caps steps.
-def _mw_run(variant, size, iters, cfg, grain):
-    nb = "1" if cfg.grain1 else (str(grain[0]) if grain else "32")
-    return ["-nb", nb, "-i", str(iters)]
+# ---- miniWeather: NX/NZ are compile-time -> rebuild per size --------------------
+# size -> NX (NZ = NX/2, as the domain is 2:1). One iteration is a timestep PAIR
+# (x-first then z-first splitting, which is what repeats), so -i counts pairs;
+# SIM_TIME only has to be long enough to hold them (400 s is >= 300 pairs at every
+# size below). -nb = tasks per loop, -u = pairs per instance.
+def _mw_run(variant, size, iters, cfg, grain, unroll):
+    return ["-nb", _nb(cfg, grain), "-i", str(iters), "-u", str(unroll)]
 
-def _mw_defs(size, iters, batch, grain):
-    nx = size
+def _mw_defs(size, iters, grain, unroll):
     nz = max(size // 2, 1)
-    return (f"-D_NX={nx} -D_NZ={nz} -D_SIM_TIME=400 -D_OUT_FREQ=-1 "
-            f"-D_DATA_SPEC=DATA_SPEC_THERMAL")
+    return [f"MW_DEFS=-D_NX={size} -D_NZ={nz} -D_SIM_TIME=400 -D_OUT_FREQ=-1 "
+            f"-D_DATA_SPEC=DATA_SPEC_THERMAL"]
 
 MINIWEATHER = AppSpec(
     name="miniweather",
@@ -585,18 +586,26 @@ MINIWEATHER = AppSpec(
     sizes=[100, 200, 400],
     iters=50,
     rebuild_per_size=True,
-    llmc_defs=_mw_defs,
-    defs_var="MW_DEFS",
+    build_defs=_mw_defs,
+    grain_arity=1,          # "nb"
+    backends=["cpu", "gpu", "ompss"],
+    # The relative total-energy change d_te: small (~1e-5 over a full run) but
+    # driven by every cell, so a relative test on it is far more sensitive than one
+    # on the energy itself.
+    answer_rtol=1e-6,
+    answer_atol=1e-14,
+    pretty="miniWeather",
+    klass="Atmospheric dynamics",
 )
 
-# ---- sw4lite proxy: SW4_N/SW4_NZ are compile-time -> rebuild per size ------------
-# size -> N (cubic box, NZ = N). -nb = tasks per loop; -i = #timesteps.
-def _sw4_run(variant, size, iters, cfg, grain):
-    nb = "1" if cfg.grain1 else (str(grain[0]) if grain else "32")
-    return ["-i", str(iters), "-nb", nb]
+# ---- sw4lite proxy: SW4_N/SW4_NZ are compile-time -> rebuild per size -----------
+# size -> N (cubic box, NZ = N). -i = timesteps, -nb = tasks per loop, -u =
+# timesteps per instance.
+def _sw4_run(variant, size, iters, cfg, grain, unroll):
+    return ["-i", str(iters), "-nb", _nb(cfg, grain), "-u", str(unroll)]
 
-def _sw4_defs(size, iters, batch, grain):
-    return f"-DSW4_N={size} -DSW4_NZ={size}"
+def _sw4_defs(size, iters, grain, unroll):
+    return [f"SW4_DEFS=-DSW4_N={size} -DSW4_NZ={size}"]
 
 SW4LITE = AppSpec(
     name="sw4lite",
@@ -610,33 +619,20 @@ SW4LITE = AppSpec(
     sizes=[32, 48, 64],
     iters=50,
     rebuild_per_size=True,
-    llmc_defs=_sw4_defs,
-    defs_var="SW4_DEFS",
+    build_defs=_sw4_defs,
+    grain_arity=1,          # "nb"
+    backends=["cpu", "gpu", "ompss"],
+    answer_rtol=1e-9,       # the L2 norm of the final displacement
+    pretty="sw4lite",
+    klass="Seismic waves",
 )
 
-# ---- cloverleaf: mesh from an input deck (runtime), not compile-time ------------
-# size -> x_cells = y_cells via a generated deck written to the app dir. Granularity
-# is deck-driven (tiles_per_chunk); the harness grain maps to tiles_per_chunk.
-# end_step caps the run (= iters). test_problem left 0 (no reference KE check in the
-# sweep). The deck path is passed with --file and the host device with --device 0.
-def _cloverleaf_run(variant, size, iters, cfg, grain):
-    tiles = "1" if cfg.grain1 else (str(grain[0]) if grain else "1")
-    # write a deck sized `size` with `iters` steps into the app directory.
-    import os
-    deck = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "..", "cloverleaf", f"clover_sweep_{size}_{iters}_{tiles}.in")
-    with open(deck, "w") as fh:
-        fh.write(
-            "*clover\n"
-            " state 1 density=0.2 energy=1.0\n"
-            " state 2 density=1.0 energy=2.5 geometry=rectangle xmin=0.0 xmax=5.0 ymin=0.0 ymax=2.0\n"
-            f" x_cells={size}\n y_cells={size}\n"
-            " xmin=0.0\n ymin=0.0\n xmax=10.0\n ymax=10.0\n"
-            " initial_timestep=0.04\n timestep_rise=1.5\n max_timestep=0.04\n"
-            f" end_time=100.0\n end_step={iters}\n"
-            f" tiles_per_chunk {tiles}\n"
-            "*endclover\n")
-    return ["--file", os.path.basename(deck), "--device", "0"]
+# ---- cloverleaf: -s is a runtime knob -> no rebuild ------------------------------
+# size -> cells per side of the clover_bm problem. One iteration is a timestep PAIR
+# (x-first then y-first advection, which is what repeats), so -i counts pairs. -nb
+# = tasks per loop (capped so every tile has >= 2 rows), -u = pairs per instance.
+def _cloverleaf_run(variant, size, iters, cfg, grain, unroll):
+    return ["-s", str(size), "-i", str(iters), "-nb", _nb(cfg, grain), "-u", str(unroll)]
 
 CLOVERLEAF = AppSpec(
     name="cloverleaf",
@@ -647,10 +643,16 @@ CLOVERLEAF = AppSpec(
     run_args=_cloverleaf_run,
     parse=_parse_harness,
     work=lambda n: (float(n) ** 2, "cells (x\u00b7y)"),
-    sizes=[128, 256, 512],
+    sizes=[256, 512, 1024],
     iters=30,
+    grain_arity=1,          # "nb"
+    backends=["cpu", "gpu", "ompss"],
+    answer_rtol=1e-9,       # the final kinetic energy
+    pretty="CloverLeaf",
+    klass="Hydrodynamics",
 )
 
 
+# llm.c is deliberately absent (see README.md, "llm.c is not in the harness").
 APPS: Dict[str, AppSpec] = {a.name: a for a in (
-    KRYLOV, LULESH, LLMC, POLYBENCH, MINIWEATHER, SW4LITE, CLOVERLEAF)}
+    KRYLOV, LULESH, MNMG, POLYBENCH, MINIWEATHER, SW4LITE, CLOVERLEAF)}

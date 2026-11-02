@@ -14,7 +14,8 @@
 #
 # Problem size is compile-time (rebuild per size); override via SW4_DEFS, e.g.:
 #     make SW4_DEFS="-DSW4_N=96 -DSW4_NZ=96"
-# Tasks per loop is the runtime knob -nb <n> (default 32); -i <n> sets #steps.
+# Tasks per loop is the runtime knob -nb <n> (default 32); -i <n> sets #steps;
+# -u <n> folds n timesteps into one taskgraph instance (TASKGRAPH_LOOP).
 # =============================================================================
 include ../common.mk
 
@@ -23,7 +24,7 @@ CFLAGS   += $(SW4_DEFS)
 
 program = sw4lite
 source  = tasking/sw4lite.cpp
-HDR     = ../tasking.h
+HDR     = ../tasking.h ../tg_report.h
 
 all: $(program)
 

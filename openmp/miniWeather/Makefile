@@ -9,8 +9,10 @@
 #
 # Problem size is compile-time (rebuild per size); override via MW_DEFS, e.g.:
 #     make MW_DEFS="-D_NX=200 -D_NZ=100 -D_SIM_TIME=200 -D_OUT_FREQ=-1 -D_DATA_SPEC=DATA_SPEC_THERMAL"
-# Tasks per loop is the runtime knob -nb <n> (default 32); -i <n> caps the step
-# count for the harness.
+# Tasks per loop is the runtime knob -nb <n> (default 32). One iteration of the
+# TASKGRAPH_LOOP is a timestep PAIR (x-first then z-first, which is what repeats);
+# -i <n> runs n pairs instead of running to SIM_TIME, and -u <n> folds n pairs
+# into one taskgraph instance.
 #
 # The port is single-node (MPI stripped) and does no NetCDF output (_OUT_FREQ<0),
 # so no MPI / pnetcdf dependency is needed.
@@ -23,7 +25,7 @@ CFLAGS  += $(MW_DEFS)
 
 program = miniweather
 source  = tasking/miniweather.cpp
-HDR     = ../tasking.h
+HDR     = ../tasking.h ../tg_report.h
 
 all: $(program)
 

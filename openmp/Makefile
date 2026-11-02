@@ -14,7 +14,7 @@
 # build it standalone via `make -C cholesky`.
 # =============================================================================
 
-APPS = krylov lulesh llmc polybench miniweather sw4lite cloverleaf
+APPS = krylov lulesh llmc mnmg polybench miniweather sw4lite cloverleaf
 
 all: $(APPS)
 
@@ -26,6 +26,9 @@ lulesh:
 
 llmc:
 	$(MAKE) -C llm.c all
+
+mnmg:
+	$(MAKE) -C MNMGDatalog all
 
 polybench:
 	$(MAKE) -C polybench all
@@ -39,17 +42,14 @@ sw4lite:
 cloverleaf:
 	$(MAKE) -C cloverleaf all
 
-mnmg:
-	$(MAKE) -C MNMGDatalog all
-
 clean:
 	$(MAKE) -C krylov clean
 	$(MAKE) -C lulesh clean
 	$(MAKE) -C llm.c  clean
+	$(MAKE) -C MNMGDatalog clean
 	$(MAKE) -C polybench clean
 	$(MAKE) -C miniWeather clean
 	$(MAKE) -C sw4lite clean
 	$(MAKE) -C cloverleaf clean
-	$(MAKE) -C MNMGDatalog clean
 
 .PHONY: all $(APPS) clean

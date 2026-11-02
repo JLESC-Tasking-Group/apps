@@ -31,17 +31,6 @@
 #include "timestep.h"
 #include "visit.h"
 
-// For the apps/openmp "tasking" model the per-timestep kernel sequence is wrapped
-// in a record/replay taskgraph (TASKGRAPH_BEGIN/END from the shared tasking.h).
-// CLOVER_TASKING is defined by src/tasking/context.h; for every other model the
-// wrapper macros are no-ops so hydro.cpp stays model-agnostic.
-#ifdef CLOVER_TASKING
-#  include "tasking.h"
-#else
-#  define TASKGRAPH_BEGIN
-#  define TASKGRAPH_END
-#endif
-
 extern std::ostream g_out;
 
 int maxloc(const std::vector<double> &totals, const int len) {
@@ -61,14 +50,6 @@ void hydro(global_variables &globals, parallel_ &parallel) {
   double timerstart = timer();
   double first_step = 0, second_step = 0;
 
-#ifdef CLOVER_TASKING
-  // Per-step wall times (ms) for the apps/openmp harness summary (parseable by
-  // scripts/evaluate.py: iteration 0 / iterations 2.. (avg|stddev) / FOM).
-  std::vector<double> iter_times;
-  iter_times.reserve(1024);
-  const double tg_start = timer();
-#endif
-
   if (!globals.config.dumpDir.empty())
     clover::dump(globals, std::to_string(parallel.task) + "_" + std::to_string(globals.step) + "_05_hydro.txt");
 
@@ -78,24 +59,16 @@ void hydro(global_variables &globals, parallel_ &parallel) {
 
     globals.step += 1;
 
-    // timestep() computes the data-dependent dt (a CFL min-reduction) and does its
-    // own halo exchanges, so it stays OUTSIDE the recorded region (its result feeds
-    // the rest of the step). The remaining per-step kernel chain is loop-invariant
-    // in shape and is what the taskgraph records/replays.
     timestep(globals, parallel);
     if (!globals.config.dumpDir.empty())
       clover::dump(globals, std::to_string(parallel.task) + "_" + std::to_string(globals.step) + "_1_timestep.txt");
 
-    TASKGRAPH_BEGIN
-    {
-      PdV(globals, true);
-      accelerate(globals);
-      PdV(globals, false);
-      flux_calc(globals);
-      advection(globals);
-      reset_field(globals);
-    }
-    TASKGRAPH_END
+    PdV(globals, true);
+    accelerate(globals);
+    PdV(globals, false);
+    flux_calc(globals);
+    advection(globals);
+    reset_field(globals);
 
     if (!globals.config.dumpDir.empty())
       clover::dump(globals, std::to_string(parallel.task) + "_" + std::to_string(globals.step) + "_7_reset_field.txt");
@@ -105,9 +78,6 @@ void hydro(global_variables &globals, parallel_ &parallel) {
     globals.time += globals.dt;
     //		globals.queue.wait_and_throw();
 
-#ifdef CLOVER_TASKING
-    iter_times.push_back((timer() - step_time) * 1000.0);
-#endif
 
     if (globals.config.summary_frequency != 0) {
       if (globals.step % globals.config.summary_frequency == 0) field_summary(globals, parallel);
@@ -130,39 +100,6 @@ void hydro(global_variables &globals, parallel_ &parallel) {
       field_summary(globals, parallel);
       if (globals.config.visit_frequency != 0) visit(globals, parallel);
 
-#ifdef CLOVER_TASKING
-      if (parallel.boss) {
-        const double elapsed = timer() - tg_start;
-        const size_t n = iter_times.size();
-#if USE_SYNC
-        const char *backend = "synchronous (blocking)";
-#elif USE_TARGET
-        const char *backend = "GPU target tasks";
-#else
-        const char *backend = "CPU tasks";
-#endif
-        std::cout << "backend=" << backend << " taskgraph=" << USE_TASKGRAPH << std::endl;
-        std::cout << "Num tasks per loop: " << globals.config.tiles_per_chunk << std::endl;
-        std::printf("Elapsed time         = %10.6f\n", elapsed);
-        if (n > 0) {
-          const size_t lo = (n > 2) ? 2 : (n > 1 ? 1 : 0);
-          const size_t cnt = n - lo;
-          double mean = 0.0;
-          for (size_t r = lo; r < n; r++) mean += iter_times[r];
-          if (cnt > 0) mean /= cnt;
-          double var = 0.0;
-          for (size_t r = lo; r < n; r++) { double d = iter_times[r] - mean; var += d * d; }
-          const double sd = (cnt > 1) ? std::sqrt(var / (cnt - 1)) : 0.0;
-          std::printf("iteration 0          : %10.3f ms  (record)\n", iter_times[0]);
-          std::printf("iteration 1          : %10.3f ms  (1st replay)\n", (n > 1) ? iter_times[1] : iter_times[0]);
-          std::printf("iterations 2.. (avg)    : %10.3f ms\n", mean);
-          std::printf("iterations 2.. (stddev) : %10.3f ms\n", sd);
-          const double cells = (double)globals.config.grid.x_cells * globals.config.grid.y_cells;
-          const double fom = (mean > 0.0) ? cells / (mean / 1000.0) : 0.0;
-          std::printf("FOM                  = %10.8g (cell-updates/s)\n", fom);
-        }
-      }
-#endif
 
       wall_clock = timer() - timerstart;
       if (parallel.boss) {

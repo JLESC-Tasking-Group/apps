@@ -10,12 +10,12 @@
 #
 # Problem size is compile-time (rebuild per size); override via PB_DEFS, e.g.:
 #     make jacobi-2d PB_DEFS="-DPB_N=512 -DPB_TSTEPS=100"
-# Tasks per loop is the runtime knob -nb <n> (default 32).
+# Tasks per loop is the runtime knob -nb <n> (default 32); -u <n> folds n
+# timesteps into one taskgraph instance (TASKGRAPH_LOOP, default 1).
 #
 # Only the four fully-parallel stencils are in the harness. seidel-2d and adi
 # (loop-carried wavefront / tridiagonal dependences) are intentionally excluded
-# -- like Cholesky, they are not clean record/replay taskgraph examples. The
-# upstream sources remain in ../polybench-stencils/ for reference.
+# -- like Cholesky, they are not clean record/replay taskgraph examples.
 # =============================================================================
 include ../common.mk
 
@@ -24,7 +24,7 @@ CFLAGS += -Wall -Wextra
 PB_DEFS ?=
 CFLAGS  += $(PB_DEFS)
 
-HDR = pb_common.h ../tasking.h
+HDR = pb_common.h ../tasking.h ../tg_report.h
 
 KERNELS = jacobi-1d jacobi-2d heat-3d fdtd-2d
 

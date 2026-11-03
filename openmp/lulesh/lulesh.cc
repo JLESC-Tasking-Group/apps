@@ -2121,7 +2121,7 @@ OMP_TARGET_ENTER_DATA( \
     for (Index_t b = 0; b < numElem; b += EBS) {
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
-      OMP_TILE(DEPEND(in, dxx[start], vol_error[0]) DEPEND(out, dxx[start], vdov[start]), MAP(present: vol_error[0:1]) num_teams(elem_teams) thread_limit(THREADS), )
+      OMP_TILE(DEPEND(in, dxx[start], vnew[start], vol_error[0]) DEPEND(out, dxx[start], vdov[start]), MAP(present: vol_error[0:1]) num_teams(elem_teams) thread_limit(THREADS), )
       for (Index_t k = start; k < end; k++) {
         Real_t vvdov = dxx[k] + dyy[k] + dzz[k] ;
         Real_t vdovthird = vvdov/Real_t(3.0) ;
@@ -2316,7 +2316,7 @@ OMP_TARGET_ENTER_DATA( \
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
       Index_t nb = start/EBS;
-      OMP_TILE(DEPEND(in, delv_xi[start], delv_eta[start], delv_zeta[start], delx_xi[start], delx_eta[start], delx_zeta[start], vnew[start]) DEPEND_MULTI(in, (it=0:dep_delv_xi[nb].size()), delv_xi[dep_delv_xi[nb][it]]) DEPEND_MULTI(in, (it=0:dep_delv_eta[nb].size()), delv_eta[dep_delv_eta[nb][it]]) DEPEND_MULTI(in, (it=0:dep_delv_zeta[nb].size()), delv_zeta[dep_delv_zeta[nb][it]]) DEPEND(out, qq[start], ql[start]), num_teams(elem_teams) thread_limit(THREADS), )
+      OMP_TILE(DEPEND(in, delv_xi[start], delv_eta[start], delv_zeta[start], delx_xi[start], delx_eta[start], delx_zeta[start], vnew[start], vdov[start]) DEPEND_MULTI(in, (it=0:dep_delv_xi[nb].size()), delv_xi[dep_delv_xi[nb][it]]) DEPEND_MULTI(in, (it=0:dep_delv_eta[nb].size()), delv_eta[dep_delv_eta[nb][it]]) DEPEND_MULTI(in, (it=0:dep_delv_zeta[nb].size()), delv_zeta[dep_delv_zeta[nb][it]]) DEPEND(out, qq[start], ql[start]), num_teams(elem_teams) thread_limit(THREADS), )
       for (Index_t i = start; i < end; i++) {
 
         Real_t qlin, qquad ;
@@ -2481,7 +2481,7 @@ OMP_TARGET_ENTER_DATA( \
     for (Index_t b = 0; b < numElem; b+=EBS) {
       Index_t start = b;
       Index_t end = min(b + EBS, numElem);
-      OMP_TILE(DEPEND(in, vnew[start], v[start], e[start], delv[start], q[start], p[start], qq[start], ql[start]) DEPEND(out, q[start], p[start], e[start], ss[start], v[start]), num_teams(elem_teams) thread_limit(THREADS), )
+      OMP_TILE(DEPEND(in, vnew[start], v[start], e[start], delv[start], q[start], p[start], qq[start], ql[start]) DEPEND(out, q[start], p[start], e[start], ss[start], v[start], vnew[start]), num_teams(elem_teams) thread_limit(THREADS), )
       for (Index_t elem = start; elem < end; elem++) {
         Index_t rep = elemRep[elem];
         Real_t e_old, delvc, p_old, q_old, qq_old, ql_old;

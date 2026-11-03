@@ -2113,7 +2113,7 @@ OMP_TARGET_ENTER_DATA( \
       OMP_TARGET_UPDATE(from (arealg[start:s]) NOWAIT DEPEND(inout, arealg[start]))
     }
 
-    OMP_TARGET_TASK(MAP(present: vol_error[0:1]))
+    OMP_TARGET_TASK(DEPEND(out, vol_error[0]) MAP(present: vol_error[0:1]))
     {
       vol_error[0] = -1;
     }
@@ -2121,7 +2121,7 @@ OMP_TARGET_ENTER_DATA( \
     for (Index_t b = 0; b < numElem; b += EBS) {
       Index_t start = b;
       Index_t end = min(start + EBS, numElem);
-      OMP_TILE(DEPEND(in, dxx[start]) DEPEND(out, dxx[start], vdov[start]), MAP(present: vol_error[0:1]) num_teams(elem_teams) thread_limit(THREADS), )
+      OMP_TILE(DEPEND(in, dxx[start], vol_error[0]) DEPEND(out, dxx[start], vdov[start]), MAP(present: vol_error[0:1]) num_teams(elem_teams) thread_limit(THREADS), )
       for (Index_t k = start; k < end; k++) {
         Real_t vvdov = dxx[k] + dyy[k] + dzz[k] ;
         Real_t vdovthird = vvdov/Real_t(3.0) ;

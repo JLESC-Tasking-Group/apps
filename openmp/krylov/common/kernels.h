@@ -118,6 +118,17 @@ void task_dot_spmv (const Tiling *tl, const real_t *a, const real_t *ys, real_t 
 /* --- scalar (length-1 buffer) ops --- */
 void task_scalar_div (const real_t *a, const real_t *b, real_t *c); /* c = a / b */
 void task_scalar_copy(const real_t *a, real_t *b);                  /* b = a     */
+/* c = a / b while the solve is live, else 0: res is the solver's current residual
+ * measure and res0 its initial value, and once res <= KR_FREEZE_REL2 * res0 every
+ * step coefficient is 0, so x and r stop changing. The solvers run a fixed number of
+ * iterations (a steady window long enough to warm the GPU), far past convergence:
+ * unguarded, their coefficients become ratios of rounding noise and the residual
+ * ends at NaN or ~1e+25..1e+92, differently on every run. Every kernel still runs
+ * each iteration, so the work and the timing are unchanged. */
+#ifndef KR_FREEZE_REL2
+# define KR_FREEZE_REL2 1e-24
+#endif
+void task_scalar_div_live(const real_t *a, const real_t *b, const real_t *res, const real_t *res0, real_t *c);
 
 #ifdef __cplusplus
 }

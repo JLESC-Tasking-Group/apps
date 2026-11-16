@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <vector>
 /*
  * tc.cpp - Datalog Transitive Closure (TC) as OpenMP target tasks / taskgraph.
  *
@@ -1384,7 +1386,7 @@ static void tc_print_csv(const char *csv, int input, int iters, u64 tc, double t
 /*   instance 0         RECORDS the task graph (XKOMP rc == 1)                 */
 /*   instance 1         first replay; also where the command graph is built    */
 /*                      and optimized (XKOMP rc == 2)                          */
-/*   instances 2..N-1   steady state -> avg / stddev                           */
+/*   instances W..N-1   steady state -> avg / stddev (W = TG_WARMUP, default 5, tasking.h) */
 /*                                                                            */
 /* CAVEAT: unlike a Krylov iteration, TC rounds do very different amounts of   */
 /* work -- the frontier grows for the first rounds and then collapses. The     */
@@ -1411,6 +1413,7 @@ typedef struct {
     double round1_s;        /* instance 1: graph build + first replay         */
     double steady_s;        /* mean of the steady-state instances             */
     double steady_sd_s;     /* sample stddev of the steady-state instances    */
+    double steady_med_s;    /* median of the steady-state instances           */
     int    steady_from;     /* index of the first steady-state instance       */
     int    steady_n;        /* number of steady-state instances               */
 } TCTimings;
@@ -1425,9 +1428,16 @@ static TCTimings tc_timings(const double *t, int n)
 
     s.round0_s    = t[0];
     s.round1_s    = (n >= 2) ? t[1] : 0.0;
-    s.steady_from = (n >= 3) ? 2 : (n >= 2 ? 1 : 0);
+    s.steady_from = (int) tg_steady_from(n);   /* see tasking.h */
     s.steady_n    = n - s.steady_from;
     tc_mean_std(t + s.steady_from, s.steady_n, &s.steady_s, &s.steady_sd_s);
+    s.steady_med_s = 0.0;
+    if (s.steady_n > 0) {
+        std::vector<double> w(t + s.steady_from, t + n);
+        std::sort(w.begin(), w.end());
+        const int k = s.steady_n;
+        s.steady_med_s = (k % 2) ? w[k / 2] : 0.5 * (w[k / 2 - 1] + w[k / 2]);
+    }
     return s;
 }
 
@@ -1492,6 +1502,7 @@ int main(int argc, char **argv)
         tc_reset_state(ctx);
         tc_warmup(ctx, warmups);
 
+        TG_GPU_WARMUP();   /* untimed: the GPU at its clock before instance 0 (tasking.h) */
         tc_reset_state(ctx);
         double f0 = omp_get_wtime();
         rounds = tc_run_fixpoint(ctx, &times, unroll);
@@ -1587,18 +1598,20 @@ int main(int argc, char **argv)
          * one round when unrolling is off -- and always in ms per ROUND, so they
          * stay comparable across -u. Instance 0 records the graph, instance 1
          * builds and optimizes the command graph and runs the first replay, and
-         * instances 2.. are the steady state. */
+         * the steady state starts at instance TG_WARMUP (default 5, tasking.h). */
         snprintf(lbl, sizeof lbl, "instance 0%s", graphed ? " (record)" : "");
         printf("  %-27s : %10.3f ms\n", lbl, st.round0_s * 1000.0);
         if (times.n >= 2) {
             snprintf(lbl, sizeof lbl, "instance 1%s", graphed ? " (1st replay)" : "");
             printf("  %-27s : %10.3f ms\n", lbl, st.round1_s * 1000.0);
         }
-        if (times.n >= 3) {
+        if (times.n >= 2) {
             snprintf(lbl, sizeof lbl, "instances %d..%d (avg)", st.steady_from, times.n - 1);
             printf("  %-27s : %10.3f ms   (%d instances)\n", lbl, st.steady_s * 1000.0, st.steady_n);
             snprintf(lbl, sizeof lbl, "instances %d..%d (stddev)", st.steady_from, times.n - 1);
             printf("  %-27s : %10.3f ms\n", lbl, st.steady_sd_s * 1000.0);
+            snprintf(lbl, sizeof lbl, "instances %d..%d (median)", st.steady_from, times.n - 1);
+            printf("  %-27s : %10.3f ms\n", lbl, st.steady_med_s * 1000.0);
         }
     }
     fflush(stdout);

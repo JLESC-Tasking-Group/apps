@@ -143,6 +143,7 @@ static void gmres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                                      y[0:m], beta[0:1], ibeta[0:1], hh[0:1], ih[0:1],
                                      part[0:tl.NTB1]))
 
+    TG_GPU_WARMUP();   /* untimed: the GPU at its clock before instance 0 (tasking.h) */
     const double t0 = omp_get_wtime();
     double prev_ts = t0;
 

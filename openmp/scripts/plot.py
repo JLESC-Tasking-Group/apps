@@ -59,7 +59,7 @@ APPS_OPENMP = Path(__file__).resolve().parent.parent
 
 # Canonical CGIR pipeline order for the graph-stats x axis.
 PASS_ORDER = ["copy-fuse", "reduce-node", "transitive-reduction",
-              "prog-fuse", "jit", "sequence", "batch"]
+              "critical-path", "prog-fuse", "jit", "sequence", "batch", "pack"]
 
 # Every <name>_before/<name>_after metric pair cgstats.csv reports per pass, in
 # the order they are printed by --dump-cgstats. The graph-<app> figure only ever
@@ -450,8 +450,10 @@ def aggregate_repeats(rows):
     The survivor carries the MEDIAN `avg_ms`, not the mean: repeats are a small
     sample and their outliers are one-sided (a process can be slowed by the
     machine, never sped up by it), so one bad repeat would drag a mean but not a
-    median. `lo_ms`/`hi_ms` keep the extremes for the error bars and `nrep`
-    records how many runs are behind the number.
+    median. `lo_ms`/`hi_ms` keep the extremes across the repeats and `nrep`
+    records how many runs are behind the number. The error bars do NOT use
+    those extremes: they draw the survivor's own `stddev_ms`, the steady-state
+    standard deviation the run reported over its instances (see _run_sd).
 
     Rows are keyed on everything that defines a measurement, so anything that
     is not the same experiment stays separate. Runs with no repeat column (any
@@ -970,6 +972,17 @@ def load_external(path):
     return out
 
 
+def _run_sd(r):
+    """Steady-state standard deviation (ms) a run reported for itself.
+
+    `stddev_ms` is computed by the app (tg_report.h) over the steady-state
+    instances of ONE process -- the same window as `avg_ms` -- so it is the
+    iteration-to-iteration jitter of that run. It is what the error bars draw;
+    the spread across repeats (lo_ms/hi_ms) is not. A row without one has 0."""
+    sd = fnum(r.get("stddev_ms"))
+    return sd if sd is not None and sd > 0 else 0.0
+
+
 def _panel_series(grp, xkey):
     """Reduce a panel's rows to {config: {x: avg_ms}} plus the ordered x values.
 
@@ -977,11 +990,8 @@ def _panel_series(grp, xkey):
     it is NOT must be constant within the panel; the caller guarantees that by
     filtering, so a leftover duplicate (a re-run) simply takes the last value.
 
-    Also returns the repeat extremes as {config: {x: (lo, hi)}}, from the
-    lo_ms/hi_ms that aggregate_repeats() left on the row. A row measured once
-    has no spread, so it reports its own value for both -- an interval of zero
-    width, which is the truthful statement that nothing is known about how much
-    it would move on a second run."""
+    Also returns each point's steady-state standard deviation as
+    {config: {x: stddev_ms}} (see _run_sd)."""
     data, spread = defaultdict(dict), defaultdict(dict)
     order = []
     for r in grp:
@@ -990,41 +1000,44 @@ def _panel_series(grp, xkey):
             continue
         x = int(r["size"]) if xkey == "size" else (r.get("variant") or "")
         data[r["config"]][x] = v
-        spread[r["config"]][x] = (fnum(r.get("lo_ms")) or v, fnum(r.get("hi_ms")) or v)
+        spread[r["config"]][x] = _run_sd(r)
         if x not in order:
             order.append(x)
     return data, sorted(order, key=lambda x: (isinstance(x, str), x)), spread
 
 
-def _speedup_err(heights, xs, cfg, data, spread, ref, ref_spread):
-    """Asymmetric yerr for a row of speedup bars, or None if nothing varied.
+def _speedup_sd(s, t, sd):
+    """Standard deviation of a speedup s = ref / t, given t's own sd.
 
-    The interval is the configuration's own spread over the repeats, divided by
-    the baseline's median -- not the corner-to-corner range of both. Every bar in
-    a panel is normalized by the same baseline, so that baseline's own spread
+    First-order propagation, sd_s = s * sd / t: symmetric, and finite even when
+    a noisy run's sd exceeds its mean (ref / (t - sd) would not be)."""
+    return s * sd / t if t > 0 else 0.0
+
+
+def _speedup_err(heights, xs, cfg, data, spread, ref, ref_spread):
+    """yerr (+-1 steady-state standard deviation) for a row of speedup bars,
+    or None if no bar has one.
+
+    The interval is the configuration's own in-run stddev (see _run_sd),
+    propagated to the speedup with the baseline's mean held fixed. Every bar in
+    a panel is normalized by the same baseline, so that baseline's own jitter
     scales the whole panel at once; charging it to each bar separately would draw
     it as though the bars could move independently, which is exactly what it
     cannot make them do. What the figure is read for is the step from one bar to
     the next, and the baseline cancels there. The caption says that the reference
     carries a spread of its own.
 
-    Returns None when every interval has zero width (no repeats anywhere), so a
-    single-sample figure draws no bars rather than a row of degenerate ticks
-    implying a precision that was never measured."""
-    lo_err, hi_err, any_spread = [], [], False
+    Returns None when no bar has a standard deviation, so the figure draws no
+    whiskers rather than a row of degenerate ticks."""
+    err, any_spread = [], False
     for h, x in zip(heights, xs):
         if h != h or x not in data.get(cfg, {}) or x not in ref:
-            lo_err.append(0.0); hi_err.append(0.0)
+            err.append(0.0)
             continue
-        t_lo, t_hi = spread.get(cfg, {}).get(x, (data[cfg][x], data[cfg][x]))
-        s_lo, s_hi = ref[x] / t_hi, ref[x] / t_lo
-        if t_hi > t_lo:
-            any_spread = True
-        # Clamp: the median ratio need not sit inside the corner-to-corner
-        # range, and a negative yerr would draw the bar inside out.
-        lo_err.append(max(h - s_lo, 0.0))
-        hi_err.append(max(s_hi - h, 0.0))
-    return [lo_err, hi_err] if any_spread else None
+        e = _speedup_sd(h, data[cfg][x], spread.get(cfg, {}).get(x, 0.0))
+        any_spread |= e > 0
+        err.append(e)
+    return [err, err] if any_spread else None
 
 
 EXTERNAL_LEGEND = "hand-written CUDA"
@@ -1343,16 +1356,16 @@ def plot_paper_unroll(rows, figdir, dpi, fmt, show, styles, baseline,
     handles = {}
 
     for ax, (app, variant, size, grp) in zip(axes, panels):
-        # {pipeline: {unroll: (median, lo, hi)}}, the unroll taken from the
+        # {pipeline: {unroll: (median, steady-state stddev)}}, the unroll taken from the
         # column rather than the label suffix load_runs() added.
         series = defaultdict(dict)
         ref = None
         for r in grp:
             pipe = canon_pipeline(_UNROLL_SUFFIX.sub("", r["config"]))
             v = fnum(r.get("avg_ms"))
-            lo, hi = fnum(r.get("lo_ms")) or v, fnum(r.get("hi_ms")) or v
+            sd = _run_sd(r)
             if pipe == canon_pipeline(baseline):
-                ref = (v, lo, hi)
+                ref = (v, sd)
                 continue
             # The other references (synchronous, ...) run no taskgraph either, so
             # they have no unroll to vary: evaluate.py pins them to u=1 and a
@@ -1363,7 +1376,7 @@ def plot_paper_unroll(rows, figdir, dpi, fmt, show, styles, baseline,
             if (only_pipeline is not None
                     and pipe != canon_pipeline(only_pipeline)):
                 continue
-            series[pipe][run_unroll(r)] = (v, lo, hi)
+            series[pipe][run_unroll(r)] = (v, sd)
         if ref is None:
             ax.set_title(f"{app}\n(no '{baseline}')")
             print(f"  WARNING: {app}: no '{baseline}' run -> unroll panel empty",
@@ -1373,9 +1386,9 @@ def plot_paper_unroll(rows, figdir, dpi, fmt, show, styles, baseline,
         for pipe, by_u in series.items():
             us = sorted(by_u)
             ys = [ref[0] / by_u[u][0] for u in us]
-            # Same corner-to-corner interval as the bar figure.
-            err = [[max(y - ref[1] / by_u[u][2], 0.0) for y, u in zip(ys, us)],
-                   [max(ref[2] / by_u[u][1] - y, 0.0) for y, u in zip(ys, us)]]
+            # Same +-1 steady-state stddev as the bar figure.
+            e = [_speedup_sd(y, by_u[u][0], by_u[u][1]) for y, u in zip(ys, us)]
+            err = [e, e]
             st = styles[canon_config(pipe)]
             ln = ax.errorbar(us, ys, yerr=(err if any(any(e) for e in err) else None),
                              marker="o", ms=4, lw=1.4, capsize=2,
@@ -1471,7 +1484,7 @@ COST_PASSES = [
     ("reduce",     ["reduce-node", "transitive-reduction"]),
     ("prog-fuse",  ["prog-fuse"]),
     ("JIT",        ["jit"]),
-    ("packing",    ["sequence", "batch"]),
+    ("packing",    ["sequence", "batch", "pack"]),   # the batch pass reports itself as "pack"
 ]
 
 
@@ -1607,12 +1620,16 @@ def _emit_table(caption, label, colspec, header, body, out, wide=True,
         print(f"wrote {out}", file=sys.stderr)
 
 
-def latex_table_graph(rows, cgstats_path, full_pipeline, out, tag=""):
+def latex_table_graph(rows, cgstats_path, full_pipeline, out, tag="",
+                      compare_pipeline=""):
     """The applications and what the passes do to their command graph.
 
     One row per problem: the graph as recorded, after the reduction passes, and
     after packing. This is the evidence for section 5.2 -- what the passes
-    change -- and it doubles as the table describing the applications."""
+    change -- and it doubles as the table describing the applications.
+
+    `compare_pipeline` (reduce+packing: packing without JIT/prog-fuse), when the
+    sweep ran it, adds a last column: the nodes left after its packing."""
     try:
         from appspecs import APPS
     except ImportError:
@@ -1620,6 +1637,20 @@ def latex_table_graph(rows, cgstats_path, full_pipeline, out, tag=""):
 
     rows = rows_of_sweep(rows, tag, "the graph table")
     cg = _cg_by_tag(cgstats_path) if Path(cgstats_path).exists() else {}
+
+    def user_nodes(v): return None if v is None else max(v - 2, 0)
+
+    def packed_nodes(passes):
+        a = lambda p: fnum(passes.get(p, {}).get("nodes_after"))
+        return user_nodes(a("pack") or a("batch") or a("sequence"))
+
+    cmp_nodes = {}
+    if compare_pipeline:
+        for r in rows:
+            if (canon_pipeline(r["config"]) == canon_pipeline(compare_pipeline)
+                    and cg.get(r["run_id"])):
+                cmp_nodes[(r["app"], r.get("variant", ""), r.get("size", ""))] = \
+                    packed_nodes(cg[r["run_id"]])
 
     # One row per problem, taken from its largest unroll -- the same recording the
     # cost table and the figure report. Collected into a dict first: appending as
@@ -1648,15 +1679,13 @@ def latex_table_graph(rows, cgstats_path, full_pipeline, out, tag=""):
         # attachment point, not work the device performs. Reporting them would
         # put a floor of two on every count and make a fully packed graph read as
         # three nodes instead of one, so they are subtracted here.
-        def user_nodes(v): return None if v is None else max(v - 2, 0)
-
         first = next((p for p in PASS_ORDER if p in passes), None)
         v0, e0 = user_nodes(before(first, "nodes")), before(first, "edges")
         v1 = user_nodes(after("transitive-reduction", "nodes")
                         or after("reduce-node", "nodes"))
         e1 = after("transitive-reduction", "edges") or after("reduce-node", "edges")
         vf = user_nodes(after("prog-fuse", "nodes"))
-        vp = user_nodes(after("batch", "nodes") or after("sequence", "nodes"))
+        vp = user_nodes(after("pack", "nodes") or after("batch", "nodes") or after("sequence", "nodes"))
 
         spec = APPS.get(r["app"])
         # Name and size in one cell: the class of each application is given in
@@ -1671,26 +1700,32 @@ def latex_table_graph(rows, cgstats_path, full_pipeline, out, tag=""):
             f"{_fmt(v1)}/{_fmt(e1)}",
             _fmt(vf),
             _fmt(vp),
-        ])
+        ] + ([_fmt(cmp_nodes.get(k)) if k in cmp_nodes else "--"] if cmp_nodes else []))
 
     _emit_table(
         "Applications, size parameters, and how optimization passes "
-        "incrementally reduces the number of nodes and edges.",
-        "tbl:apps", "@{}l r r r r@{}",
+        "incrementally reduces the number of nodes and edges."
+        + (" Last column: the nodes left when \\code{packing} follows \\code{reduce} "
+           "directly (no \\code{JIT}, no \\code{prog-fuse})." if cmp_nodes else ""),
+        "tbl:apps", "@{}l r r r r" + (" r" if cmp_nodes else "") + "@{}",
         ["Application", "\\#node/\\#edge", "\\code{reduce}", "\\code{prog-fuse}",
-         "\\code{packing}"],
+         "\\code{packing}"] + (["\\code{reduce}+\\code{packing}"] if cmp_nodes else []),
         body, out, wide=False)
 
 
 def latex_table_cost(rows, cgstats_path, jitstats_path, baseline, main_tag,
-                     full_pipeline, cached_tag, out):
+                     full_pipeline, cached_tag, out, compare_pipeline=""):
     """What the passes cost, and how many replays repay it.
 
     Two break-even columns. `cold` is what a run pays when nothing has been
     compiled before; `cached` is what every later run of the same application
     pays, once the JIT's on-disk cache holds the compiled kernels. They differ by
     orders of magnitude because JIT dominates the cost, so reporting only one of
-    them would misrepresent the system in one direction or the other."""
+    them would misrepresent the system in one direction or the other.
+
+    `compare_pipeline` (reduce+packing: packing without JIT/prog-fuse), when the
+    sweep ran it, adds a last group: its replay time and its break-even (its
+    passes cost little: no JIT), against the same baseline."""
     try:
         from appspecs import APPS
     except ImportError:
@@ -1703,6 +1738,8 @@ def latex_table_cost(rows, cgstats_path, jitstats_path, baseline, main_tag,
     if not cached:
         print(f"  no runs tagged '{cached_tag}': the cached break-even column will "
               f"be empty (see --cached-tag)", file=sys.stderr)
+    cmp = (_cost_rows(rows, cgstats_path, jitstats_path, baseline, main_tag,
+                      compare_pipeline, main_tag) if compare_pipeline else {})
 
     body = []
     for k in sorted(cold, key=lambda k: (k[0], k[1], int(k[2] or 0))):
@@ -1722,21 +1759,26 @@ def latex_table_cost(rows, cgstats_path, jitstats_path, baseline, main_tag,
             _fmt(w["total"], 1, True) if w else "--",
             _fmt(c["breakeven"], 0, True),
             _fmt(w["breakeven"], 0, True) if w else "--",
-        ])
+        ] + ([_fmt(cmp[k]["replay"], 3, True) if k in cmp else "--",
+              _fmt(cmp[k]["breakeven"], 0, True) if k in cmp else "--"] if cmp else []))
 
     _emit_table(
         "Replay time of an iteration, and cost of each pass (additive, left to right). "
         "Times are in milliseconds. We report both cold (no ondisk cache) and "
         "warm (with ondisk cache) times for the JIT pass, and the resulting total "
         "and break-even. \\code{JIT} is the only cached pass, so it is the only "
-        "one whose two columns differ.",
-        "tbl:cost", "@{}l r r r r r r r r r r r@{}",
+        "one whose two columns differ."
+        + (" The last two columns run \\code{reduce} then \\code{packing} only "
+           "(no \\code{JIT}, no \\code{prog-fuse}): its replay time, and its "
+           "break-even." if cmp else ""),
+        "tbl:cost", "@{}l r r r r r r r r r r r" + (" r r" if cmp else "") + "@{}",
         ["Application", "Size", "one replay", "\\code{reduce}",
          "\\code{prog-fuse}", "cold", "cached", "\\code{packing}",
-         "cold", "cached", "cold", "cached"],
+         "cold", "cached", "cold", "cached"] + (["one replay", "break-even"] if cmp else []),
         body, out,
         groups=[("\\code{JIT}", 6, 7), ("total", 9, 10),
-                ("break-even", 11, 12)])
+                ("break-even", 11, 12)]
+               + ([("\\code{reduce}+\\code{packing}", 13, 14)] if cmp else []))
 
 def _save(fig, figdir, name, dpi, fmt, show):
     import matplotlib.pyplot as plt
@@ -1855,6 +1897,11 @@ def main():
                     help="runs.csv `tag` identifying the warm on-disk-JIT-cache sweep, "
                     "which supplies the cost table's cached break-even column. Absent "
                     "from the input, that column is left empty")
+    ap.add_argument("--compare-pipeline",
+                    default="taskgraph:reduce-node,transitive-reduction,batch",
+                    help="configuration the LaTeX tables set beside the full pipeline "
+                    "(default: reduce+packing, i.e. packing without JIT/prog-fuse); its "
+                    "columns appear only when the sweep ran it. '' leaves them out")
     ap.add_argument("--pipeline",
                     default="taskgraph:reduce-node,transitive-reduction,jit,prog-fuse,"
                             "sequence,batch",
@@ -1915,10 +1962,11 @@ def main():
         d = Path(args.latex_tables)
         d.mkdir(parents=True, exist_ok=True)
         latex_table_graph(rows, cgstats_csv, args.pipeline,
-                          str(d / "generated-table-graph.tex"), args.main_tag)
+                          str(d / "generated-table-graph.tex"), args.main_tag,
+                          args.compare_pipeline)
         latex_table_cost(rows, cgstats_csv, jitstats_csv, args.async_baseline,
                          args.main_tag, args.pipeline, args.cached_tag,
-                         str(d / "generated-table-cost.tex"))
+                         str(d / "generated-table-cost.tex"), args.compare_pipeline)
 
     if args.no_figures:
         return

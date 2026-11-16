@@ -78,6 +78,7 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
     real_t *omega    = (real_t *) host_alloc(sizeof(real_t));
     real_t *beta     = (real_t *) host_alloc(sizeof(real_t));
     real_t *rr       = (real_t *) host_alloc(sizeof(real_t)); /* <r,r> for the residual */
+    real_t *rr0      = (real_t *) host_alloc(sizeof(real_t)); /* initial <r,r> (freeze) */
 
     /* Per-block partial dot sums (device-resident; the dot decomposes into T1
      * partial reductions into these + a finalize, on both backends). */
@@ -95,19 +96,22 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
     OMP_TARGET_ENTER_DATA(map(to: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], x[0:n], r[0:n])
                           map(alloc: c[0:n], p[0:n], q[0:n], v[0:n], s[0:n], d[0:n], t[0:n],
                                      rho[0:1], next_rho[0:1], cv[0:1], ts[0:1], tt[0:1],
-                                     alpha[0:1], omega[0:1], beta[0:1], rr[0:1],
+                                     alpha[0:1], omega[0:1], beta[0:1], rr[0:1], rr0[0:1],
                                      part_cv[0:tl.NTB1], part_ts[0:tl.NTB1], part_tt[0:tl.NTB1],
                                      part_nr[0:tl.NTB1], part_rr[0:tl.NTB1]))
 
+    TG_GPU_WARMUP();   /* untimed: the GPU at its clock before instance 0 (tasking.h) */
     const double t0 = omp_get_wtime();
 
     #pragma omp parallel
     #pragma omp single
     {
-        /* One-time setup: c = r; p = r; next_rho = <c,r>. */
+        /* One-time setup: c = r; p = r; next_rho = <c,r>; rr = rr0 = <r,r>. */
         task_copy(&tl, r, c);
         task_copy(&tl, r, p);
         task_dot(&tl, c, r, part_nr, next_rho);
+        task_dot(&tl, r, r, part_rr, rr);
+        task_scalar_copy(rr, rr0);
         #pragma omp taskwait
 
         double prev_ts = omp_get_wtime();
@@ -150,7 +154,7 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
             task_spmv(row_ptr, col_idx, val, nnz, p, q, &tl);        /* q = A p           */
             task_vmul_spmv(&tl, inv, q, v);                          /* v = M q           */
             task_dot(&tl, c, v, part_cv, cv);                        /* <c,v>             */
-            task_scalar_div(rho, cv, alpha);                         /* alpha = rho/<c,v> */
+            task_scalar_div_live(rho, cv, rr, rr0, alpha);           /* alpha = rho/<c,v> */
             task_copy(&tl, r, s);                                    /* s = r            */
             task_axpy(&tl, alpha, (real_t) -1.0, v, s);              /* s -= alpha*v     */
             task_axpy(&tl, alpha, (real_t) +1.0, p, x);              /* x += alpha*p     */
@@ -158,19 +162,21 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
             task_vmul_spmv(&tl, inv, d, t);                         /* t = M d          */
             task_dot(&tl, t, s, part_ts, ts);                       /* <t,s>            */
             task_dot(&tl, t, t, part_tt, tt);                       /* <t,t>            */
-            task_scalar_div(ts, tt, omega);                         /* omega = <t,s>/<t,t> */
+            task_scalar_div_live(ts, tt, rr, rr0, omega);           /* omega = <t,s>/<t,t> */
             task_axpy(&tl, omega, (real_t) +1.0, s, x);             /* x += omega*s     */
             task_copy(&tl, s, r);                                   /* r = s            */
             task_axpy(&tl, omega, (real_t) -1.0, t, r);             /* r -= omega*t     */
             task_dot(&tl, c, r, part_nr, next_rho);                 /* next_rho = <c,r> */
             task_dot(&tl, r, r, part_rr, rr);                       /* <r,r> (residual) */
-            /* beta = (next_rho/rho) * (alpha/omega) -- a compound scalar task. */
+            /* beta = (next_rho/rho) * (alpha/omega) -- a compound scalar task; 0 once
+             * converged, like alpha and omega (task_scalar_div_live, kernels.h). */
             OMP_TARGET_TASK(DEFAULT_NONE
-                            DEPEND(in, next_rho[0], rho[0], alpha[0], omega[0]) DEPEND(out, beta[0])
-                            MAP(present: next_rho[0:1], rho[0:1], alpha[0:1], omega[0:1], beta[0:1])
-                            SHARED(next_rho, rho, alpha, omega, beta))
+                            DEPEND(in, next_rho[0], rho[0], alpha[0], omega[0], rr[0], rr0[0]) DEPEND(out, beta[0])
+                            MAP(present: next_rho[0:1], rho[0:1], alpha[0:1], omega[0:1], rr[0:1], rr0[0:1], beta[0:1])
+                            SHARED(next_rho, rho, alpha, omega, rr, rr0, beta))
             {
-                beta[0] = (next_rho[0] / rho[0]) * (alpha[0] / omega[0]);
+                beta[0] = (rr[0] > (real_t) KR_FREEZE_REL2 * rr0[0])
+                        ? (next_rho[0] / rho[0]) * (alpha[0] / omega[0]) : (real_t) 0.0;
             }
             task_axpy(&tl, omega, (real_t) -1.0, v, p);             /* p -= omega*v     */
             task_xpby(&tl, r, beta, p);                             /* p = r + beta*p   */
@@ -186,14 +192,14 @@ static void bicgstab_solve(const SpMatrix *A, const real_t *b, real_t *x,
                          map(release: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], r[0:n],
                                       c[0:n], p[0:n], q[0:n], v[0:n], s[0:n], d[0:n], t[0:n],
                                       rho[0:1], next_rho[0:1], cv[0:1], ts[0:1], tt[0:1],
-                                      alpha[0:1], omega[0:1], beta[0:1], rr[0:1],
+                                      alpha[0:1], omega[0:1], beta[0:1], rr[0:1], rr0[0:1],
                                       part_cv[0:tl.NTB1], part_ts[0:tl.NTB1], part_tt[0:tl.NTB1],
                                       part_nr[0:tl.NTB1], part_rr[0:tl.NTB1]))
 
     host_free(r); host_free(c); host_free(p); host_free(q); host_free(v);
     host_free(s); host_free(d); host_free(t); host_free(inv);
     host_free(rho); host_free(next_rho); host_free(cv); host_free(ts); host_free(tt);
-    host_free(alpha); host_free(omega); host_free(beta); host_free(rr);
+    host_free(alpha); host_free(omega); host_free(beta); host_free(rr); host_free(rr0);
     host_free(part_cv); host_free(part_ts); host_free(part_tt); host_free(part_nr); host_free(part_rr);
     tiling_fini(&tl);
     st->total_s = t1 - t0;

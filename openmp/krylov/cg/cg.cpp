@@ -75,6 +75,7 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
     real_t *pAp   = (real_t *) host_alloc(sizeof(real_t));
     real_t *alpha = (real_t *) host_alloc(sizeof(real_t));
     real_t *beta  = (real_t *) host_alloc(sizeof(real_t));
+    real_t *g0    = (real_t *) host_alloc(sizeof(real_t)); /* initial gamma (freeze) */
 
     /* Per-block partial dot sums (device-resident: the dot decomposes into T1
      * partial reductions into these + a finalize, on both backends). */
@@ -87,9 +88,10 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
     for (idx_t i = 0; i < n; i++) { x[i] = (real_t) 0.0; r[i] = b[i]; }
 
     OMP_TARGET_ENTER_DATA(MAP(to: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], x[0:n], r[0:n])
-                          MAP(alloc: p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1],
+                          MAP(alloc: p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1], g0[0:1],
                                      part1[0:tl.NTB1], part2[0:tl.NTB1]))
 
+    TG_GPU_WARMUP();   /* untimed: the GPU at its clock before instance 0 (tasking.h) */
     const double t0 = omp_get_wtime();
 
     #pragma omp parallel
@@ -100,6 +102,7 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
         task_vmul(&tl, inv, r, z);
         task_copy(&tl, z, p);
         task_dot(&tl, r, z, part2, gamma);
+        task_scalar_copy(gamma, g0);
         #pragma omp taskwait
 
         /* Reference timestamp for the first iteration's execution time. */
@@ -144,12 +147,12 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
         {
             task_spmv(row_ptr, col_idx, val, nnz, p, Ap, &tl);        /* Ap  = A*p       */
             task_dot_spmv(&tl, p, Ap, part1, pAp);                    /* pAp = <p,Ap>    */
-            task_scalar_div(gamma, pAp, alpha);                       /* alpha = g/pAp   */
+            task_scalar_div_live(gamma, pAp, gamma, g0, alpha);       /* alpha = g/pAp   */
             task_axpy(&tl, alpha, (real_t) +1.0, p, x);               /* x  += alpha*p   */
             task_axpy_spmv(&tl, alpha, (real_t) -1.0, Ap, r);         /* r  -= alpha*Ap  */
             task_vmul(&tl, inv, r, z);                                /* z   = M^-1 r    */
             task_dot(&tl, r, z, part2, g_new);                        /* g_new = <r,z>   */
-            task_scalar_div(g_new, gamma, beta);                      /* beta = gn/g     */
+            task_scalar_div_live(g_new, gamma, g_new, g0, beta);      /* beta = gn/g     */
             task_xpby(&tl, z, beta, p);                               /* p = z + beta*p  */
             task_scalar_copy(g_new, gamma);                           /* gamma = g_new   */
         }
@@ -162,11 +165,11 @@ static void cg_solve(const SpMatrix *A, const real_t *b, real_t *x,
     const double t1 = omp_get_wtime();
 
     OMP_TARGET_EXIT_DATA(MAP(from: x[0:n]) MAP(release: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], r[0:n],
-                                      p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1],
+                                      p[0:n], Ap[0:n], z[0:n], gamma[0:1], g_new[0:1], pAp[0:1], alpha[0:1], beta[0:1], g0[0:1],
                                       part1[0:tl.NTB1], part2[0:tl.NTB1]))
 
     host_free(r); host_free(p); host_free(Ap); host_free(z); host_free(inv);
-    host_free(gamma); host_free(g_new); host_free(pAp); host_free(alpha); host_free(beta);
+    host_free(gamma); host_free(g_new); host_free(pAp); host_free(alpha); host_free(beta); host_free(g0);
     host_free(part1); host_free(part2);
     tiling_fini(&tl);
     st->total_s = t1 - t0;

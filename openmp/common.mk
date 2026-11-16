@@ -24,9 +24,13 @@
 # it here rather than at the call site keeps `make USE_OMPSS=1` working on its
 # own -- the XKOMP default would otherwise be silently wrong.
 USE_OMPSS ?= 0
+VANILLA ?= 0
 ifeq ($(USE_OMPSS),1)
   OMPSS_CC ?= clang++
   CC = $(OMPSS_CC)
+else ifeq ($(VANILLA),1)
+  # Vanilla clang + LLVM OpenMP (KMP libomp, libomptarget): sync / no-taskgraph only.
+  CC = clang++
 else
   CC = xkcxx -DUSE_XKOMP=1
 endif
@@ -91,7 +95,9 @@ ifeq ($(USE_OMPSS),1)
   LDFLAGS += -lnuma
 else
   CFLAGS  += -fopenmp -fopenmp-version=60
-  CFLAGS  += -fopenmp-task-jit-abi=packed     # XKOMP JIT (none|pointers|packed)
+  ifneq ($(VANILLA),1)
+    CFLAGS  += -fopenmp-task-jit-abi=packed     # XKOMP JIT (none|pointers|packed)
+  endif
 endif
 
 # ---- GPU (OpenMP target offload), active only when USE_TARGET=1 -----------

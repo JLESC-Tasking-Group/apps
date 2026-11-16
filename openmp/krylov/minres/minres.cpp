@@ -107,6 +107,7 @@ static void minres_solve(const SpMatrix *A, const real_t *b, real_t *x,
                                      r2v[0:1], phi[0:1], gamma_inv[0:1],
                                      part_vy[0:tl.NTB1], part_r2v[0:tl.NTB1]))
 
+    TG_GPU_WARMUP();   /* untimed: the GPU at its clock before instance 0 (tasking.h) */
     const double t0 = omp_get_wtime();
 
     #pragma omp parallel

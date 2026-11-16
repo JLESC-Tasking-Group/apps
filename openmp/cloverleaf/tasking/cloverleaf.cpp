@@ -746,6 +746,7 @@ int main(int argc, char **argv)
             halo(xvel0, H_XVEL, 2); halo(yvel0, H_YVEL, 2); halo(xvel1, H_XVEL, 2); halo(yvel1, H_YVEL, 2);
             #pragma omp taskwait
 
+            TG_GPU_WARMUP();   /* untimed: the GPU at its clock before instance 0 (tasking.h) */
             t0 = omp_get_wtime();
             prev_ts = t0;
             TASKGRAPH_LOOP(unroll,
@@ -785,6 +786,7 @@ int main(int argc, char **argv)
     const double cell_updates = 2.0 * xmax * ymax;   // per iteration (2 timesteps)
     printf("FOM (cell-updates/s) : %10.8g\n", (mean > 0.0) ? cell_updates / (mean / 1000.0) : 0.0);
     printf("answer (kinetic energy): %.15e\n", r.ke);
+    fflush(stdout);   /* the report survives a crash in teardown (evaluate.py: ok_crashed_at_exit) */
 
     const int bad = dtv[BAD] != 0.0;
     if (bad) fprintf(stderr, "error: invalid or too small timestep (< %g) during the run\n", dtmin);

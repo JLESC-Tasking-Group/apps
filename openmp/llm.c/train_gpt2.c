@@ -3517,6 +3517,7 @@ int main(int argc, char *argv[])
                    model.grads_acts_memory[0:dev_Na])
 #endif
 
+    TG_GPU_WARMUP();   /* untimed: the GPU at its clock before instance 0 (tasking.h) */
     double start = WALL_TIME();
 
     // OmpSs-2 tasks are created from the implicit main task (no parallel/single

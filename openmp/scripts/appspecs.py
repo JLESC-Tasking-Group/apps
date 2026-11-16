@@ -82,7 +82,7 @@ DEFAULT_OPTS = [
 # pipelines of a whole overnight sweep and the CSV said otherwise.
 CGIR_PASSES = frozenset([
     "copy-fuse", "reduce-node", "transitive-reduction",
-    "prog-fuse", "jit", "sequence", "batch",
+    "prog-fuse", "jit", "sequence", "batch", "pack", "critical-path",
 ])
 
 # Short legend label for each pipeline, keyed by the LAST pass added. Keeps the
@@ -93,6 +93,11 @@ OPT_LABELS = {
     "reduce-node,transitive-reduction,jit":                          "+jit",
     "reduce-node,transitive-reduction,jit,prog-fuse":                "+prog-fuse",
     "reduce-node,transitive-reduction,jit,prog-fuse,batch":          "+packing",
+    # the same pipeline with `critical-path` right after the reductions
+    "reduce-node,transitive-reduction,critical-path":                               "+critical-path",
+    "reduce-node,transitive-reduction,critical-path,jit":                           "+jit",
+    "reduce-node,transitive-reduction,critical-path,jit,prog-fuse":                 "+prog-fuse",
+    "reduce-node,transitive-reduction,critical-path,jit,prog-fuse,batch":           "+packing",
 }
 
 
@@ -207,6 +212,8 @@ def _parse_instances(text):
         "iter1_ms":  _grab(text, r"instance 1[^:\n]*:\s*" + _F + r"\s*ms"),
         "avg_ms":    _grab(text, r"instances \d+\.\.\d+[^:\n]*\(avg\)[^:\n]*:\s*" + _F + r"\s*ms"),
         "stddev_ms": _grab(text, r"instances \d+\.\.\d+[^:\n]*\(stddev\)[^:\n]*:\s*" + _F + r"\s*ms"),
+        # robust to the GPU's post-idle clock ramp (see the apps' reports)
+        "median_ms": _grab(text, r"instances \d+\.\.\d+[^:\n]*\(median\)[^:\n]*:\s*" + _F + r"\s*ms"),
     }
 
 
@@ -564,15 +571,26 @@ POLYBENCH = AppSpec(
 # ---- miniWeather: NX/NZ are compile-time -> rebuild per size --------------------
 # size -> NX (NZ = NX/2, as the domain is 2:1). One iteration is a timestep PAIR
 # (x-first then z-first splitting, which is what repeats), so -i counts pairs;
-# SIM_TIME only has to be long enough to hold them (400 s is >= 300 pairs at every
-# size below). -nb = tasks per loop, -u = pairs per instance.
+# SIM_TIME has to hold them: the binary caps -i at the full pairs that fit in
+# SIM_TIME (dt = min(dx, dz) / 450 * 1.5), then rounds down to a multiple of -u.
+# 400 s holds only 150 pairs at NX = 50, so -u 1 (synchronous) and -u 8 ran 150
+# vs 144 pairs, i.e. different answers, and fewer instances than asked: SIM_TIME
+# is raised (in 100 s steps) to hold -i + 8 pairs, 400 s at least; it does not
+# depend on -u, so every configuration builds the same defines.
+# -nb = tasks per loop, -u = pairs per instance.
 def _mw_run(variant, size, iters, cfg, grain, unroll):
     return ["-nb", _nb(cfg, grain), "-i", str(iters), "-u", str(unroll)]
 
+def _mw_sim_time(size, iters, unroll):
+    nz = max(size // 2, 1)
+    dt = min(2.e4 / size, 1.e4 / nz) / 450 * 1.50
+    need = 2 * ((iters or 0) + 8) * dt
+    return max(400, 100 * math.ceil(need / 100))
+
 def _mw_defs(size, iters, grain, unroll):
     nz = max(size // 2, 1)
-    return [f"MW_DEFS=-D_NX={size} -D_NZ={nz} -D_SIM_TIME=400 -D_OUT_FREQ=-1 "
-            f"-D_DATA_SPEC=DATA_SPEC_THERMAL"]
+    return [f"MW_DEFS=-D_NX={size} -D_NZ={nz} -D_SIM_TIME={_mw_sim_time(size, iters, unroll)} "
+            f"-D_OUT_FREQ=-1 -D_DATA_SPEC=DATA_SPEC_THERMAL"]
 
 MINIWEATHER = AppSpec(
     name="miniweather",

@@ -17,7 +17,8 @@
  * Entries are per taskgraph INSTANCE -- a group of `unroll` iterations -- and in
  * ms per ITERATION (the TASKGRAPH_LOOP epilogue divides by `unroll`), so they
  * stay comparable across -u. Instance 0 is the record, instance 1 the command-
- * graph build + first replay, instances 2.. the steady state.
+ * graph build + first replay; the steady state starts at instance TG_WARMUP (default 5; see
+ * tasking.h).
  *
  * `answer` is a number computed from the final state that every configuration of
  * the same problem must reproduce (plot.py's report_answers() checks it).
@@ -27,6 +28,8 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "tasking.h"
 
@@ -63,13 +66,19 @@ static inline long tg_round_iters(long iters, long unroll)
     return r;
 }
 
+static inline int tg_cmp_double(const void *a, const void *b)
+{
+    const double x = *(const double *) a, y = *(const double *) b;
+    return (x > y) - (x < y);
+}
+
 /* Timing summary. Returns the steady-state mean (ms per iteration), which the
  * caller turns into its FOM. */
 static inline double tg_report_instances(const double *inst_ms, long ninst, long unroll)
 {
     if (ninst <= 0) return 0.0;
     const int graphed = TG_GRAPHED;
-    const long lo  = (ninst > 2) ? 2 : (ninst > 1 ? 1 : 0);   /* first steady instance */
+    const long lo  = tg_steady_from(ninst);   /* first steady instance */
     const long cnt = ninst - lo;
     double mean = 0.0;
     for (long r = lo; r < ninst; r++) mean += inst_ms[r];
@@ -83,10 +92,20 @@ static inline double tg_report_instances(const double *inst_ms, long ninst, long
     printf("instance 0%-11s: %10.3f ms\n", graphed ? " (record)" : "", inst_ms[0]);
     if (ninst > 1)
         printf("instance 1%-11s: %10.3f ms\n", graphed ? " (1st replay)" : "", inst_ms[1]);
-    /* the window actually averaged: it starts below 2 only when there are too
-     * few instances for the record / first replay to be dropped */
+    /* the window actually averaged: it starts below TG_WARMUP only when
+     * there are too few instances (see tg_steady_from) */
     printf("instances %ld..%ld (avg)    : %10.3f ms   (%ld instances)\n", lo, ninst - 1, mean, cnt);
     printf("instances %ld..%ld (stddev) : %10.3f ms\n", lo, ninst - 1, sd);
+    /* The median, robust to a few slow instances the mean is not (e.g. the
+     * GPU's clock ramp-up after an idle phase such as the first replay's JIT). */
+    if (cnt > 0) {
+        double *w = (double *) malloc((size_t) cnt * sizeof(double));
+        memcpy(w, inst_ms + lo, (size_t) cnt * sizeof(double));
+        qsort(w, (size_t) cnt, sizeof(double), tg_cmp_double);
+        const double med = (cnt % 2) ? w[cnt / 2] : 0.5 * (w[cnt / 2 - 1] + w[cnt / 2]);
+        free(w);
+        printf("instances %ld..%ld (median) : %10.3f ms\n", lo, ninst - 1, med);
+    }
     return mean;
 }
 

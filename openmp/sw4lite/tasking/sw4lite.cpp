@@ -106,24 +106,30 @@ int NB  = 32;  // tasks per loop
 int KBS = 1;   // z-planes per tile
 
 // component-last indexing: u[c*npts + i + ni*j + nij*k]
-static inline long IDX(int i, int j, int k) { return (long)i + (long)ni * j + (long)ni * nj * k; }
+// A macro, not a function: in an offloaded tile it then reads the tile's own
+// (implicitly firstprivate) ni/nj rather than the host globals, which are not
+// declare-target and do not exist on the device.
+#define IDX(i,j,k) ((long)(i) + (long)ni * (j) + (long)ni * nj * (k))
 
 //////////////////////////////////////////////////////////////////////////////////////////
 // rhs4sg: interior 4th-order elastic stencil (from rhs4sg_rev.C). Tiled over k.
 // With unit stretch (strx=stry=strz=1). lu = (1/h^2) * L(u). Computes interior
 // k in [hs, nk-hs), j in [hs, nj-hs), i in [hs, ni-hs).
 //////////////////////////////////////////////////////////////////////////////////////////
-void rhs4sg_block(const float_sw4 *src, int kb, int ke)
+// One z-plane k. Everything the stencil reads is a parameter (not a global), so
+// the function can be called from an offloaded tile: the device code then only
+// touches the tile's mapped / firstprivate values.
+static inline void rhs4sg_plane(const float_sw4 *src, float_sw4 *Lu, const float_sw4 *mu,
+                                const float_sw4 *la, const int ni, const int nj,
+                                const long NP, const float_sw4 cof, const int k)
 {
     const float_sw4 i6 = 1.0 / 6, i144 = 1.0 / 144, tf = 0.75;
-    const float_sw4 cof = 1.0 / (h * h);
-    const long NP = npts;
 #define MU(i,j,k)  mu[IDX(i,j,k)]
 #define LA(i,j,k)  la[IDX(i,j,k)]
 #define U1(i,j,k)  src[0*NP + IDX(i,j,k)]
 #define U2(i,j,k)  src[1*NP + IDX(i,j,k)]
 #define U3(i,j,k)  src[2*NP + IDX(i,j,k)]
-    for (int k = kb; k < ke; k++)
+    {
         for (int j = hs; j < nj - hs; j++)
             for (int i = hs; i < ni - hs; i++) {
                 float_sw4 mux1 = MU(i-1,j,k) - tf*(MU(i,j,k)+MU(i-2,j,k));
@@ -230,6 +236,7 @@ void rhs4sg_block(const float_sw4 *src, int kb, int ke)
 #undef U1
 #undef U2
 #undef U3
+    }
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////
@@ -240,6 +247,8 @@ void rhs4sg_block(const float_sw4 *src, int kb, int ke)
 void evalRHS_src(float_sw4 *src)
 {
     const long nij = (long)ni * nj;
+    const long NP = npts;
+    const float_sw4 cof = 1.0 / (h * h);
     const int nblk = (nk + KBS - 1) / KBS;
     // interior k in [hs, nk-hs): rhs block [kb,ke) reads src planes [kb-2, ke+1]
     // -> name neighbour blocks b-2..b+2. Writes Lu (whole-buffer token Lu[0]).
@@ -257,8 +266,9 @@ void evalRHS_src(float_sw4 *src)
                  MAP(present: src[0:(size_t)3*npts], Lu[0:(size_t)3*npts],
                               mu[0:(size_t)npts], la[0:(size_t)npts])
                  num_teams((ke - kb)) thread_limit(256),
-                 firstprivate(src, kb, ke))
-        rhs4sg_block(src, kb, ke);
+                 firstprivate(src, kb, ke, Lu, mu, la, ni, nj, NP, cof))
+        for (int k = kb; k < ke; k++)
+            rhs4sg_plane(src, Lu, mu, la, ni, nj, NP, cof, k);
     }
 }
 void evalRHS() { evalRHS_src(U); }
@@ -521,6 +531,7 @@ int main(int argc, char **argv)
     {
         #pragma omp single
         {
+            TG_GPU_WARMUP();   /* untimed: the GPU at its clock before instance 0 (tasking.h) */
             t0 = omp_get_wtime();
             prev_ts = t0;
             /* `unroll` timesteps per taskgraph instance (-u). */
@@ -559,6 +570,7 @@ int main(int argc, char **argv)
     const double gpupd = (double)N * N * NZ;   // interior grid-point updates / step
     printf("FOM (gridpt-updates/s): %10.8g\n", (mean > 0.0) ? gpupd / (mean / 1000.0) : 0.0);
     printf("answer (L2 norm of U): %.15e\n", l2norm());
+    fflush(stdout);   /* the report survives a crash in teardown (evaluate.py: ok_crashed_at_exit) */
     if (verify) printf("checksum             = %.10e\n", checksum());
 
     free(inst_ms);

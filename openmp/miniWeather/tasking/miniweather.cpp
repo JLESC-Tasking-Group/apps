@@ -502,6 +502,7 @@ int main(int argc, char **argv)
     double prev_ts, t0, tf;
     const double dt_full = dt;
 
+    TG_GPU_WARMUP();   /* untimed: the GPU at its clock before instance 0 (tasking.h) */
     auto wall1 = std::chrono::steady_clock::now();
     #pragma omp parallel
     {
@@ -572,6 +573,7 @@ int main(int argc, char **argv)
         const double cell_updates = 2.0 * nx * nz;   // cells advanced per iteration (2 steps)
         printf("FOM (cell-updates/s) : %10.8g\n", (mean > 0.0) ? cell_updates / (mean / 1000.0) : 0.0);
         printf("answer (d_te)        : %.15e\n", (te - te0) / te0);
+        fflush(stdout);   /* the report survives a crash in teardown (evaluate.py: ok_crashed_at_exit) */
     }
 
     free(inst_ms);

@@ -139,6 +139,7 @@ static inline void pb_report(const char *name, int nb,
     const double fom = (mean > 0.0) ? lattice_updates_per_step / (mean / 1000.0) : 0.0;
     printf("FOM (lup/s)          : %10.8g\n", fom);
     printf("answer (checksum)    : %.15e\n", answer);
+    fflush(stdout);   /* the report survives a crash in teardown (evaluate.py: ok_crashed_at_exit) */
 }
 
 /* ---- Cheap checksum of a flat array (self-consistency verification) -------- */

@@ -73,7 +73,7 @@ CSV_FIELDS = [
     "run_id", "timestamp", "machine", "tag",
     "app", "variant", "config", "opt", "build_vars", "backend", "env",
     "size", "work", "work_label", "iters", "unroll", "grain", "rep",
-    "avg_ms", "stddev_ms", "iter0_ms", "iter1_ms", "elapsed_s", "fom", "flops", "gflops",
+    "avg_ms", "stddev_ms", "median_ms", "iter0_ms", "iter1_ms", "elapsed_s", "fom", "flops", "gflops",
     "residual", "error", "answer", "verdict",
     "returncode", "status", "cmd",
 ]
@@ -166,7 +166,10 @@ def build_key(app, variant, cfg, target, size, grain, unroll):
 
     Kept out of do_build() because the run site needs the same key to find the
     binary that build produced -- see stash_binary()."""
-    key = (app.name, variant, cfg.label, target)
+    # Every taskgraph:<opt> config is the same binary (the passes are a run-time
+    # variable): one build serves them all.
+    label = "taskgraph" if cfg.label.startswith("taskgraph") else cfg.label
+    key = (app.name, variant, label, target)
     if app.rebuild_per_size:
         # build_defs receives size, grain and unroll, so each combination is
         # assumed to be its own binary; tuple() to stay hashable. (The current
@@ -310,7 +313,7 @@ def main():
                     "page cache, clock and power state. That variance is the larger "
                     "one on short-running problems, so a single run cannot say "
                     "whether two configurations differ. Repeats measure it; plot.py "
-                    "reduces them to a median and min-max whiskers. Use >= 5")
+                    "reduces them to a median (its whiskers are the in-run steady-state stddev). Use >= 5")
     ap.add_argument("--omit", default="", metavar="LIST",
                     help="comma list of reference configurations NOT to run, from "
                     + ", ".join(REFERENCE_CONFIGS) + ". None of them runs a CGIR pass, "
@@ -478,9 +481,11 @@ def main():
         if not ok:
             sys.stderr.write(p.stdout[-2000:] + "\n")
         built[key] = ok
-        # Only repeats need it: with one pass, every build is followed by its own
-        # run before anything else can clean the directory.
-        if ok and args.repeat > 1:
+        # Always, not only for repeats: the taskgraph:<opt> configs share one key,
+        # so even in one pass the later ones reuse a build that the other sizes'
+        # builds have cleaned away since -- for an app rebuilt per size, they would
+        # otherwise run the last size's binary.
+        if ok:
             stashed[key] = stash_binary(app, variant, key, outdir)
         return ok
 
@@ -741,6 +746,8 @@ def _parse_opts(arg, ap=None):
     than turned into a bogus pass name."""
     if not arg:
         return list(DEFAULT_OPTS)
+    if arg.strip() == "skip":       # reference configurations only (e.g. vanilla LLVM)
+        return []
     out = []
     for chunk in arg.split(";"):
         passes = [p for p in re.split(r"[,\s]+", chunk.strip()) if p]

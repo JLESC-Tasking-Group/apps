@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <vector>
 /*
    This is a Version 2.0 MPI + OpenMP implementation of LULESH
 
@@ -1319,6 +1321,7 @@ OMP_TARGET_ENTER_DATA( \
 {
     numThreads = omp_get_num_threads();
 
+    TG_GPU_WARMUP();   /* untimed: the GPU at its clock before instance 0 (tasking.h) */
     t0 = omp_get_wtime();
     prev_ts = t0;
   /* `unroll` cycles per taskgraph instance (-u). The body is unrollable as-is:
@@ -2824,10 +2827,11 @@ OMP_TARGET_ENTER_DATA( \
    * epilogue divides by `unroll`) so they stay comparable across -u. The three
    * phases are the runtime's own: xkomp records the graph on instance 0, builds
    * and optimizes the command graph on instance 1 and then replays, so instance
-   * 1 carries the whole build cost and instances 2.. are the steady state. */
+   * 1 carries the whole build cost and the steady state starts at
+   * instance TG_WARMUP (default 5, tasking.h). */
   if (ninst > 0) {
     const int graphed = (USE_TASKGRAPH && !USE_SYNC);
-    const int lo  = (ninst > 2) ? 2 : (ninst > 1 ? 1 : 0);  /* first steady instance */
+    const int lo  = (int) tg_steady_from(ninst);  /* first steady instance (tasking.h) */
     const int cnt = ninst - lo;
     double mean = 0.0;
     for (int r = lo; r < ninst; r++) mean += iter_times[r];
@@ -2841,11 +2845,20 @@ OMP_TARGET_ENTER_DATA( \
     if (ninst > 1)
       printf("instance 1%-11s: %10.3f ms\n",
              graphed ? " (1st replay)" : "", iter_times[1]);
-    /* Report the window actually averaged: it starts below 2 only when there are
-     * too few instances for the record / first replay to be dropped. */
+    /* Report the window actually averaged: it starts below TG_WARMUP only
+     * when there are too few instances (see tg_steady_from). */
     printf("instances %d..%d (avg)    : %10.3f ms   (%d instances)\n",
            lo, ninst - 1, mean, cnt);
     printf("instances %d..%d (stddev) : %10.3f ms\n", lo, ninst - 1, sd);
+    /* The median, robust to a transient phase the mean is not: the GPU may run
+     * ~30% slow for ~200 ms after being idle (clock ramp-up, e.g. while the
+     * first replay JIT-compiles), which a short run's mean absorbs. */
+    if (cnt > 0) {
+      std::vector<double> w(iter_times + lo, iter_times + ninst);
+      std::sort(w.begin(), w.end());
+      const double med = (cnt % 2) ? w[cnt / 2] : 0.5 * (w[cnt / 2 - 1] + w[cnt / 2]);
+      printf("instances %d..%d (median) : %10.3f ms\n", lo, ninst - 1, med);
+    }
   }
   free(iter_times);
 

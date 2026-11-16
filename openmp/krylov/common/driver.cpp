@@ -37,6 +37,23 @@ void krylov_stats_free(KrylovStats *s)
     s->iter_ms = NULL;
 }
 
+static int krylov_cmp_double(const void *a, const void *b)
+{
+    const double x = *(const double *) a, y = *(const double *) b;
+    return (x > y) - (x < y);
+}
+
+/* Median of v[0..n), n > 0 (v is not modified). */
+static double krylov_median(const double *v, int n)
+{
+    double *w = (double *) malloc((size_t) n * sizeof(double));
+    memcpy(w, v, (size_t) n * sizeof(double));
+    qsort(w, (size_t) n, sizeof(double), krylov_cmp_double);
+    const double m = (n % 2) ? w[n / 2] : 0.5 * (w[n / 2 - 1] + w[n / 2]);
+    free(w);
+    return m;
+}
+
 void krylov_stats_report(const KrylovStats *s, int taskgraph, double flops)
 {
     char lbl[64];
@@ -54,7 +71,7 @@ void krylov_stats_report(const KrylovStats *s, int taskgraph, double flops)
      * comparable across -u. The three phases are the runtime's own: xkomp
      * records the graph on instance 0, builds and optimizes the command graph on
      * instance 1 and then replays, so instance 1 carries the whole build cost
-     * and instances 2.. are the steady state. */
+     * and the steady state starts at instance TG_WARMUP (default 5, tasking.h). */
     if (s->niter >= 1) {
         snprintf(lbl, sizeof lbl, "instance 0%s", taskgraph ? " (record)" : "");
         printf("  %-27s : %10.3f ms\n", lbl, s->iter_ms[0]);
@@ -63,23 +80,31 @@ void krylov_stats_report(const KrylovStats *s, int taskgraph, double flops)
         snprintf(lbl, sizeof lbl, "instance 1%s", taskgraph ? " (1st replay)" : "");
         printf("  %-27s : %10.3f ms\n", lbl, s->iter_ms[1]);
     }
-    if (s->niter >= 3) {
-        const int cnt = s->niter - 2;
+    if (s->niter >= 2) {
+        const int lo  = (int) tg_steady_from(s->niter);   /* see tasking.h */
+        const int cnt = s->niter - lo;
         double sum = 0.0;
-        for (int i = 2; i < s->niter; i++) sum += s->iter_ms[i];
+        for (int i = lo; i < s->niter; i++) sum += s->iter_ms[i];
         const double mean = sum / cnt;
 
         double var = 0.0;
-        for (int i = 2; i < s->niter; i++) {
+        for (int i = lo; i < s->niter; i++) {
             const double dv = s->iter_ms[i] - mean;
             var += dv * dv;
         }
         const double stddev = (cnt > 1) ? sqrt(var / (cnt - 1)) : 0.0;
 
-        snprintf(lbl, sizeof lbl, "instances 2..%d (avg)", s->niter - 1);
+        snprintf(lbl, sizeof lbl, "instances %d..%d (avg)", lo, s->niter - 1);
         printf("  %-27s : %10.3f ms   (%d instances)\n", lbl, mean, cnt);
-        snprintf(lbl, sizeof lbl, "instances 2..%d (stddev)", s->niter - 1);
+        snprintf(lbl, sizeof lbl, "instances %d..%d (stddev)", lo, s->niter - 1);
         printf("  %-27s : %10.3f ms\n", lbl, stddev);
+
+        /* The median, robust to a transient phase the mean is not: the GPU
+         * may run ~30% slow for ~200 ms after being idle (clock ramp-up, e.g.
+         * while the first replay JIT-compiles), which a short run's mean
+         * absorbs but its median ignores. */
+        snprintf(lbl, sizeof lbl, "instances %d..%d (median)", lo, s->niter - 1);
+        printf("  %-27s : %10.3f ms\n", lbl, krylov_median(s->iter_ms + lo, cnt));
     }
 }
 

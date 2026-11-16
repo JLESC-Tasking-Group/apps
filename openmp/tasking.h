@@ -87,6 +87,94 @@
 #endif
 
 #include <stddef.h>     /* size_t, used by the TASKGRAPH_LOOP dispatch below */
+#include <stdio.h>      /* the warm-up's report line */
+#include <stdlib.h>     /* getenv */
+#include <time.h>       /* clock_gettime, for the GPU warm-up */
+
+/* ---- Steady-state window of the timing summaries --------------------------
+ * Instance 0 records the taskgraph; instance 1 builds and optimizes the command
+ * graph (JIT included) and replays it; instance 2 is where XKRT loads the PTX
+ * modules and, once their kernels are settled, builds the CUDA graphs of the
+ * packs; the next ones are warm-up. The steady state is instances W..: the apps
+ * report instance 0 (the record) on its own, and the mean / stddev / median of
+ * instances W.. . A run with too few instances falls back to its last one.
+ *
+ * W, the number of instances left out of the statistics, is TG_STEADY_FROM (5)
+ * unless the environment sets TG_WARMUP=<W> (W >= 2: the record and the first
+ * replay are never steady). The warm-up must cover more than one-time costs: a
+ * GPU left idle while the first replay JIT-compiles (hundreds of ms) clocks down
+ * (an A100 drops from 1410 to 765 MHz), and takes ~0.4 s of load to clock back
+ * up -- 5 instances of a sub-ms problem end long before that, and its steady
+ * state would be measured at the low clock. So W is best sized in time: enough
+ * instances to keep the GPU busy ~1 s after instance 1 (paper-eval/scripts/
+ * warmup.py). */
+#define TG_STEADY_FROM 5
+static inline long tg_warmup_instances(void)
+{
+    static long w = -1;
+    if (w < 0) {
+        const char *e = getenv("TG_WARMUP");
+        const long  v = (e && *e) ? strtol(e, NULL, 10) : TG_STEADY_FROM;
+        w = v < 2 ? 2 : v;
+    }
+    return w;
+}
+static inline long tg_steady_from(long ninst)
+{
+    const long w = tg_warmup_instances();
+    return ninst > w ? w : (ninst > 1 ? ninst - 1 : 0);
+}
+
+/* ---- GPU warm-up, before the first (recorded) instance --------------------
+ * TG_GPU_WARMUP() keeps the GPU busy with a compute-bound OpenMP target loop for
+ * TG_GPU_WARMUP_MS milliseconds (default 1000; 0 disables), so that the first
+ * instance does not start on a GPU idling at its lowest clock -- e.g. after the
+ * build, the data setup, or the previous run. Called once per run by each app,
+ * just before its timed loop and outside every measurement. Nothing on the host
+ * backends.
+ *
+ * A macro and not a function: the target region it contains then belongs to the
+ * one function that expands it. A function in this header would hold the same
+ * offload entry in every translation unit that includes it. */
+static inline double tg_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return 1e3 * (double) ts.tv_sec + 1e-6 * (double) ts.tv_nsec;
+}
+static inline double tg_gpu_warmup_ms(void)
+{
+    const char *e = getenv("TG_GPU_WARMUP_MS");
+    return (e && *e) ? atof(e) : 1000.0;
+}
+#if USE_TARGET && !USE_OMPSS
+# define TG_GPU_WARMUP()                                                           \
+    do {                                                                           \
+        const double tg_wu_ms_ = tg_gpu_warmup_ms();                               \
+        if (tg_wu_ms_ > 0.0) {                                                     \
+            const double tg_wu_t0_ = tg_now_ms();                                  \
+            float tg_wu_sum_ = 0.0f;                                               \
+            long  tg_wu_n_   = 0;                                                  \
+            do {                                                                   \
+                float tg_wu_s_ = 0.0f;                                             \
+                TG_PRAGMA(omp target teams distribute parallel for                 \
+                          reduction(+: tg_wu_s_) map(tofrom: tg_wu_s_))            \
+                for (int tg_wu_i_ = 0; tg_wu_i_ < (1 << 22); tg_wu_i_++) {         \
+                    float tg_wu_x_ = (float) tg_wu_i_;                             \
+                    for (int tg_wu_k_ = 0; tg_wu_k_ < 1024; tg_wu_k_++)            \
+                        tg_wu_x_ = tg_wu_x_ * 0.999999f + 1e-6f;                   \
+                    tg_wu_s_ += tg_wu_x_;                                          \
+                }                                                                  \
+                tg_wu_sum_ += tg_wu_s_;                                            \
+                tg_wu_n_++;                                                        \
+            } while (tg_now_ms() - tg_wu_t0_ < tg_wu_ms_);                         \
+            printf("GPU warm-up          : %10.1f ms (%ld kernels, %g)\n",         \
+                   tg_now_ms() - tg_wu_t0_, tg_wu_n_, (double) tg_wu_sum_);        \
+        }                                                                          \
+    } while (0)
+#else
+# define TG_GPU_WARMUP() do { } while (0)
+#endif
 
 #if USE_XKOMP
 # include <xkomp/xkomp.h>

@@ -66,6 +66,7 @@ int main(int argc, char **argv)
     {
         #pragma omp single
         {
+            TG_GPU_WARMUP();   /* untimed: the GPU at its clock before instance 0 (tasking.h) */
             t0 = omp_get_wtime();
             prev_ts = t0;
             /* `unroll` timesteps per taskgraph instance (-u). The body is one timestep and

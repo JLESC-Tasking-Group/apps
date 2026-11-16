@@ -431,6 +431,15 @@ void task_scalar_div(const real_t *a, const real_t *b, real_t *c)
     }
 }
 
+void task_scalar_div_live(const real_t *a, const real_t *b, const real_t *res, const real_t *res0, real_t *c)
+{
+    OMP_TARGET_TASK(DEPEND(in, a[0], b[0], res[0], res0[0]) DEPEND(out, c[0])
+                    MAP(present: a[0:1], b[0:1], res[0:1], res0[0:1], c[0:1]))
+    {
+        c[0] = (res[0] > (real_t) KR_FREEZE_REL2 * res0[0]) ? a[0] / b[0] : (real_t) 0.0;
+    }
+}
+
 void task_scalar_copy(const real_t *a, real_t *b)
 {
     OMP_TARGET_TASK(DEPEND(in, a[0]) DEPEND(out, b[0]) MAP(present: a[0:1], b[0:1]))

@@ -74,6 +74,7 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
     real_t *qMq     = (real_t *) host_alloc(sizeof(real_t));
     real_t *alpha   = (real_t *) host_alloc(sizeof(real_t));
     real_t *beta    = (real_t *) host_alloc(sizeof(real_t));
+    real_t *rho0    = (real_t *) host_alloc(sizeof(real_t)); /* initial rho (freeze) */
 
     /* Per-block partial dot sums (device-resident; the dot decomposes into T1
      * partial reductions into these + a finalize, on both backends). */
@@ -87,9 +88,10 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
 
     OMP_TARGET_ENTER_DATA(map(to: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], x[0:n], r[0:n])
                           map(alloc: p[0:n], q[0:n], Ar[0:n], Mq[0:n],
-                                     rho[0:1], rho_bar[0:1], qMq[0:1], alpha[0:1], beta[0:1],
+                                     rho[0:1], rho_bar[0:1], qMq[0:1], alpha[0:1], beta[0:1], rho0[0:1],
                                      part_qMq[0:tl.NTB1], part_rho[0:tl.NTB1]))
 
+    TG_GPU_WARMUP();   /* untimed: the GPU at its clock before instance 0 (tasking.h) */
     const double t0 = omp_get_wtime();
 
     #pragma omp parallel
@@ -100,6 +102,7 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
         task_copy(&tl, r, p);
         task_copy_spmv(&tl, Ar, q);
         task_dot_spmv(&tl, r, Ar, part_rho, rho);
+        task_scalar_copy(rho, rho0);
         #pragma omp taskwait
 
         double prev_ts = omp_get_wtime();
@@ -140,13 +143,13 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
         {
             task_vmul(&tl, inv, q, Mq);                                 /* Mq = M^-1 q      */
             task_dot(&tl, q, Mq, part_qMq, qMq);                       /* <q,Mq>           */
-            task_scalar_div(rho, qMq, alpha);                          /* alpha = rho/<q,Mq> */
+            task_scalar_div_live(rho, qMq, rho, rho0, alpha);          /* alpha = rho/<q,Mq> */
             task_axpy(&tl, alpha, (real_t) +1.0, p, x);                /* x += alpha*p     */
             task_axpy(&tl, alpha, (real_t) -1.0, Mq, r);               /* r -= alpha*Mq    */
             task_spmv(row_ptr, col_idx, val, nnz, r, Ar, &tl);        /* Ar = A r         */
             task_scalar_copy(rho, rho_bar);                            /* rho_bar = rho    */
             task_dot_spmv(&tl, r, Ar, part_rho, rho);                  /* rho = <r,Ar>     */
-            task_scalar_div(rho, rho_bar, beta);                       /* beta = rho/rho_bar */
+            task_scalar_div_live(rho, rho_bar, rho, rho0, beta);       /* beta = rho/rho_bar */
             task_xpby(&tl, r, beta, p);                                /* p = r + beta*p   */
             task_xpby_spmv(&tl, Ar, beta, q);                          /* q = Ar + beta*q  */
         }
@@ -160,11 +163,11 @@ static void cr_solve(const SpMatrix *A, const real_t *b, real_t *x,
     OMP_TARGET_EXIT_DATA(map(from: x[0:n])
                          map(release: row_ptr[0:n + 1], col_idx[0:nnz], val[0:nnz], inv[0:n], r[0:n],
                                       p[0:n], q[0:n], Ar[0:n], Mq[0:n],
-                                      rho[0:1], rho_bar[0:1], qMq[0:1], alpha[0:1], beta[0:1],
+                                      rho[0:1], rho_bar[0:1], qMq[0:1], alpha[0:1], beta[0:1], rho0[0:1],
                                       part_qMq[0:tl.NTB1], part_rho[0:tl.NTB1]))
 
     host_free(r); host_free(p); host_free(q); host_free(Ar); host_free(Mq); host_free(inv);
-    host_free(rho); host_free(rho_bar); host_free(qMq); host_free(alpha); host_free(beta);
+    host_free(rho); host_free(rho_bar); host_free(qMq); host_free(alpha); host_free(beta); host_free(rho0);
     host_free(part_qMq); host_free(part_rho);
     tiling_fini(&tl);
     st->total_s = t1 - t0;

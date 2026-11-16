@@ -896,7 +896,7 @@ PAPER_LABELS = {
     "taskgraph:none":                                                "taskgraph",
     "taskgraph:reduce-node,transitive-reduction":                    "+reduce",
     "taskgraph:reduce-node,transitive-reduction,jit":                "+jit",
-    "taskgraph:reduce-node,transitive-reduction,prog-fuse,jit":      "+prog-fuse",
+    "taskgraph:reduce-node,transitive-reduction,prog-fuse,jit":      "+fuse",
     "taskgraph:reduce-node,transitive-reduction,prog-fuse,jit,sequence,batch":
                                                                      "+packing",
     # `sequence` was dropped from the default pipeline once it was measured to
@@ -1482,7 +1482,7 @@ def _fmt(v, prec=0, group=False):
 # implementation and one -- `reduce` -- in the paper, so their times are summed.
 COST_PASSES = [
     ("reduce",     ["reduce-node", "transitive-reduction"]),
-    ("prog-fuse",  ["prog-fuse"]),
+    ("fuse",       ["prog-fuse"]),
     ("JIT",        ["jit"]),
     ("packing",    ["sequence", "batch", "pack"]),   # the batch pass reports itself as "pack"
 ]
@@ -1708,7 +1708,7 @@ def latex_table_graph(rows, cgstats_path, full_pipeline, out, tag="",
         + (" Last column: the nodes left when \\code{packing} follows \\code{reduce} "
            "directly (no \\code{JIT}, no \\code{prog-fuse})." if cmp_nodes else ""),
         "tbl:apps", "@{}l r r r r" + (" r" if cmp_nodes else "") + "@{}",
-        ["Application", "\\#node/\\#edge", "\\code{reduce}", "\\code{prog-fuse}",
+        ["Application", "\\#node/\\#edge", "\\code{reduce}", "\\code{fuse}",
          "\\code{packing}"] + (["\\code{reduce}+\\code{packing}"] if cmp_nodes else []),
         body, out, wide=False)
 
@@ -1751,7 +1751,7 @@ def latex_table_cost(rows, cgstats_path, jitstats_path, baseline, main_tag,
             _size_cell(k[2]),
             _fmt(c["replay"], 3, True),
             _fmt(c["reduce"], 1, True),
-            _fmt(c["prog-fuse"], 1, True),
+            _fmt(c["fuse"], 1, True),
             _fmt(c["JIT"], 1, True),
             _fmt(w["JIT"], 1, True) if w else "--",
             _fmt(c["packing"], 1, True),
@@ -1773,7 +1773,7 @@ def latex_table_cost(rows, cgstats_path, jitstats_path, baseline, main_tag,
            "break-even." if cmp else ""),
         "tbl:cost", "@{}l r r r r r r r r r r r" + (" r r" if cmp else "") + "@{}",
         ["Application", "Size", "one replay", "\\code{reduce}",
-         "\\code{prog-fuse}", "cold", "cached", "\\code{packing}",
+         "\\code{fuse}", "cold", "cached", "\\code{packing}",
          "cold", "cached", "cold", "cached"] + (["one replay", "break-even"] if cmp else []),
         body, out,
         groups=[("\\code{JIT}", 6, 7), ("total", 9, 10),

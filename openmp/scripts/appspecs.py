@@ -54,7 +54,7 @@ from typing import Callable, Dict, List, Optional
 #   +jit        recompiling each task body at -O3 in the runtime, WITHOUT fusing
 #               -- isolated on purpose, so the fusion bar below cannot be
 #               credited with a gain that is only recompilation
-#   +prog-fuse  fusing serial chains of programs before compiling them
+#   +fuse       fusing serial chains of programs before compiling them
 #   +packing    the sequence/batch packing passes (host super-tasks and vendor
 #               command graphs)
 #
@@ -91,12 +91,12 @@ CGIR_PASSES = frozenset([
 OPT_LABELS = {
     "reduce-node,transitive-reduction":                             "+reduce",
     "reduce-node,transitive-reduction,jit":                          "+jit",
-    "reduce-node,transitive-reduction,jit,prog-fuse":                "+prog-fuse",
+    "reduce-node,transitive-reduction,jit,prog-fuse":                "+fuse",
     "reduce-node,transitive-reduction,jit,prog-fuse,batch":          "+packing",
     # the same pipeline with `critical-path` right after the reductions
     "reduce-node,transitive-reduction,critical-path":                               "+critical-path",
     "reduce-node,transitive-reduction,critical-path,jit":                           "+jit",
-    "reduce-node,transitive-reduction,critical-path,jit,prog-fuse":                 "+prog-fuse",
+    "reduce-node,transitive-reduction,critical-path,jit,prog-fuse":                 "+fuse",
     "reduce-node,transitive-reduction,critical-path,jit,prog-fuse,batch":           "+packing",
 }
 
